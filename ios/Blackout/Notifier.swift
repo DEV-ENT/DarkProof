@@ -15,11 +15,16 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     private var task = UIBackgroundTaskIdentifier.invalid
     private let center = UNUserNotificationCenter.current()
 
-    func setUp() {
-        center.delegate = self
-        let safe = UNNotificationAction(identifier: "safe", title: "I'm safe", options: [])
+    /// The answers under "Are you safe?". With "Lock DarkProof" on, "I'm safe" needs the phone unlocked: whoever holds it can't say it for you.
+    func updateActions() {
+        let safe = UNNotificationAction(identifier: "safe", title: "I'm safe", options: AppLock.shared.enabled ? [.authenticationRequired] : [])
         let help = UNNotificationAction(identifier: "help", title: "I need help", options: [.foreground, .destructive])
         center.setNotificationCategories([UNNotificationCategory(identifier: Self.askCategory, actions: [safe, help], intentIdentifiers: [])])
+    }
+
+    func setUp() {
+        center.delegate = self
+        updateActions()
         refresh()
         #if DEBUG
         if CommandLine.arguments.contains("notifyTest") { // pretend messages arrive just after going to the background
@@ -39,7 +44,7 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     #if DEBUG
     private func testMessages() {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let code = UserDefaults.standard.string(forKey: "code")
+        let code = GroupSecrets.shared.current
         received(Message(id: "test-ask-\(now)", ts: now, sender: "test-m", name: "Marco", text: AreYouSafe().text, group: code))
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
             self.received(Message(id: "test-help-\(now)", ts: now, sender: "test-l", name: "Lucia",
@@ -65,7 +70,7 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     func received(_ m: Message) {
         let group = Mesh.shared.engine?.groupName(m.group) ?? "your group"
         Unread.shared.updateAppBadge()
-        if UIApplication.shared.applicationState == .active { return inApp(m, group: group) }
+        if UIApplication.shared.applicationState == .active && !AppLock.shared.isLocked { return inApp(m, group: group) }
         // Messages arriving within 2 seconds are posted together: catching up after being out of range can bring
         // dozens at once. iOS gives a few seconds so the batch is posted even if it would suspend the app meanwhile.
         pending.append((m, group))
@@ -75,7 +80,7 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     }
 
     private var myName: String { UserDefaults.standard.string(forKey: "name") ?? "" }
-    private var activeCode: String { UserDefaults.standard.string(forKey: "code") ?? "" }
+    private var activeCode: String { GroupSecrets.shared.current ?? "" }
 
     /// Someone needs help: their own check-in, or a report about someone else.
     private static func help(_ m: Message) -> (who: String, by: String?)? {
@@ -151,9 +156,11 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     private func post(_ m: Message, title: String, body: String, subtitle: String? = nil, tab: Nav.Tab, urgent: Bool = false,
                       category: String? = nil) {
         let c = UNMutableNotificationContent()
-        c.title = title
-        c.body = body
-        if let subtitle { c.subtitle = subtitle }
+        // With "Lock DarkProof" on, nothing about who or what shows on a locked or borrowed phone.
+        let hide = AppLock.shared.enabled
+        c.title = hide ? "DarkProof" : title
+        c.body = !hide ? body : category == Self.askCategory ? "Someone asks if you are safe. Open DarkProof." : urgent ? "Someone needs help. Open DarkProof." : "New message"
+        if let subtitle, !hide { c.subtitle = subtitle }
         c.sound = .default
         c.threadIdentifier = urgent ? "help" : "group"
         // Which group and screen to open; a tag stands for the group, so codes never sit in the alert database.
@@ -172,7 +179,7 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     /// On screen, the app itself shows what arrived (in-app banner): no system banner.
     func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
-        done([])
+        done(AppLock.shared.isLocked ? [.banner, .sound] : []) // the lock screen hides the in-app banner
     }
 
     /// Tapped: opens that group (switching to it if needed) on the right screen. "I'm safe" and "I need help" under a

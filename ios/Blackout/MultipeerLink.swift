@@ -35,9 +35,9 @@ final class MultipeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertise
 
     /// Called by the router, possibly while it holds its lock, so only queue the work.
     func send(_ peer: String, _ p: Packet) {
-        let name = String(peer.dropFirst(Self.prefix.count)), data = p.encode()
+        let data = p.encode()
         q.async {
-            guard let target = self.session.connectedPeers.first(where: { $0.displayName == name }) else { return }
+            guard let target = self.session.connectedPeers.first(where: { Self.key($0) == peer }) else { return }
             try? self.session.send(data, toPeers: [target], with: .reliable)
         }
     }
@@ -75,7 +75,7 @@ final class MultipeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertise
 
     func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
         q.async {
-            let id = Self.prefix + peerID.displayName
+            let id = Self.key(peerID)
             switch state {
             case .connected:
                 self.router.peerUp(id)
@@ -93,14 +93,18 @@ final class MultipeerLink: NSObject, MCSessionDelegate, MCNearbyServiceAdvertise
 
     func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
         guard let p = Packet.decode(data) else { return }
-        q.async { self.router.receive(from: Self.prefix + peerID.displayName, p) }
+        q.async { self.router.receive(from: Self.key(peerID), p) }
     }
 
-    func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {}
+    // DarkProof sends only packets: a stream or a file from someone is refused, or it could fill the disk.
+    func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) { stream.close() }
     func session(_ session: MCSession, didStartReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID,
-                 with progress: Progress) {}
+                 with progress: Progress) { progress.cancel() }
     func session(_ session: MCSession, didFinishReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID,
                  at localURL: URL?, withError error: Error?) {}
+
+    /// A link's name in the router: by the peer itself, because anyone can use someone else's display name.
+    private static func key(_ p: MCPeerID) -> String { prefix + p.displayName + "#" + String(p.hash) }
 
     private func report() { onStatus("Nearby iPhones: \(session.connectedPeers.count) connected") }
 

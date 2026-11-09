@@ -25,15 +25,22 @@ final class OfflineMap: NSObject, ObservableObject {
     private struct Context: Codable { let lat: Double; let lon: Double; let ts: Int64 }
 
     /// Call once at launch, before any map is shown.
-    func setUp() {
+    /// With "Connect through Tor" the map shows only what is saved: the map server would see this phone's address and the area on screen.
+    func applyNetwork() {
         let c = URLSessionConfiguration.default
         c.httpMaximumConnectionsPerHost = 4
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
         c.httpAdditionalHeaders = ["User-Agent": "DarkProof/\(v) (iOS; +https://github.com/DEV-ENT/DarkProof)"]
+        var offline = UserDefaults.standard.bool(forKey: "tor")
         #if DEBUG
-        if CommandLine.arguments.contains("noInternet") { c.protocolClasses = [NoInternet.self] } // test the saved map
+        if CommandLine.arguments.contains("noInternet") { offline = true } // test the saved map
         #endif
+        if offline { c.protocolClasses = [NoInternet.self] }
         MLNNetworkConfiguration.sharedManager.sessionConfiguration = c
+    }
+
+    func setUp() {
+        applyNetwork()
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(progressChanged), name: .MLNOfflinePackProgressChanged, object: nil)
         nc.addObserver(self, selector: #selector(packFailed), name: .MLNOfflinePackError, object: nil)
@@ -63,6 +70,7 @@ final class OfflineMap: NSObject, ObservableObject {
     /// Saves the map around `c`, replacing any saved area.
     func download(around c: Spot) {
         if case .downloading = state { return }
+        if UserDefaults.standard.bool(forKey: "tor") { state = .failed("Turn off Connect through Tor to download the map: the map server would see your address."); return }
         let b = Self.bounds(around: c)
         guard Self.tileCount(b) <= Self.maxTiles else { state = .failed("This area needs too many map tiles."); return }
         let region = MLNTilePyramidOfflineRegion(styleURL: Self.styleURL, bounds: b, fromZoomLevel: 0, toZoomLevel: Self.maxZoom)
@@ -134,13 +142,11 @@ final class OfflineMap: NSObject, ObservableObject {
     }
 }
 
-#if DEBUG
-/// Debug builds, launch argument `noInternet`: every map request fails as if there were no internet, to check that
-/// the saved map works on its own.
+/// Every map request fails as if there were no internet: with "Connect through Tor" on, and in debug builds with the
+/// launch argument `noInternet`, to check that the saved map works on its own.
 final class NoInternet: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() { client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet)) }
     override func stopLoading() {}
 }
-#endif

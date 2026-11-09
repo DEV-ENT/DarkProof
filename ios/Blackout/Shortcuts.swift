@@ -29,7 +29,9 @@ enum CheckInShortcut {
     @MainActor static func send(_ c: CheckIn) async -> String {
         Mesh.shared.startIfSetUp()
         guard let e = Mesh.shared.engine else { return "Open DarkProof and join a group first." }
-        let group = UserDefaults.standard.string(forKey: "groupName") ?? "your group"
+        // With "Lock DarkProof" on, whoever holds the phone can't tell the group you're safe without unlocking.
+        if c == .safe && AppLock.shared.enabled { return "Open DarkProof and unlock it to say you're safe." }
+        let group = AppLock.shared.enabled ? "your group" : UserDefaults.standard.string(forKey: "groupName") ?? "your group"
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             if e.checkInSending != nil { return done.resume() } // one is on its way already
             e.checkIn(c) { done.resume() }

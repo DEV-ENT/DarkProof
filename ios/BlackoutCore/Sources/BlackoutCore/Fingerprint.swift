@@ -40,6 +40,11 @@ public enum Fingerprint {
     /// "🐶 😀 🐼 🔨 🐧"
     public static func emojiText(_ indices: [Int]) -> String { indices.map { emoji[$0] }.joined(separator: " ") }
 
+    /// A person's emoji, eight to a line (spec "Person emoji").
+    public static func emojiLines(_ indices: [Int]) -> String {
+        stride(from: 0, to: indices.count, by: 8).map { emojiText(Array(indices[$0..<min($0 + 8, indices.count)])) }.joined(separator: "\n")
+    }
+
     /// "Dog, Smiley, Panda, Hammer, Penguin": what people say out loud.
     public static func spoken(_ indices: [Int]) -> String { indices.map { names[$0] }.joined(separator: ", ") }
 }

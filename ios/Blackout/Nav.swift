@@ -45,7 +45,7 @@ final class Nav: ObservableObject {
 
     /// Shows a group's chat or people: switches group first if needed (`code` nil = stay).
     func open(group code: String?, tab: Tab, everyone: Bool = false) {
-        if let code, !code.isEmpty, let e = Mesh.shared.engine, code != UserDefaults.standard.string(forKey: "code") {
+        if let code, !code.isEmpty, let e = Mesh.shared.engine, code != GroupSecrets.shared.current {
             let name = SavedGroups.all().first { $0.code == code }?.name ?? "Group"
             SavedGroups.switchTo(groupName: name, code: code, engine: e)
         }
@@ -77,45 +77,57 @@ enum GroupTag {
 
     /// The saved group with this tag, if any.
     static func code(for tag: String) -> String? {
-        let d = UserDefaults.standard
-        let all = SavedGroups.all().map(\.code) + [d.string(forKey: "code") ?? ""]
+        let all = SavedGroups.all().map(\.code) + [GroupSecrets.shared.code]
         return all.first { !$0.isEmpty && of($0) == tag }
     }
 }
 
-/// What has been read: the newest message time seen per group code (and "everyone" for the Everyone channel), saved
-/// on the phone. Unread = messages from others after that. Main thread.
+/// What has been read: the newest message time seen per group (by its tag, so no code is saved here) and "everyone" for
+/// the Everyone channel, saved on the phone. Unread = messages from others after that. Main thread.
 final class Unread: ObservableObject {
     static let shared = Unread()
     static let everyone = "everyone"
-    private let key = "lastRead"
+    private let key = "lastReadTags"
+    private func tag(_ channel: String) -> String { channel == Self.everyone ? channel : GroupTag.of(channel) }
     @Published private(set) var lastRead: [String: Int64]
 
     init() {
         let d = UserDefaults.standard
         if let saved = d.dictionary(forKey: key) as? [String: Int64] {
             lastRead = saved
+        } else if let old = d.dictionary(forKey: "lastRead") as? [String: Int64] { // older builds kept the codes themselves here
+            var r: [String: Int64] = [:]
+            for (channel, ts) in old { r[channel == Self.everyone ? channel : GroupTag.of(channel)] = ts }
+            lastRead = r
+            d.set(r, forKey: key); d.removeObject(forKey: "lastRead")
         } else { // first launch with this feature: everything so far counts as read
             let now = Int64(Date().timeIntervalSince1970 * 1000)
             var r = [Self.everyone: now]
-            for g in SavedGroups.all() { r[g.code] = now }
-            if let c = d.string(forKey: "code"), !c.isEmpty { r[c] = now }
+            for g in SavedGroups.all() { r[GroupTag.of(g.code)] = now }
+            if let c = GroupSecrets.shared.current { r[GroupTag.of(c)] = now }
             lastRead = r
             d.set(r, forKey: key)
         }
     }
 
+    /// A group got a new code (someone was removed): what was read stays read.
+    func rename(_ old: String, _ new: String) {
+        guard let t = lastRead.removeValue(forKey: tag(old)) else { return }
+        lastRead[tag(new)] = t
+        UserDefaults.standard.set(lastRead, forKey: key)
+    }
+
     /// Everything up to `ts` in this channel was seen.
     func markRead(_ channel: String, upTo ts: Int64) {
-        guard ts > lastRead[channel] ?? 0 else { return }
-        lastRead[channel] = ts
+        guard ts > lastRead[tag(channel)] ?? 0 else { return }
+        lastRead[tag(channel)] = ts
         UserDefaults.standard.set(lastRead, forKey: key)
         updateAppBadge()
     }
 
     /// Messages from others in a group (by code) or in Everyone that came after the last one seen there.
     func count(_ channel: String, in all: [Message], me: String) -> Int {
-        let since = lastRead[channel] ?? 0
+        let since = lastRead[tag(channel)] ?? 0
         return all.reduce(0) { n, m in
             let inChannel = channel == Self.everyone ? m.isPublic : (!m.isPublic && m.group == channel)
             return n + (inChannel && m.sender != me && m.ts > since && Place.of(m.text) == nil ? 1 : 0)

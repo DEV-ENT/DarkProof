@@ -42,7 +42,9 @@ object WifiBoard {
     @Volatile private var error: String? = null // why the board could not start
     @Volatile private var before = emptySet<String>() // addresses this phone had before the hotspot started
     @Volatile private var app: Context? = null
-    private val pool = Executors.newFixedThreadPool(8) // caps how many browsers are served at once
+    private val pool = java.util.concurrent.ThreadPoolExecutor(8, 8, 0L, java.util.concurrent.TimeUnit.MILLISECONDS, java.util.concurrent.ArrayBlockingQueue(16)) // caps how many browsers are served at once
+    private val watchdog = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "board-watchdog").apply { isDaemon = true } }
+    private var minuteStart = 0L; private var postsThisMinute = 0
     private val lastPost = ConcurrentHashMap<String, Long>() // client address -> time of last post
     private val time = SimpleDateFormat("HH:mm", Locale.US)
     private val HOTSPOT_IFACES = listOf("ap", "swlan", "softap", "wlan1", "wlan2")
@@ -120,13 +122,17 @@ object WifiBoard {
                 error = "Couldn't start the board. Restart DarkProof and try again."; main.post { stop(); changed() }; return@thread
             }
             server = ss
-            try { while (true) { val s = ss.accept(); pool.execute { handle(s) } } }
+            try { while (true) { val s = ss.accept(); try { pool.execute { handle(s) } } catch (_: java.util.concurrent.RejectedExecutionException) { s.close() } } }
             catch (_: Exception) { }
             finally { ss.close(); if (server === ss) server = null }
         }
     }
 
     private fun handle(s: Socket): Unit = s.use {
+        // The Wi-Fi around this phone only: not the mobile network, and not other apps on this phone.
+        if (!s.inetAddress.isSiteLocalAddress && !s.inetAddress.isLinkLocalAddress) return
+        fun limit(seconds: Long) = watchdog.schedule({ runCatching { s.close() } }, seconds, java.util.concurrent.TimeUnit.SECONDS)
+        var cut = limit(30) // sending one byte every few seconds can't hold a place for long
         try {
             s.soTimeout = 10_000
             val inp = BufferedInputStream(s.getInputStream())
@@ -136,14 +142,18 @@ object WifiBoard {
             val length = lines.firstOrNull { it.lowercase().startsWith("content-length:") }
                 ?.substringAfter(':')?.trim()?.toIntOrNull()?.coerceIn(0, 4096) ?: 0
             val body = ByteArray(length).also { var n = 0; while (n < length) { val r = inp.read(it, n, length - n); if (r < 0) break; n += r } }
+            fun header(n: String) = lines.firstOrNull { it.lowercase().startsWith("$n:") }?.substringAfter(':')?.trim()
+            // Made by some other website, or a website's name pointed at this phone: the board is only ever opened by its address.
+            val foreign = header("origin")?.let { it.substringAfter("://") != header("host") } ?: false || header("host")?.substringBefore(':')?.all { it.isDigit() || it == '.' } != true
             when {
+                foreign -> respond(s, 404, "text/plain", "Not found")
                 method == "GET" && path == "/" -> respond(s, 200, "text/html; charset=utf-8", page())
-                method == "GET" && path == "/DarkProof.apk" && apk() != null -> sendFile(s, apk()!!)
+                method == "GET" && path == "/DarkProof.apk" && apk() != null -> { cut.cancel(false); cut = limit(300); sendFile(s, apk()!!) }
                 method == "GET" && path.startsWith("/messages") -> respond(s, 200, "application/json", messages())
                 method == "POST" && path == "/send" -> respond(s, 200, "application/json", post(s, String(body, Charsets.UTF_8)))
                 else -> respond(s, 404, "text/plain", "Not found")
             }
-        } catch (_: Exception) { }
+        } catch (_: Exception) { } finally { cut.cancel(false) }
     }
 
     private fun readHead(inp: BufferedInputStream): String? {
@@ -174,7 +184,7 @@ object WifiBoard {
     }.toString()
 
     /** This app's APK, to download from the board; null if it was installed in parts (an app store bundle). */
-    private fun apk(): java.io.File? = app?.applicationInfo?.takeIf { it.splitSourceDirs.isNullOrEmpty() }?.sourceDir?.let(::File)?.takeIf { it.canRead() }
+    private fun apk(): java.io.File? = app?.applicationInfo?.takeIf { it.splitSourceDirs.isNullOrEmpty() && it.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0 }?.sourceDir?.let(::File)?.takeIf { it.canRead() }
 
     private fun sendFile(s: Socket, f: java.io.File) {
         val head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.android.package-archive\r\nContent-Length: ${f.length()}\r\n" +
@@ -193,6 +203,10 @@ object WifiBoard {
         val who = s.inetAddress.hostAddress ?: "?"; val now = System.currentTimeMillis()
         if (now - (lastPost[who] ?: 0L) < MIN_POST_GAP_MS) return """{"ok":false,"error":"Wait a few seconds between messages."}"""
         lastPost[who] = now
+        synchronized(this) { // these go worldwide under this phone's name: not too many, whoever sends them
+            if (now - minuteStart > 60_000) { minuteStart = now; postsThisMinute = 0 }
+            if (++postsThisMinute > 60) return """{"ok":false,"error":"Too many messages right now. Try again in a minute."}"""
+        }
         MeshEngine.sendFromBoard(name, text)
         return """{"ok":true}"""
     }

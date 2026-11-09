@@ -7,11 +7,11 @@ enum Situation {
     static func text(engine: Engine, groupName: String, me: Spot?, now: Date = Date()) -> String {
         var lines: [String] = []
         let people = Person.all(in: engine.messages, me: engine.deviceId)
-        lines.append("Group \"\(groupName)\": \(people.count) other \(people.count == 1 ? "person" : "people") have written; \(engine.phones) phone(s) in range right now.")
+        lines.append("Group \"\(groupName.aiSafe())\": \(people.count) other \(people.count == 1 ? "person" : "people") have written; \(engine.phones) phone(s) in range right now.")
         for p in people.prefix(15) {
             var parts: [String] = []
             if let c = p.checkIn {
-                let how = p.reportedBy.map { "reported by \($0)" } ?? "checked in"
+                let how = p.reportedBy.map { "reported by \($0.aiSafe())" } ?? "checked in"
                 parts.append("\(c == .safe ? "safe" : "NEEDS HELP") (\(how) \(ago(p.checkInTs, now)))")
                 if !p.needs.isEmpty { parts.append("needs: " + Need.text(p.needs)) }
                 if let n = p.people, n > 1 { parts.append("\(n) people") }
@@ -19,12 +19,11 @@ enum Situation {
             else { parts.append("has not checked in") }
             parts.append("last heard \(ago(p.lastTs, now))")
             if let b = p.battery { parts.append("battery \(b)%") }
-            if engine.linkedNodes.contains(p.id) { parts.append("phone in range now") }
             if let s = p.spot {
                 if let me { parts.append("was \(FindSheet.meters(Geo.distance(me, s))) \(Geo.compassWord(Geo.bearing(me, s)).lowercased()) of you \(ago(p.spotTs, now))") }
                 else { parts.append("shared a position \(ago(p.spotTs, now))") }
             }
-            lines.append("- \(p.name): " + parts.joined(separator: ", "))
+            lines.append("- \(p.name.aiSafe()): " + parts.joined(separator: ", "))
         }
         if let m = engine.myLastCheckIn, let c = CheckIn.of(m.text) {
             lines.append("The user's own last check-in: \(c.label.lowercased()), \(ago(m.ts, now)).")
@@ -37,19 +36,27 @@ enum Situation {
         for s in places {
             var d = ""
             if let sp = s.place.spot, let me { d = ", \(FindSheet.meters(Geo.distance(me, sp))) \(Geo.compassWord(Geo.bearing(me, sp)).lowercased())" }
-            let note = s.place.note.isEmpty ? "" : ": \(s.place.note.prefix(120))"
-            lines.append("- \(s.place.kind.word)\(note) (by \(s.by), \(ago(s.ts, now))\(d))")
+            let note = s.place.note.isEmpty ? "" : ": \(s.place.note.aiSafe(120))"
+            lines.append("- \(s.place.kind.word)\(note) (by \(s.by.aiSafe()), \(ago(s.ts, now))\(d))")
         }
 
         let recent = engine.messages.filter { !$0.isPublic && CheckIn.of($0.text) == nil }.suffix(8)
         if !recent.isEmpty {
             lines.append("Latest group messages, oldest first:")
             for m in recent {
-                let who = m.sender == engine.deviceId ? "The user" : m.name
+                let who = m.sender == engine.deviceId ? "The user" : m.name.aiSafe()
                 let text = m.photo != nil ? "[photo] " + Photo.caption(m.text) : m.text
-                lines.append("- \(who), \(ago(m.ts, now)): \(text.prefix(160))")
+                lines.append("- \(who), \(ago(m.ts, now)): \(text.aiSafe(160))")
             }
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+extension String {
+    /// Text from other people, for the assistant: one line, short, and it can't close the <data> block around it.
+    func aiSafe(_ max: Int = 40) -> String {
+        let line = components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+        return String(line.replacingOccurrences(of: "<", with: "‹").replacingOccurrences(of: ">", with: "›").prefix(max))
     }
 }

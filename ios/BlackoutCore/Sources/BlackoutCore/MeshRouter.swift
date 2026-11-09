@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Flooding with deduplication and store-and-forward. No platform dependencies.
 /// Same rules as the Android MeshRouter (spec/FORMAT.md, "Forwarding rules").
@@ -18,44 +19,61 @@ public final class MeshRouter: @unchecked Sendable { // all state is guarded by 
     private let maxStored: Int
     private let lock = NSRecursiveLock() // re-entrant, like Kotlin's @Synchronized
     private var peers: [String] = []     // insertion-ordered set
-    private var seen = Set<String>()
-    private var order: [String] = []     // stored ids, oldest first
+    private var seen = Set<String>(), seenBefore = Set<String>() // two generations: old ones are forgotten
+    private var rotatedAt: Int64
+    private var order: [String] = []     // stored keys, oldest first
     private var stored: [String: Packet] = [:]
+    private var cameFrom: [String: String] = [:] // key -> the link that brought it (not for this phone's own)
+    private var held: [String: Int] = [:]        // link -> packets of it stored here
+    private let minCipher: Int, maxPerMinute: Int, unlimited: (String) -> Bool
+    private var pace: [String: (start: Int64, n: Int)] = [:] // link -> this minute's new packets
+    /// The smallest real packet: IV, tag, signature and three empty text fields. Anything shorter is junk.
+    public static let minSealed = 12 + 16 + 64 + 6
+    /// New packets taken from one link in a minute: far more than phones really send, so a flood costs its sender time.
+    public static let linkPerMinute = 3_000
+    private static let maxSeen = 50_000 // packets remembered, so a stream of new ones can't fill the memory
+
+    /// What makes two packets the same: the id and the content. An id alone isn't enough: someone who sees an id could
+    /// send junk under it first, and the real packet would then be dropped as a duplicate.
+    public static func key(_ p: Packet) -> String { p.id + ":" + SHA256.hash(data: p.cipher).prefix(8).map { String(format: "%02x", $0) }.joined() }
 
     public init(send: @escaping (_ peer: String, _ p: Packet) -> Void,
                 deliver: @escaping (Packet) -> Void,
                 now: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
                 retentionMs: Int64 = 7 * 24 * 3_600_000,
-                maxStored: Int = 500) {
+                maxStored: Int = 500,
+                minCipher: Int = 0, maxPerMinute: Int = 0, unlimited: @escaping (String) -> Bool = { _ in false }) {
         self.send = send; self.deliver = deliver; self.now = now
         self.retentionMs = retentionMs; self.maxStored = maxStored
+        self.minCipher = minCipher; self.maxPerMinute = maxPerMinute; self.unlimited = unlimited
+        rotatedAt = now()
     }
 
     public var peerCount: Int { locked { peers.count } }
 
-    /// After a restart: `all` is passed on again; `seenIds` are packets already handled, so they aren't shown twice.
+    /// After a restart: `all` is passed on again; `seenIds` are packets already handled (`key`), so they aren't shown twice.
     /// Packets dated in the future are left out. Peers already linked get the packets that are new to the router.
     public func restore(_ all: [Packet], seenIds: Set<String> = []) {
         locked {
             seen.formUnion(seenIds)
             let t = now()
-            let fresh = all.filter { !Self.inFuture($0.ts, now: t) && stored[$0.id] == nil }.sorted { $0.ts < $1.ts }.map(Self.clamp)
-            for p in fresh { seen.insert(p.id); keep(p) }
-            for p in fresh where stored[p.id] != nil { for peer in peers { forward(peer, p) } }
+            let fresh = all.filter { !Self.inFuture($0.ts, now: t) && stored[Self.key($0)] == nil }.sorted { $0.ts < $1.ts }.map(Self.clamp)
+            for p in fresh { seen.insert(Self.key(p)); keep(p, from: "") }
+            for p in fresh where stored[Self.key(p)] != nil { for peer in peers { forward(peer, p) } }
         }
     }
 
     /// Sends a message written on this device.
-    public func publish(_ p: Packet) { locked { seen.insert(p.id); keep(p); for peer in peers { forward(peer, p) } } }
+    public func publish(_ p: Packet) { locked { seen.insert(Self.key(p)); keep(p, from: ""); for peer in peers { forward(peer, p) } } }
 
-    public func peerDown(_ peer: String) { locked { peers.removeAll { $0 == peer } } }
+    public func peerDown(_ peer: String) { locked { peers.removeAll { $0 == peer }; pace[peer] = nil } }
 
     /// A new neighbor gets everything still stored.
     public func peerUp(_ peer: String) {
         locked {
             if !peers.contains(peer) { peers.append(peer) }
             prune()
-            for id in order { if let p = stored[id] { forward(peer, p) } }
+            for k in order { if let p = stored[k] { forward(peer, p) } }
         }
     }
 
@@ -63,26 +81,50 @@ public final class MeshRouter: @unchecked Sendable { // all state is guarded by 
     public func receive(from: String, _ packet: Packet) {
         locked {
             let t = now()
-            guard packet.ts >= t - retentionMs, !Self.inFuture(packet.ts, now: t), seen.insert(packet.id).inserted else { return }
+            guard packet.ts >= t - retentionMs, !Self.inFuture(packet.ts, now: t), packet.cipher.count >= minCipher else { return }
+            let k = Self.key(packet)
+            guard !seen.contains(k), !seenBefore.contains(k) else { return }
+            if maxPerMinute > 0 && !unlimited(from) { // not marked as seen: it can still come later, or from someone else
+                var w = pace[from] ?? (t, 0)
+                if t - w.start >= 60_000 { w = (t, 0) }
+                w.n += 1
+                pace[from] = w
+                guard w.n <= maxPerMinute else { return }
+            }
+            if t - rotatedAt > retentionMs || seen.count > Self.maxSeen { seenBefore = seen; seen = []; rotatedAt = t }
+            seen.insert(k)
             let p = Self.clamp(packet)
-            keep(p); deliver(p)
+            keep(p, from: from); deliver(p)
             for peer in peers where peer != from { forward(peer, p) }
         }
     }
 
     private func forward(_ peer: String, _ p: Packet) { if p.ttl > 1 { send(peer, p.withTtl(p.ttl - 1)) } }
-    private func keep(_ p: Packet) {
-        if stored[p.id] == nil { order.append(p.id) }
-        stored[p.id] = p
+    private func keep(_ p: Packet, from: String) {
+        let k = Self.key(p)
+        if stored[k] == nil {
+            order.append(k)
+            if !from.isEmpty { cameFrom[k] = from; held[from, default: 0] += 1 }
+        }
+        stored[k] = p
         prune()
+    }
+    private func forget(_ k: String) {
+        stored[k] = nil
+        if let f = cameFrom.removeValue(forKey: k) { let n = held[f, default: 1] - 1; held[f] = n > 0 ? n : nil }
     }
     private func prune() {
         let cut = now() - retentionMs
-        order.removeAll { id in
-            guard let p = stored[id], p.ts >= cut else { stored[id] = nil; return true }
+        order.removeAll { k in
+            guard let p = stored[k], p.ts >= cut else { forget(k); return true }
             return false
         }
-        while order.count > maxStored { stored[order.removeFirst()] = nil }
+        while order.count > maxStored {
+            // One link can't push everyone else's packets out: while it holds more than a quarter, its own oldest go first.
+            var i = 0
+            if let top = held.max(by: { $0.value < $1.value }), top.value > maxStored / 4, let j = order.firstIndex(where: { cameFrom[$0] == top.key }) { i = j }
+            forget(order.remove(at: i))
+        }
     }
     private func locked<T>(_ f: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return f() }
 }

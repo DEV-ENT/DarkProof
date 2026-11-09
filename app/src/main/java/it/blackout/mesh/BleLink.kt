@@ -44,6 +44,9 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
         private const val MAX_LINKS = 6
         private const val RETRY_MS = 5_000L
         private const val SWEEP_MS = 5_000L
+        private const val SAME_TIME_MS = 10_000L
+        private const val ROTATE_MS = 30_000L      // at the limit, at most one settled link gives way this often
+        private const val ROTATE_AGE_MS = 60_000L
         private const val STALE_MS = 5_000L    // at the link limit, a link with no HELLO this old makes room
         fun owns(peer: String) = peer.startsWith(PREFIX)
         // Status notes, in plain words (Home and Connections show them).
@@ -354,7 +357,9 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
         val other = links.values.firstOrNull { it !== l && it.remote == remote }
         if (other != null) { // two links to the same phone: keep one (spec: "Duplicate links")
             val keepCentral = BleProtocol.keepMyCentralLink(nodeId, remote)
-            val loser = if (other.central == l.central) other else if (l.central == keepCentral) other else l
+            // Only two links made at the same moment are really a duplicate. A later one claiming the same phone could be
+            // anyone: node ids prove nothing, so the link that's up stays. A dead one goes by its own disconnect.
+            val loser = if (kotlin.math.abs(l.createdAt - other.createdAt) >= SAME_TIME_MS) l else if (other.central == l.central) other else if (l.central == keepCentral) other else l
             Log.d(TAG, "duplicate link to $remote: closing ${loser.id}")
             drop(loser)
             if (loser === l) return
@@ -394,10 +399,16 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
     }
 
     /** At the link limit: forgets the oldest link whose other side hasn't sent HELLO after 5 s, if any. */
+    private var rotatedAt = 0L
     private fun makeRoom(): Boolean {
         val now = SystemClock.elapsedRealtime()
-        val stale = links.values.filter { it.remote == null && now - it.createdAt >= STALE_MS }.minByOrNull { it.createdAt } ?: return false
-        Log.d(TAG, "link limit: closing ${stale.id}, no HELLO yet"); drop(stale)
+        links.values.filter { it.remote == null && now - it.createdAt >= STALE_MS }.minByOrNull { it.createdAt }?.let {
+            Log.d(TAG, "link limit: closing ${it.id}, no HELLO yet"); drop(it); return true
+        }
+        // Every place taken by a phone that said HELLO: one at random gives way now and then, so nobody can hold them all by just staying.
+        if (now - rotatedAt < ROTATE_MS) return false
+        val l = links.values.filter { now - it.createdAt >= ROTATE_AGE_MS }.randomOrNull() ?: return false
+        rotatedAt = now; Log.d(TAG, "link limit: closing ${l.id} to make room"); drop(l, hard = true)
         return true
     }
 

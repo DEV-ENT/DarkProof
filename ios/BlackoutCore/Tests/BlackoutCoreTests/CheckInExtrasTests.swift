@@ -80,4 +80,10 @@ final class CheckInExtrasTests: XCTestCase {
         }
         XCTAssertTrue(Invite.webUrl(name: "G", code: "K7QF-2M9X-PA4T-W8RJ").absoluteString.hasPrefix(Invite.webPrefix))
     }
+
+    func testAnInviteInsideASharedMessageIsFoundAndHugeCodesAreRefused() {
+        let g = Invite.parse("Join my group on DarkProof: darkproof://join?name=Family&code=ABCD-EFGH-1234 see you")
+        XCTAssertEqual(g?.name, "Family"); XCTAssertEqual(g?.code, "ABCD-EFGH-1234")
+        XCTAssertNil(Invite.parse("darkproof://join?name=x&code=" + String(repeating: "A", count: 2500)))
+    }
 }

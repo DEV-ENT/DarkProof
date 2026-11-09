@@ -68,6 +68,7 @@ object OfflineMap {
     fun setUp(c: Context) {
         if (ready) return; ready = true
         MapLibre.getInstance(c.applicationContext)
+        if (Tor.enabled(c)) MapLibre.setConnected(false)
         val version = runCatching { c.packageManager.getPackageInfo(c.packageName, 0).versionName }.getOrNull() ?: "0"
         val ua = "DarkProof/$version (Android; +https://github.com/DEV-ENT/DarkProof)"
         HttpRequestUtil.setOkHttpClient(OkHttpClient.Builder()
@@ -95,8 +96,12 @@ object OfflineMap {
     }
 
     /** Saves the map around [c], replacing any saved area. */
+    /** With "Connect through Tor" the map shows only what is saved: the map server would see this phone's address and the area on screen. */
+    fun torChanged(on: Boolean) { runCatching { MapLibre.setConnected(if (on) false else null) } }
+
     fun download(ctx: Context, c: Spot) {
         if (state is State.Downloading) return
+        if (Tor.enabled(ctx)) { state = State.Failed("Turn off Connect through Tor to download the map: the map server would see your address."); return }
         val b = bounds(c)
         if (tileCount(b) > MAX_TILES) { state = State.Failed("This area needs too many map tiles."); return }
         state = State.Downloading(0f)

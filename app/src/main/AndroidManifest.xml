@@ -15,8 +15,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/> <!-- restart the mesh after the phone restarts -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC"/> <!-- "Lock DarkProof", only if it is turned on -->
     <uses-permission android:name="android.permission.VIBRATE"/> <!-- help alerts while the app is open -->
-    <application android:label="DarkProof" android:icon="@mipmap/ic_launcher" android:theme="@android:style/Theme.Material.NoActionBar" android:largeHeap="true">
+    <!-- Nothing goes into a backup or a phone-to-phone transfer: group codes and messages stay on this phone. -->
+    <application android:allowBackup="false" android:fullBackupContent="false" android:dataExtractionRules="@xml/no_backup" android:label="DarkProof" android:icon="@mipmap/ic_launcher" android:theme="@android:style/Theme.Material.NoActionBar" android:largeHeap="true">
         <uses-native-library android:name="libOpenCL.so" android:required="false"/>
         <!-- The QR scanner (Join) comes with the app from Google Play, so it works offline later. -->
         <meta-data android:name="com.google.mlkit.vision.DEPENDENCIES" android:value="barcode_ui"/>
@@ -25,11 +27,6 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale">
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
             <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts"/>
-            <!-- App shortcuts, tiles and notifications (Quick.kt) -->
-            <intent-filter>
-                <action android:name="it.darkproof.mesh.action.SAFE"/><action android:name="it.darkproof.mesh.action.HELP"/>
-                <action android:name="it.darkproof.mesh.action.CHAT"/><category android:name="android.intent.category.DEFAULT"/>
-            </intent-filter>
             <!-- Web invites: https://darkproof.app/join#name=…&code=… (App Links, once darkproof.app serves assetlinks.json) -->
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW"/>
@@ -45,6 +42,8 @@
                 <data android:scheme="darkproof" android:host="join"/>
             </intent-filter>
         </activity>
+        <!-- App shortcuts, tiles and notifications (Quick.kt) come through here: not exported, so no other app can start it. -->
+        <activity-alias android:name=".QuickActions" android:targetActivity=".MainActivity" android:exported="false"/>
         <service android:name=".MeshService" android:exported="false" android:foregroundServiceType="connectedDevice"/>
         <receiver android:name=".AnswerReceiver" android:exported="false"/>
         <receiver android:name=".BootReceiver" android:exported="true">

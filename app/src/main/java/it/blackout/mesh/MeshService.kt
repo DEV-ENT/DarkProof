@@ -35,8 +35,8 @@ class MeshService : Service() {
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var client: ConnectionsClient
     private lateinit var svc: String
-    private val found = ConcurrentHashMap<String, String>()   // endpoint -> deviceId (discovered)
-    private val names = ConcurrentHashMap<String, String>()   // endpoint -> deviceId (any connection, either direction)
+    private val found = ConcurrentHashMap<String, String>()   // endpoint -> link id (discovered)
+    private val names = ConcurrentHashMap<String, String>()   // endpoint -> link id (any connection, either direction)
     private val connected = ConcurrentHashMap.newKeySet<String>()
     private val pending = ConcurrentHashMap.newKeySet<String>()
     private var started = false
@@ -56,7 +56,7 @@ class MeshService : Service() {
         val n = Notification.Builder(this, ch).setContentTitle("DarkProof is on")
             .setContentText("Passing messages between phones nearby, also when the app is closed")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth).setContentIntent(open).setOngoing(true)
-            .addAction(Notification.Action.Builder(null, "Stop DarkProof", stop).build()).build()
+            .addAction(Notification.Action.Builder(null, "Stop DarkProof", stop).apply { if (Build.VERSION.SDK_INT >= 31) setAuthenticationRequired(true) }.build()).build()
         try {
             if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE) else startForeground(1, n)
         } catch (e: Exception) { // ForegroundServiceStartNotAllowedException, or SecurityException without the permissions
@@ -64,7 +64,7 @@ class MeshService : Service() {
         }
         // The saved group wins over the intent: Android may redeliver an old intent after the user switched groups.
         val prefs = getSharedPreferences("mesh", 0)
-        val name = prefs.getString("name", null) ?: i?.getStringExtra("name"); val code = prefs.getString("code", null) ?: i?.getStringExtra("code")
+        val name = prefs.getString("name", null) ?: i?.getStringExtra("name"); val code = Groups.code(this) ?: i?.getStringExtra("code")
         if (!started && name != null && code != null) {
             started = true
             io.execute {
@@ -98,7 +98,7 @@ class MeshService : Service() {
         client = Nearby.getConnectionsClient(this)
         val lora = LoraLink(this); MeshEngine.lora = lora; lora.start()
         val meshcore = MeshCoreLink(this); MeshEngine.meshcore = meshcore; meshcore.start()
-        val ble = BleLink(this, MeshEngine.deviceId); MeshEngine.ble = ble
+        val ble = BleLink(this, MeshEngine.linkId); MeshEngine.ble = ble
         MeshEngine.nearbyNodes = { connected.mapNotNull { names[it] }.toSet() }
         MeshEngine.sender = { peer, p ->
             when {
@@ -122,7 +122,7 @@ class MeshService : Service() {
     }
 
     private fun advertise() {
-        client.startAdvertising(MeshEngine.deviceId, svc, lifecycle,
+        client.startAdvertising(MeshEngine.linkId, svc, lifecycle,
             AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build())
             .addOnFailureListener { if (it.message?.contains("8001") != true) { status(problem(it)); ui.postDelayed(::advertise, 10_000) } }
     }
@@ -135,8 +135,8 @@ class MeshService : Service() {
     /** Only the phone with the lower ID initiates, so two phones never call each other at the same time. */
     private fun dial(ep: String) {
         val other = found[ep] ?: return
-        if (MeshEngine.deviceId >= other || ep in connected || !pending.add(ep)) return
-        client.requestConnection(MeshEngine.deviceId, ep, lifecycle).addOnFailureListener {
+        if (MeshEngine.linkId >= other || ep in connected || !pending.add(ep)) return
+        client.requestConnection(MeshEngine.linkId, ep, lifecycle).addOnFailureListener {
             pending -= ep; ui.postDelayed({ dial(ep) }, 5_000)
         }
     }
@@ -146,7 +146,7 @@ class MeshService : Service() {
     }
     private val payloads = object : PayloadCallback() {
         override fun onPayloadReceived(ep: String, p: Payload) {
-            val raw = p.asBytes() ?: return
+            val raw = p.asBytes() ?: run { client.cancelPayload(p.id); return } // DarkProof sends only packets: a file from someone could fill the disk
             io.execute { Packet.decode(raw)?.let { MeshEngine.router?.receive(ep, it) } }
         }
         override fun onPayloadTransferUpdate(ep: String, u: PayloadTransferUpdate) {}

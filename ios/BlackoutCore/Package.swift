@@ -5,10 +5,12 @@ import PackageDescription
 
 let package = Package(
     name: "BlackoutCore",
-    platforms: [.iOS(.v16), .macOS(.v13)],
+    platforms: [.iOS("26.0"), .macOS("26.0")], // CryptoKit has ML-KEM from 26: every phone in a group needs it
     products: [.library(name: "BlackoutCore", targets: ["BlackoutCore"])],
     targets: [
-        .target(name: "BlackoutCore"),
-        .testTarget(name: "BlackoutCoreTests", dependencies: ["BlackoutCore"]),
+        // Always optimized, also in Debug builds: unoptimized, the group-key step takes seconds instead of milliseconds.
+        .target(name: "Scrypt", swiftSettings: [.unsafeFlags(["-O"])]),
+        .target(name: "BlackoutCore", dependencies: ["Scrypt"]),
+        .testTarget(name: "BlackoutCoreTests", dependencies: ["BlackoutCore", "Scrypt"]),
     ]
 )

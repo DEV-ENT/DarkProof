@@ -19,29 +19,54 @@ class FormatVectorsTest {
 
     @Test fun vectorFileHasAllKinds() {
         assertEquals(4, vectors.count { it["kind"] == "kdf" }) // includes the Public channel code
-        assertEquals(2, vectors.count { it["kind"] == "seal" })
+        assertEquals(2, vectors.count { it["kind"] == "member" })
+        assertEquals(1, vectors.count { it["kind"] == "signed" }); assertEquals(1, vectors.count { it["kind"] == "signed-intro" })
+    }
+
+    @Test fun memberIdsAndEmojiMatch() = vectors.filter { it["kind"] == "member" }.forEach { v ->
+        val pub = unhex(v["public_key"]!!)
+        assertEquals(v["member_id"], P256.memberId(pub))
+        assertEquals(v["emoji"], P256.emoji(pub).joinToString(" "))
+        assertArrayEquals(pub, P256.compress(P256.decompress(pub)!!)) // decompressing gives the same point back
     }
 
     @Test fun keyDerivationMatches() = vectors.filter { it["kind"] == "kdf" }.forEach { v ->
         assertEquals(v.toString(), v["key"], hex(GroupCrypto.deriveKey(code(v))))
     }
 
-    @Test fun sealProducesIdenticalPacket() = vectors.filter { it["kind"] == "seal" }.forEach { v ->
-        val id = v["id"]!!; val ts = v["ts"]!!.toLong()
-        val cipher = GroupCrypto(code(v)).seal(id, ts, v["sender"]!!, v["name"]!!, v["text"]!!, iv = unhex(v["iv"]!!))
-        assertEquals(v["name"], v["packet"], hex(Packet(id, ts, v["ttl"]!!.toInt(), cipher).encode()))
+    private fun checkSigned(v: Map<String, String>, crypto: GroupCrypto) {
+        val id = v["id"]!!; val ts = v["ts"]!!.toLong(); val sig = unhex(v["signature"]!!)
+        val p = Packet.decode(unhex(v["packet"]!!))!!
+        assertEquals(id, p.id); assertEquals(ts, p.ts); assertEquals(16, p.ttl)
+        val o = crypto.openSigned(p)!!
+        assertEquals(v["member_id"], o.message.sender); assertEquals(v["name"], o.message.name)
+        assertArrayEquals(sig, o.signature)
+        val pub = P256.decompress(unhex(v["public_key"]!!))!!
+        assertTrue(P256.verify(pub, o.digest, o.signature))
+        assertFalse(P256.verify(pub, o.digest, sig.copyOf().also { it[63] = (it[63] + 1).toByte() })) // one bit off: no
+        assertFalse(P256.verify(P256.newKeyPair().public, o.digest, o.signature))                   // another key: no
+        // Sealing the same body with the same signature and IV gives the same bytes.
+        val again = crypto.seal(id, ts, o.message.sender, o.message.name, o.message.text, extra = o.extra, iv = unhex(v["iv"]!!), pad = Pad.NONE) { sig }
+        assertEquals(v["packet"], hex(Packet(id, ts, 16, again).encode()))
     }
 
-    @Test fun vectorPacketsDecodeAndOpen() = vectors.filter { it["kind"] == "seal" }.forEach { v ->
-        val p = Packet.decode(unhex(v["packet"]!!))!!
-        assertEquals(v["id"], p.id); assertEquals(v["ts"]!!.toLong(), p.ts); assertEquals(v["ttl"]!!.toInt(), p.ttl)
-        val m = GroupCrypto(code(v)).open(p)!!
-        assertEquals(v["sender"], m.sender); assertEquals(v["name"], m.name); assertEquals(v["text"], m.text)
-        assertNull(GroupCrypto("wrong-code").open(p))
+    @Test fun signedMessageMatches() = vectors.filter { it["kind"] == "signed" }.forEach { v ->
+        checkSigned(v, GroupCrypto(v["code"]!!))
+        assertEquals(v["text"], GroupCrypto(v["code"]!!).open(Packet.decode(unhex(v["packet"]!!))!!)!!.text)
+        assertNull(GroupCrypto("wrong-code").open(Packet.decode(unhex(v["packet"]!!))!!))
+    }
+
+    @Test fun introductionMatches() = vectors.filter { it["kind"] == "signed-intro" }.forEach { v ->
+        assertEquals(v["intro_key"], hex(GroupCrypto.deriveIntroKey(GroupCrypto.deriveKey(v["code"]!!))))
+        val intros = GroupCrypto(v["code"]!!).intros()
+        checkSigned(v, intros)
+        val o = intros.openSigned(Packet.decode(unhex(v["packet"]!!))!!)!!
+        assertEquals("02" + v["public_key"], hex(o.extra!!)) // 0x02, then the public key
+        assertNull(GroupCrypto(v["code"]!!).open(Packet.decode(unhex(v["packet"]!!))!!)) // not a message
     }
 
     @Test fun oldV02PacketsAreRejected() {
-        val raw = unhex(vectors.first { it["kind"] == "seal" }["packet"]!!).also { it[0] = 0xB1.toByte() }
+        val raw = unhex(vectors.first { it["kind"] == "signed" }["packet"]!!).also { it[0] = 0xB1.toByte() }
         assertNull(Packet.decode(raw))
     }
 }

@@ -10,6 +10,7 @@ import BlackoutCore
 final class BleLink: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDelegate, CBPeripheralDelegate {
     static let prefix = "ble:"
     private static let maxLinks = 6
+    private var rotatedAt = Date.distantPast
     private static let retryDelay: TimeInterval = 5
     private static let sweepEvery: TimeInterval = 5
     private static let stale: TimeInterval = 5 // at the link limit, a link with no HELLO this old makes room
@@ -90,9 +91,12 @@ final class BleLink: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDele
     /// At the link limit: forgets the oldest link whose other side hasn't sent HELLO after 5 s, if any.
     private func makeRoom() -> Bool {
         let now = Date()
-        guard let stale = links.values.filter({ $0.remote == nil && now.timeIntervalSince($0.createdAt) >= Self.stale })
-            .min(by: { $0.createdAt < $1.createdAt }) else { return false }
-        drop(stale)
+        if let stale = links.values.filter({ $0.remote == nil && now.timeIntervalSince($0.createdAt) >= Self.stale })
+            .min(by: { $0.createdAt < $1.createdAt }) { drop(stale); return true }
+        // Every place taken by a phone that said HELLO: one at random gives way now and then, so nobody can hold them all by just staying.
+        guard now.timeIntervalSince(rotatedAt) >= 30, let l = links.values.filter({ now.timeIntervalSince($0.createdAt) >= 60 }).randomElement() else { return false }
+        rotatedAt = now
+        drop(l)
         return true
     }
 
@@ -310,7 +314,9 @@ final class BleLink: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDele
         if l.isCentral { nodeOf[l.key] = remote }
         if let other = links.values.first(where: { $0 !== l && $0.remote == remote }) { // spec: "Duplicate links"
             let keepCentral = BleProtocol.keepMyCentralLink(myId: nodeId, remoteId: remote)
-            let loser = other.isCentral == l.isCentral ? other : (l.isCentral == keepCentral ? other : l)
+            // Only two links made at the same moment are really a duplicate. A later one claiming the same phone could be
+            // anyone: node ids prove nothing, so the link that's up stays. A dead one goes by its own disconnect.
+            let loser = abs(l.createdAt.timeIntervalSince(other.createdAt)) >= 10 ? l : other.isCentral == l.isCentral ? other : (l.isCentral == keepCentral ? other : l)
             drop(loser)
             if loser === l { return }
         }

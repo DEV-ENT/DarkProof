@@ -20,21 +20,23 @@ object Actions {
     const val HELP = "it.darkproof.mesh.action.HELP"   // open the "Send I need help?" question
     const val CHAT = "it.darkproof.mesh.action.CHAT"   // open the chat (of EXTRA_GROUP, if given)
     const val EXTRA_GROUP = "group"
+    /** The way in for all of these. It isn't exported, so another app on the phone can't send "I'm safe" for you. */
+    const val ALIAS = "it.blackout.mesh.QuickActions"
 
-    fun intent(c: Context, action: String, group: String? = null): Intent = Intent(c, MainActivity::class.java).setAction(action)
+    fun intent(c: Context, action: String, group: String? = null): Intent = Intent().setClassName(c, ALIAS).setAction(action)
         .apply { if (group != null) putExtra(EXTRA_GROUP, group) }
         .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
 }
 
 /** A check-in sent from outside the screen (tile, shortcut, notification): starts the mesh if needed, never waits for GPS. */
 object QuickCheckIn {
-    fun ready(c: Context) = c.getSharedPreferences("mesh", 0).getString("code", null) != null
+    fun ready(c: Context) = Groups.code(c) != null
 
     /** Sends [check] to [group] (the group in use if null); [done] runs on a background thread with false if there is no group. */
     fun send(c: Context, check: CheckIn, group: String? = null, done: (Boolean) -> Unit = {}) {
         val app = c.applicationContext
         val prefs = app.getSharedPreferences("mesh", 0)
-        val name = prefs.getString("name", null); val code = prefs.getString("code", null)
+        val name = prefs.getString("name", null); val code = Groups.code(app)
         if (name == null || code == null) { done(false); return }
         Thread {
             MeshEngine.start(app, name, code) // does nothing if it runs already
@@ -64,7 +66,7 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         if (i.action != Intent.ACTION_BOOT_COMPLETED && i.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
         val prefs = c.getSharedPreferences("mesh", 0)
-        if (prefs.getString("code", null) == null || prefs.getBoolean("stopped", false)) return
+        if (Groups.code(c) == null || prefs.getBoolean("stopped", false)) return
         MeshService.start(c) // connectedDevice may start from BOOT_COMPLETED (Android 14 and 15 rules)
     }
 }
@@ -74,10 +76,11 @@ class SafeTile : TileService() {
     override fun onTileAdded() { Ready.mark(this, Ready.TILE) }
     override fun onStartListening() {
         Ready.mark(this, Ready.TILE)
-        qsTile?.apply { state = Tile.STATE_INACTIVE; if (Build.VERSION.SDK_INT >= 29) subtitle = Groups.current(this@SafeTile)?.name; updateTile() }
+        qsTile?.apply { state = Tile.STATE_INACTIVE; if (Build.VERSION.SDK_INT >= 29) subtitle = if (AppLock.enabled(this@SafeTile)) null else Groups.current(this@SafeTile)?.name; updateTile() }
     }
     override fun onClick() {
-        if (!QuickCheckIn.ready(this)) { openApp(Intent(this, MainActivity::class.java)); return }
+        // With "Lock DarkProof" on, whoever holds the phone can't tell the group you're safe without unlocking.
+        if (!QuickCheckIn.ready(this) || AppLock.enabled(this)) { openApp(Intent(this, MainActivity::class.java)); return }
         QuickCheckIn.send(this, CheckIn.SAFE)
         qsTile?.apply { state = Tile.STATE_ACTIVE; if (Build.VERSION.SDK_INT >= 29) subtitle = "Sent"; updateTile() }
         Toast.makeText(this, "Sending “I'm safe” to ${Groups.current(this)?.name ?: "your group"}", Toast.LENGTH_SHORT).show()

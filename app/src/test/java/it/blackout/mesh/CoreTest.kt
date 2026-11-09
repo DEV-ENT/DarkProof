@@ -57,9 +57,10 @@ class CoreTest {
     @Test fun wantConfigBytes() { assertArrayEquals(byteArrayOf(0x18, 42), Meshtastic.wantConfig(42)) }
     @Test fun loraMessageFitsAtLimit() {
         val c = GroupCrypto("group-code"); val id = Packet.newId()
-        val p = Packet(id, 1, 16, c.seal(id, 1, "abcdef012345", "Massimiliano Rossi", "x".repeat(140)))
+        // Signed packets (spec "Signatures"): about 80 characters with a long name and a 16-char member id.
+        val p = Packet(id, 1, 16, c.seal(id, 1, "c482f374ea24d954", "Massimiliano Rossi", "x".repeat(80)))
         assertTrue(p.encode().size.toString(), Meshtastic.fits(p))
-        val q = Packet(id, 1, 16, c.seal(id, 1, "abcdef012345", "Massimiliano Rossi", "x".repeat(400)))
+        val q = Packet(id, 1, 16, c.seal(id, 1, "c482f374ea24d954", "Massimiliano Rossi", "x".repeat(140)))
         assertFalse(Meshtastic.fits(q))
     }
     @Test fun queuePacesDropsOldAndOversize() {
@@ -77,12 +78,43 @@ class CoreTest {
     @Test fun restoredSeenIdsAreNotDeliveredAgain() {
         val got = mutableListOf<String>()
         val r = MeshRouter({ _, _ -> }, { got += it.id })
-        r.restore(emptyList(), listOf(M1))
+        r.restore(emptyList(), listOf(MeshRouter.key(Packet(M1, 1, 16, byteArrayOf(1)))))
         r.receive("peer", Packet(M1, System.currentTimeMillis(), 16, byteArrayOf(1)))
         assertTrue(got.isEmpty())
         r.receive("peer", Packet("00000000000000b2", System.currentTimeMillis(), 16, byteArrayOf(1)))
         assertEquals(listOf("00000000000000b2"), got)
     }
+    /** Someone who saw an id can't stop the real packet by sending junk under it first, however many copies they send. */
+    @Test fun junkSentFirstUnderAnIdDoesNotStopTheRealPacket() {
+        val got = mutableListOf<Int>(); val t = System.currentTimeMillis()
+        val r = MeshRouter({ _, _ -> }, { got += it.cipher[0].toInt() })
+        fun send(b: Int) = r.receive("x", Packet(M1, t, 16, byteArrayOf(b.toByte())))
+        send(9); send(1); send(1)
+        assertEquals(listOf(9, 1), got)
+        send(2); send(3); send(4)
+        assertEquals(listOf(9, 1, 2, 3, 4), got)
+    }
+
+    @Test fun tooSmallPacketsAndFloodsFromOneLinkAreRefused() {
+        var t = 1_000_000L; val got = ArrayList<String>()
+        val r = MeshRouter({ _, _ -> }, { got += it.id }, now = { t }, minCipher = 5, maxPerMinute = 3, unlimited = { it == "relay" })
+        fun p(i: Int, n: Int = 5) = Packet("%016x".format(i), t, 16, ByteArray(n))
+        r.receive("a", p(1, 4)); assertTrue(got.isEmpty())                  // too small to be real
+        for (i in 2..6) r.receive("a", p(i)); assertEquals(3, got.size)     // the link's pace
+        r.receive("b", p(7)); assertEquals(4, got.size)                     // another link isn't held up
+        for (i in 8..12) r.receive("relay", p(i)); assertEquals(9, got.size) // relays are bigger and paged
+        t += 60_000; r.receive("a", p(6)); assertEquals(10, got.size)       // one refused earlier can still come
+    }
+
+    @Test fun oneLinkCantPushOutEveryoneElse() {
+        val sent = HashSet<String>(); val t = System.currentTimeMillis()
+        val r = MeshRouter({ _, p -> sent += p.id }, { }, maxStored = 8)
+        r.receive("good", Packet("00000000000000a1", t, 16, byteArrayOf(1)))
+        repeat(50) { r.receive("bad", Packet("%016x".format(1000 + it), t, 16, byteArrayOf(1))) }
+        sent.clear(); r.peerUp("new")
+        assertTrue("the first link's packet is still here", "00000000000000a1" in sent)
+    }
+
     // ---- spec "Forwarding rules": timestamps and ttl (same vectors as the iPhone's CoreTests) ----
 
     @Test fun packetsFromTheFutureAreDropped() {

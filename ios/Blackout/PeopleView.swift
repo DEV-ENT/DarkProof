@@ -46,12 +46,11 @@ struct PeopleView: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { t in
             let people = Person.all(in: engine.messages, me: engine.deviceId)
-            let nearby = people.filter { engine.linkedNodes.contains($0.id) }.count
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     HStack(alignment: .top) {
                         ScreenTitle(title: "People", subtitle: people.isEmpty ? groupName :
-                            "\(groupName) · \(people.count) \(people.count == 1 ? "person" : "people") · \(nearby) nearby")
+                            "\(groupName) · \(people.count) \(people.count == 1 ? "person" : "people")")
                         Spacer()
                         Button { nav.sheet = .settings } label: { RoundIcon(symbol: "gearshape.fill") }.accessibilityLabel("Settings")
                     }
@@ -152,15 +151,20 @@ struct PeopleList: View {
     let people: [Person]
     @ObservedObject var engine: Engine
     let now: Date
+    @CurrentCode private var code
     @State private var finding: Person?
+    @State private var checking: Person?
 
     var body: some View {
         VStack(spacing: 0) {
             ForEach(people) { p in
-                PersonRow(person: p, inRange: engine.linkedNodes.contains(p.id), byMe: p.reporterId == engine.deviceId, now: now) { finding = p }
+                PersonRow(person: p, byMe: p.reporterId == engine.deviceId, now: now,
+                          newKey: !p.isReport && engine.newKeyFor(code, p.id, p.name), find: { finding = p },
+                          open: p.isReport ? nil : { checking = p })
                 if p.id != people.last?.id { Rectangle().fill(Theme.line).frame(height: 1).padding(.leading, 76) }
             }
         }
+        .sheet(item: $checking) { PersonCheckSheet(engine: engine, person: $0, code: code) }
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
         .sheet(item: $finding) { FindSheet(person: $0) }
     }
@@ -168,10 +172,11 @@ struct PeopleList: View {
 
 struct PersonRow: View {
     let person: Person
-    let inRange: Bool
     var byMe = false
     let now: Date
+    var newKey = false        // a checked person's name with another key (spec "Person emoji")
     var find: () -> Void = {} // opens the compass, for people who shared their position
+    var open: (() -> Void)? = nil // their emoji check; reports have none
 
     private var status: (String, Color) {
         guard let c = person.checkIn else { return ("Last heard \(ago(person.lastTs, now))", Theme.dim) }
@@ -202,10 +207,10 @@ struct PersonRow: View {
                 Text(person.name).scaledFont(17, .semibold).foregroundStyle(Theme.text).lineLimit(1)
                 Text(s.0).scaledFont(14, .medium).foregroundStyle(s.1).fixedSize(horizontal: false, vertical: true)
                 if !extra.isEmpty { Text(extra).scaledFont(14, .semibold).foregroundStyle(Theme.text).fixedSize(horizontal: false, vertical: true) }
+                if newKey { Text("New key: check their emoji").scaledFont(14, .semibold).foregroundStyle(Theme.help) }
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 6) {
-                if inRange { Chip("Nearby") }
                 if let b = person.battery { BatteryLabel(percent: b) }
             }
             if person.spot != nil {
@@ -215,9 +220,10 @@ struct PersonRow: View {
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
         .contentShape(Rectangle())
-        .onTapGesture { if person.spot != nil { find() } }
+        .onTapGesture { if let open { open() } else if person.spot != nil { find() } }
         .accessibilityElement(children: .combine)
         .accessibilityAction(named: "Find \(person.name)") { if person.spot != nil { find() } }
+        .accessibilityAction(named: "Check \(person.name)'s emoji") { open?() }
     }
 }
 
@@ -264,120 +270,70 @@ struct ConnectionHelp: View {
     }
 }
 
-// MARK: - Settings
-
-struct GroupSheet: View {
+/// A person's 8 emoji (spec/FORMAT.md, "Person emoji"): compared with the emoji on their phone, then marked as checked.
+/// Warns when a checked person's name now comes with another key.
+struct PersonCheckSheet: View {
     @ObservedObject var engine: Engine
+    let person: Person
+    let code: String
+    @State private var checked = false
+    @State private var finding = false
+    @State private var askAdmin = false
+    @State private var askRemove = false
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("groupName") private var groupName = "My group"
-    @AppStorage("code") private var code = ""
-    @AppStorage("name") private var myName = ""
-    @State private var nameDraft = ""
-    @State private var groupDraft = ""
-    @State private var blocked: [String: String] = [:]
-    @AppStorage(LocationService.shareKey) private var shareLocation = false
-    @ObservedObject private var loc = LocationService.shared
-    @ObservedObject private var notifier = Notifier.shared
+
+    private func note(_ ok: Bool, _ done: String) { Nav.shared.toast(ok ? done : "Not everyone's keys have reached this phone yet. Try again when they're in reach.") }
 
     var body: some View {
-        SheetPage(title: "Settings") {
-            Card {
-                InputField(label: "Your name", hint: "Shown next to your messages.") {
-                    TextField("", text: $nameDraft).submitLabel(.done)
-                }
-                InputField(label: "Group name", hint: "Only on this phone. Each person can name it as they like.") {
-                    TextField("", text: $groupDraft, prompt: Text(groupName).foregroundColor(Theme.faint)).submitLabel(.done)
-                }
-                Button("Save") { save() }
-                    .buttonStyle(PrimaryButton())
-                    .disabled(clean(nameDraft, 20).isEmpty)
-            }
-            Card { FingerprintView(code: code) }
-            GroupsCard(engine: engine)
+        let pub = engine.publicKey(of: person.id, in: code)
+        let newKey = engine.newKeyFor(code, person.id, person.name)
+        SheetPage(title: person.name) {
             Card {
                 HStack {
-                    Text("Notifications").scaledFont(17, .bold).foregroundStyle(Theme.text)
+                    Text(newKey ? "New key for \(person.name)" : "Check \(person.name)").scaledFont(18, .bold)
+                        .foregroundStyle(newKey ? Theme.help : Theme.text)
                     Spacer()
-                    switch notifier.status {
-                    case .authorized, .provisional, .ephemeral: Chip("On", Theme.safe)
-                    case .denied: Chip("Off")
-                    default: EmptyView()
+                    if checked { Chip("Checked", Theme.safe) }
+                }
+                if newKey {
+                    Text("You checked \(person.name) before, with another key. If \(person.name) didn't reinstall DarkProof or reset their phone, someone else may be using their name. Check their emoji before you trust these messages.")
+                        .scaledFont(15).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+                }
+                if let pub {
+                    let ix = MemberKey.emoji(pub)
+                    Text(Fingerprint.emojiLines(ix)).scaledFont(30)
+                    Text(Fingerprint.spoken(ix)).scaledFont(13).foregroundStyle(Theme.dim)
+                    if checked {
+                        Text("You compared these with \(person.name)'s phone.").scaledFont(15).foregroundStyle(Theme.dim)
+                    } else {
+                        Text("Meet \(person.name) or call them. They open Settings › Groups and read you “Your emoji”. If they're the same as these, tap They match.")
+                            .scaledFont(15).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+                        Button("They match") { engine.markChecked(code, person.id, person.name); checked = true }.buttonStyle(GhostButton())
                     }
-                }
-                Text("Alerts when your groups write or check in, and always when someone needs help. In the background iOS keeps only Bluetooth running, so alerts then come from phones nearby. Made on your phone: no internet needed.")
-                    .scaledFont(15).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
-                if notifier.status == .notDetermined {
-                    Button("Turn on notifications") { notifier.requestPermission() }.buttonStyle(GhostButton())
-                } else if notifier.status == .denied {
-                    OpenSettingsButton()
+                } else {
+                    Text("\(person.name)'s key hasn't reached this phone yet, so their messages show “Not verified yet”. It comes by itself when their phone or the internet is in reach.")
+                        .scaledFont(15).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .onAppear { notifier.refresh() }
-            Card {
-                Toggle(isOn: $shareLocation) {
-                    Text("Share my location in check-ins").scaledFont(17, .bold).foregroundStyle(Theme.text)
-                }
-                .tint(Theme.safe)
-                Text("When you tap I'm safe or I need help, your group also sees where you are, and can find you with a compass. It works without internet. Only your group can read your check-ins.")
-                    .scaledFont(15).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
-                if shareLocation && loc.denied {
-                    Text("Location is off for DarkProof. Allow it in Settings, or your check-ins go out without it.")
-                        .font(.footnote).foregroundStyle(Theme.help)
-                    OpenSettingsButton()
-                }
+            if person.spot != nil {
+                Button { finding = true } label: { Label("Find \(person.name)", systemImage: "location.north.fill") }.buttonStyle(PrimaryButton())
             }
-            .onChange(of: shareLocation) { on in if on { LocationService.shared.requestPermission() } }
-            Card {
-                Text("Practice and shortcuts").scaledFont(17, .bold).foregroundStyle(Theme.text)
-                HStack(spacing: 10) {
-                    Button("Practice asking for help") { open(.practice) }.buttonStyle(GhostButton())
-                    Button("Shortcut") { open(.shortcut) }.buttonStyle(GhostButton())
-                }
-                Button("Show the Get ready list") { UserDefaults.standard.set(false, forKey: "hideGetReady"); Nav.shared.toast("It's on Home") }
-                    .buttonStyle(GhostButton())
-            }
-            if !blocked.isEmpty {
-                Card {
-                    Text("Blocked people").scaledFont(17, .bold).foregroundStyle(Theme.text)
-                    Text("Their messages, places and check-ins are hidden on this phone.").scaledFont(15).foregroundStyle(Theme.dim)
-                    ForEach(blocked.sorted(by: { $0.value < $1.value }), id: \.key) { id, name in
-                        HStack {
-                            Text(name).scaledFont(17, .semibold).foregroundStyle(Theme.text)
-                            Spacer()
-                            Button("Unblock") { Moderation.unblock(id); blocked = Moderation.blocked; engine.moderationChanged() }
-                                .buttonStyle(GhostButton()).accessibilityLabel("Unblock \(name)")
-                        }
-                    }
-                }
-            }
-            Card {
-                Text("Help and safety").scaledFont(17, .bold).foregroundStyle(Theme.text)
-                Text("In Everyone, hold a message to report it or block its sender. To report abuse or a problem, write to \(Contact.email).")
-                    .scaledFont(15).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 10) {
-                    Button("Email us") { UIApplication.shared.open(Contact.mail) }.buttonStyle(GhostButton())
-                    Button("Privacy policy") { UIApplication.shared.open(Contact.privacy) }.buttonStyle(GhostButton())
-                }
+            let admin = engine.isAdmin(code, person.id)
+            if admin { Text("\(person.name) is an admin of this group.").scaledFont(15).foregroundStyle(Theme.dim) }
+            if person.id != engine.deviceId, engine.isAdmin(code, engine.deviceId), engine.inGroup(code, person.id), !engine.removed(code) {
+                if !admin { Button("Make admin") { askAdmin = true }.buttonStyle(SecondaryButton()) }
+                Button("Remove from group") { askRemove = true }.buttonStyle(SecondaryButton())
             }
         }
-        .onAppear { nameDraft = myName; groupDraft = groupName; blocked = Moderation.blocked }
-    }
-
-    private func clean(_ s: String, _ max: Int) -> String {
-        String(s.trimmingCharacters(in: .whitespacesAndNewlines).prefix(max))
-    }
-
-    private func open(_ s: MainView.Sheet) {
-        Nav.shared.sheet = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { Nav.shared.sheet = s }
-    }
-
-    private func save() {
-        let n = clean(nameDraft, 20), typed = clean(groupDraft, Invite.maxGroupName)
-        let g = typed.isEmpty ? groupName : typed
-        if g != groupName { groupName = g; SavedGroups.remember(.init(name: g, code: code)) }
-        if n != myName { myName = n; engine.rejoin(name: n, code: code) }
-        Nav.shared.toast("Saved")
-        dismiss()
+        .onAppear { checked = engine.isChecked(code, person.id) }
+        .sheet(isPresented: $finding) { FindSheet(person: person) }
+        .alert("Make \(person.name) an admin?", isPresented: $askAdmin) {
+            Button("Make admin") { engine.makeAdmin(code, person.id) { note($0, "\(person.name) is now an admin") } }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("\(person.name) will be able to remove people and make others admins. The group sees this.") }
+        .alert("Remove \(person.name)?", isPresented: $askRemove) {
+            Button("Remove", role: .destructive) { engine.remove(code, person.id) { ok in note(ok, "\(person.name) was removed"); if ok { dismiss() } } }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("Everyone else gets a new key and a new invite code, and old invites stop working. \(person.name) can't read anything from now on. The group sees who removed them.") }
     }
 }

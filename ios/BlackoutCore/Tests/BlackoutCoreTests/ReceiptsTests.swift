@@ -7,8 +7,8 @@ final class ReceiptsTests: XCTestCase {
     /// Vector cross-checked with Python's hashlib/hmac (spec/FORMAT.md, "Delivery receipts").
     func testReceiptKeyVector() {
         let group = GroupCrypto.deriveKey("test-group-1")
-        XCTAssertEqual(hex(group), "5b3b419c3127c6562d34f9357179690746274ea9f6088385901e83d1d4055a9a")
-        XCTAssertEqual(hex(GroupCrypto.deriveReceiptKey(group)), "496bfa142c33041abecd0fdb71763051e81c2fed0a55cbc1c0a7af8311d4a225")
+        XCTAssertEqual(hex(group), "f5dbd9efb376f8e61a21bd63c2db282b5dfffffd21b1df45ff2af54139a6cd89")
+        XCTAssertEqual(hex(GroupCrypto.deriveReceiptKey(group)), "738e7a99ea6284081ccd3d830969a9cb6ad62fd6161f1adedf4d34f13677e479")
     }
 
     /// Old apps try only the group and public keys: they must not be able to open a receipt, and the other way round.

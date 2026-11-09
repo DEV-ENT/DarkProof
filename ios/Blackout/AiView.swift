@@ -15,25 +15,15 @@ struct AiView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .top) {
-                    ScreenTitle(title: "Ask", subtitle: "Offline assistant on this iPhone")
-                    Spacer()
-                    Button("New") { confirmNew = true }.buttonStyle(GhostButton())
+            HStack(alignment: .top, spacing: 12) {
+                ScreenTitle(title: "Ask", subtitle: "Works with no internet. It can be wrong: double-check anything important.")
+                Spacer(minLength: 0)
+                Menu {
+                    Button { confirmNew = true } label: { Label("New conversation", systemImage: "square.and.pencil") }
                         .disabled(ai.busy || ai.conversation.isEmpty)
-                        .accessibilityLabel("New conversation")
-                }
-                Button { choosingModel = true } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "cpu")
-                        Text(ai.selected.title).lineLimit(1)
-                        Image(systemName: "chevron.down").scaledFont(11, .bold)
-                    }
-                }
-                .buttonStyle(GhostButton())
-                .accessibilityLabel("AI model: \(ai.selected.title)")
-                Text("It works with no internet and can be wrong. Double-check anything important.")
-                    .scaledFont(13).foregroundStyle(Theme.faint)
+                    Button { choosingModel = true } label: { Label("AI model: \(ai.selected.title)", systemImage: "cpu") }
+                } label: { RoundIcon(symbol: "ellipsis") }
+                .accessibilityLabel("More: new conversation, AI model")
             }
             .padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 8)
 
@@ -48,8 +38,21 @@ struct AiView: View {
                     .padding(20)
                 }
             } else if ai.conversation.isEmpty {
-                EmptyState(symbol: "sparkles", title: "Ask anything",
-                           text: "First aid, water, staying warm, what to pack. Or summarize what your group said.")
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(suggestions, id: \.self) { q in
+                            Button { ask(q) } label: {
+                                Text(q).scaledFont(16, .semibold).foregroundStyle(Theme.text).multilineTextAlignment(.leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 18).padding(.vertical, 14)
+                                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(ai.busy)
+                        }
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                }
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -75,18 +78,10 @@ struct AiView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 10) {
-                Button { summarize() } label: { Label("Summarize \(groupName)", systemImage: "text.alignleft") }
-                    .buttonStyle(GhostButton())
-                    .disabled(ai.busy || !ai.selectedReady || groupMessages.isEmpty)
-                Composer(draft: $draft, placeholder: ai.busy ? "Thinking…" : "Ask a question",
-                         enabled: !ai.busy && ai.selectedReady) {
-                    let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !t.isEmpty {
-                        draft = ""
-                        ai.send(t, situation: Situation.text(engine: engine, groupName: groupName, me: LocationService.shared.location?.spot))
-                    }
-                }
+            Composer(draft: $draft, placeholder: ai.busy ? "Thinking…" : "Ask a question",
+                     enabled: !ai.busy && ai.selectedReady) {
+                let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { draft = ""; ask(t) }
             }
             .padding(.horizontal, 16).padding(.vertical, 10)
         }
@@ -100,16 +95,29 @@ struct AiView: View {
         }
     }
 
-    /// The group's recent messages (not Everyone), kept within what the model can read at once (about 4 characters
-    /// per token).
-    private func summarize() {
-        var h = groupMessages.suffix(40).map {
-            "\(ChatTime.stamp($0.ts)) \($0.name): \($0.text.prefix(300))"
-        }.joined(separator: "\n")
-        h = String(h.suffix(Int(ai.selected.context) * 2))
-        if !h.isEmpty {
-            ai.send("Summarize these emergency messages from my group: who is safe, who is asking for help, and what is missing. Do not make anything up.\n\n\(h)")
+    private static let catchUp = "Catch me up on the last 6 hours"
+
+    /// Tapped when the conversation is empty, like typing them.
+    private var suggestions: [String] {
+        ["Who in \(groupName) needs help?", "How do I treat a burn?", Self.catchUp, "How do I make water safe to drink?"]
+    }
+
+    private func ask(_ question: String) {
+        var situation = Situation.text(engine: engine, groupName: groupName, me: LocationService.shared.location?.spot)
+        var after: String?
+        if question == Self.catchUp {
+            // The group's messages of the last 6 hours (not Everyone), within what the model can read at once (about
+            // 4 characters per token). Shown as the short question; the messages go with what the app knows.
+            let since = Int64(Date().timeIntervalSince1970 * 1000) - 6 * 3_600_000
+            let recent = groupMessages.filter { $0.ts >= since }.suffix(40)
+            guard !recent.isEmpty else { Nav.shared.toast("Nothing from \(groupName) in the last 6 hours"); return }
+            let h = recent.map { "\(ChatTime.stamp($0.ts)) \($0.sender == engine.deviceId ? "The user" : $0.name.aiSafe()): \($0.text.aiSafe(300))" }
+                .joined(separator: "\n")
+            after = "Say who is safe, who is asking for help and what is missing. Do not make anything up."
+            situation += "\nAll group messages of the last 6 hours, oldest first:\n"
+                + String(h.suffix(Int(ai.selected.context) * 2))
         }
+        ai.send(question, situation: situation, after: after)
     }
 }
 

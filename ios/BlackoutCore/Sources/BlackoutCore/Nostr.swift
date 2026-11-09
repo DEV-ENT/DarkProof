@@ -59,10 +59,13 @@ public enum Nostr {
     public static func publish(_ event: [String: Any]) -> String { json(["EVENT", event]) }
 
     /// The Public channel's mailbox (spec/FORMAT.md, "Mailboxes"): worldwide, so it is caught up one page only.
-    public static let publicMailbox: UInt16 = 0x0794
+    public static let publicMailbox: UInt16 = 0x9576
     public static let page = 500                    // events per catch-up REQ
     public static let maxPages = 4                  // pages per group mailbox and relay link
-    public static let sinceMarginSeconds: Int64 = 600 // catch-up starts 10 min before the last time seen: clocks differ
+    public static let sinceMarginSeconds: Int64 = 1_500 // catch-up starts 25 min before the last time seen: events are dated up to 17 min back, and clocks differ
+    /// An event's date: the current time, rounded down to about 17 minutes, so stored events don't give away when they were sent.
+    public static func blurred(_ now: Int64) -> Int64 { now - now % 1024 }
+    public static let relayPerMinute = 6_000        // messages taken from one relay link in a minute (100 a second)
 
     /// New events for all these mailboxes, as they arrive. `since` 7 days back so events from phones with a slow clock
     /// still match; `limit` 1 because stored events come from the catch-up REQs.
@@ -83,7 +86,7 @@ public enum Nostr {
         public init(eventId: String, accepted: Bool, reason: String) { self.eventId = eventId; self.accepted = accepted; self.reason = reason }
     }
     public static func ok(_ text: String) -> Ok? {
-        guard let a = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [Any], a.count >= 3, a[0] as? String == "OK",
+        guard let a = array(text), a.count >= 3, a[0] as? String == "OK",
               let id = a[1] as? String, let accepted = a[2] as? Bool else { return nil }
         let why = a.count > 3 ? a[3] as? String ?? "" : ""
         return Ok(eventId: id, accepted: accepted || why.lowercased().hasPrefix("duplicate"), reason: why)
@@ -91,7 +94,7 @@ public enum Nostr {
 
     /// The end of a subscription's stored events: ["EOSE", id] (complete) or ["CLOSED", id, reason] (not complete).
     public static func end(_ text: String) -> (subId: String, complete: Bool)? {
-        guard let a = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [Any], a.count >= 2,
+        guard let a = array(text), a.count >= 2,
               let type = a[0] as? String, let id = a[1] as? String else { return nil }
         switch type {
         case "EOSE": return (id, true)
@@ -118,7 +121,7 @@ public enum Nostr {
 
     /// The reason, if this is a relay refusing an event (["OK", id, false, reason]); else nil.
     public static func refusal(_ text: String) -> String? {
-        guard let a = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [Any], a.count >= 3,
+        guard let a = array(text), a.count >= 3,
               a[0] as? String == "OK", a[2] as? Bool == false else { return nil }
         return a.count > 3 ? a[3] as? String ?? "" : ""
     }
@@ -137,12 +140,34 @@ public enum Nostr {
         public let createdAt: Int64; public let subId: String
     }
     public static func received(_ text: String) -> Received? {
-        guard let a = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [Any], a.count >= 3,
+        guard let a = array(text), a.count >= 3,
               a[0] as? String == "EVENT", let e = a[2] as? [String: Any], e["kind"] as? Int == kind,
               let content = e["content"] as? String, let raw = Data(base64Encoded: content), let p = Packet.decode(raw),
               let id = e["id"] as? String, let pub = e["pubkey"] as? String else { return nil }
+        guard (e["created_at"] as? NSNumber)?.int64Value ?? 0 >= 0 else { return nil } // no event is from before 1970: a hostile relay
         return Received(packet: p, eventId: id, pubkey: pub, createdAt: (e["created_at"] as? NSNumber)?.int64Value ?? 0,
                         subId: a[1] as? String ?? "")
+    }
+
+    /// A real message from a relay is 4 levels of JSON deep.
+    static let maxDepth = 16
+    /// A relay's message as an array, or nil. JSONSerialization recurses once per nesting level, and a relay could send
+    /// enough levels to run off the end of a background thread's small stack, which ends the app.
+    static func array(_ text: String) -> [Any]? {
+        var depth = 0, quoted = false, escaped = false
+        for b in text.utf8 {
+            if quoted {
+                if escaped { escaped = false } else if b == 0x5C { escaped = true } else if b == 0x22 { quoted = false }
+            } else if b == 0x22 {
+                quoted = true
+            } else if b == 0x5B || b == 0x7B {
+                depth += 1
+                if depth > maxDepth { return nil }
+            } else if b == 0x5D || b == 0x7D {
+                depth -= 1
+            }
+        }
+        return try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [Any]
     }
 
     private static func json(_ o: Any) -> String {
@@ -182,6 +207,12 @@ public final class RelaySince {
 /// is followed by an older one (`until`), up to `Nostr.maxPages` for a group and one for the Public channel. A mailbox
 /// whose catch-up ends with EOSE starts next time where this one started; a refused one (CLOSED) or one with no answer
 /// is left for the next link. Times in seconds. Not thread-safe. Same as Android's CatchUp.
+/// A relay's messages this minute. Outlives its links: dropping the link and coming back doesn't buy a new share.
+public final class RelayPace {
+    public var from: Int64 = 0, n = 0
+    public init() {}
+}
+
 public final class CatchUp {
     public struct Req: Sendable {
         public let subId: String, mailbox: UInt16, since: Int64, until: Int64?
@@ -198,8 +229,22 @@ public final class CatchUp {
     public private(set) var sentAt: Int64 = 0
     private var startedAt: Int64 = 0
     private var pages = 0, count = 0, oldest = Int64.max, n = 0
+    private let pace: RelayPace
+    private var throttled = false
 
-    public init(relay: String, since: RelaySince, prefix: String = "cu") { self.relay = relay; self.since = since; self.prefix = prefix }
+    public init(relay: String, since: RelaySince, prefix: String = "cu", pace: RelayPace = RelayPace()) {
+        self.relay = relay; self.since = since; self.prefix = prefix; self.pace = pace
+    }
+
+    /// One more message from this relay: false if it is over its share for this minute. Relays aren't held to the limit
+    /// for links, which would let one of them use up the share of the others, so each has its own. What this drops is
+    /// fetched again on the next link: nothing moves the saved start forward once a link went over.
+    public func allow(now: Int64) -> Bool {
+        if now - pace.from >= 60 { pace.from = now; pace.n = 0 }
+        pace.n += 1
+        if pace.n > Nostr.relayPerMinute { throttled = true; return false }
+        return true
+    }
 
     public func add(_ mailboxes: [UInt16]) {
         for m in mailboxes where !done.contains(m) && !todo.contains(m) && m != current?.mailbox { todo.append(m) }
@@ -221,7 +266,7 @@ public final class CatchUp {
     public func end(_ subId: String, complete: Bool, now: Int64) -> Req? {
         guard let c = current, c.subId == subId else { return nil }
         current = nil
-        if complete {
+        if complete && !throttled {
             let max = c.mailbox == Nostr.publicMailbox ? 1 : Nostr.maxPages
             if count >= Nostr.page && pages < max { return page(c.mailbox, from: c.since, until: oldest == c.until ? oldest - 1 : oldest, now: now) }
             done.insert(c.mailbox)
@@ -232,7 +277,7 @@ public final class CatchUp {
 
     /// A live event of `mailbox` made at `createdAt`: once caught up, the saved start follows it (never past now).
     public func live(_ mailbox: UInt16, createdAt: Int64, now: Int64) {
-        if done.contains(mailbox) { since.advance(relay, mailbox, to: Swift.min(createdAt, now)) }
+        if done.contains(mailbox) && !throttled { since.advance(relay, mailbox, to: Swift.min(createdAt, now)) }
     }
 
     private func page(_ m: UInt16, from: Int64, until: Int64?, now: Int64) -> Req {
@@ -251,7 +296,7 @@ public final class CatchUp {
 public final class RelayOutbox {
     public static let ownMax = 500, candidatesMax = 5_000, missingMax = 2_000
     public static let sentMax = 3_000, onRelaysMax = 5_000, flightsMax = 300
-    public static let freshMs: Int64 = 120_000   // own packets younger than this go up without asking first
+    public static let freshMs: Int64 = 2_400_000 // own packets younger than this go up without asking first (their date is up to 35 minutes back)
     public static let answerMs: Int64 = 30_000   // how long a post waits for a relay to accept it
     public static let tries = 3
     /// A bridged packet waits up to this long, at random, before the relays are asked about it: phones that got it at

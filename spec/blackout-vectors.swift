@@ -3,10 +3,11 @@
 //   gen                                   -> print spec/test-vectors.txt
 //   seal <code> <id> <ts> <sender> <name> <text>  -> print packet hex (random IV, ttl 16)
 //   open <code> <packet-hex>              -> print decoded fields
-// Build: swiftc -O -o blackout-vectors spec/blackout-vectors.swift   (macOS, uses CryptoKit + CommonCrypto)
+// Build (macOS, CryptoKit; scrypt from the iPhone core, cross-checked against Python's hashlib.scrypt):
+//   mkdir -p /tmp/bv && cp spec/blackout-vectors.swift /tmp/bv/main.swift
+//   swiftc -O -o /tmp/bv/blackout-vectors /tmp/bv/main.swift ios/BlackoutCore/Sources/Scrypt/Scrypt.swift
 import Foundation
 import CryptoKit
-import CommonCrypto
 
 func hex(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined() }
 func unhex(_ s: String) -> Data {
@@ -16,14 +17,7 @@ func unhex(_ s: String) -> Data {
 }
 func deriveKey(_ raw: String) -> Data {
     let code = raw.precomposedStringWithCanonicalMapping  // NFC
-    let salt = Array("blackout-mesh-v1".utf8)
-    var out = [UInt8](repeating: 0, count: 32)
-    let rc = code.withCString { pw in
-        CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), pw, code.utf8.count, salt, salt.count,
-                             CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256), 120_000, &out, out.count)
-    }
-    precondition(rc == kCCSuccess)
-    return Data(out)
+    return Scrypt.derive(password: Data(code.utf8), salt: Data("darkproof-group-v2".utf8), n: 32768, r: 8, p: 1, length: 32)
 }
 func str(_ s: String) -> Data { let b = Data(s.utf8); return Data([UInt8(b.count >> 8), UInt8(b.count & 0xff)]) + b }
 func plain(_ sender: String, _ name: String, _ text: String) -> Data { str(sender) + str(name) + str(text) }
@@ -34,11 +28,11 @@ func seal(_ key: Data, _ id: String, _ ts: Int64, _ p: Data, iv: Data) -> Data {
 }
 func packet(_ id: String, _ ts: Int64, _ ttl: UInt8, _ cipher: Data) -> Data {
     var t = ts.bigEndian
-    return Data([0xB2]) + unhex(id) + Data(bytes: &t, count: 8) + Data([ttl]) + cipher
+    return Data([0xB3]) + unhex(id) + Data(bytes: &t, count: 8) + Data([ttl]) + cipher
 }
 func open(_ key: Data, _ raw: Data) -> (String, Int64, UInt8, String, String, String)? {
     let b = [UInt8](raw)
-    guard b.count > 18, b[0] == 0xB2 else { return nil }
+    guard b.count > 18, b[0] == 0xB3 else { return nil }
     let id = hex(Data(b[1..<9]))
     let ts = b[9..<17].reduce(Int64(0)) { ($0 << 8) | Int64($1) }
     let c = Data(b[18...])
@@ -62,15 +56,10 @@ case "gen":
     let nfd = "città sicura 2026".decomposedStringWithCanonicalMapping
     print("\n# Same code as above typed in decomposed form (a + combining accent); must give the same key.")
     print("kind: kdf\ncode_hex: \(hex(Data(nfd.utf8)))\nkey: \(hex(deriveKey(nfd)))")
-    let cases: [(String, String, Int64, String, String, String, String)] = [
-        ("blackout-test-1", "0123456789abcdef", 1793807238631, "7c0d995b-2c4", "Alice", "Hello from Alice", "000102030405060708090a0b"),
-        ("città sicura 2026", "fedcba9876543210", 1793810000000, "df441b09-3f2", "Zoë", "Acqua finita 💧 serve aiuto", "a0a1a2a3a4a5a6a7a8a9aaab"),
-    ]
-    for (code, id, ts, sender, name, text, iv) in cases {
-        let p = plain(sender, name, text)
-        let c = seal(deriveKey(code), id, ts, p, iv: unhex(iv))
-        print("\nkind: seal\ncode: \(code)\nid: \(id)\nts: \(ts)\nsender: \(sender)\nname: \(name)\ntext: \(text)\niv: \(iv)\nplain: \(hex(p))\nttl: 16\npacket: \(hex(packet(id, ts, 16, c)))")
-    }
+    // Signed packets (kind: signed) come from the Python reference with sealraw below: ECDSA needs a fixed nonce.
+case "sealraw" where a.count == 7: // sealraw <key hex> <id> <ts> <plaintext hex> <iv hex>: a packet from a given plaintext
+    let ts = Int64(a[4])!
+    print(hex(packet(a[3], ts, 16, seal(unhex(a[2]), a[3], ts, unhex(a[5]), iv: unhex(a[6])))))
 case "seal" where a.count == 8:
     var iv = Data(count: 12); _ = iv.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 12, $0.baseAddress!) }
     let ts = Int64(a[4])!
@@ -79,5 +68,5 @@ case "open" where a.count == 4:
     if let m = open(deriveKey(a[2]), unhex(a[3])) { print("id=\(m.0) ts=\(m.1) ttl=\(m.2) sender=\(m.3) name=\(m.4) text=\(m.5)") }
     else { print("CANNOT OPEN"); exit(1) }
 default:
-    print("usage: gen | seal <code> <id> <ts> <sender> <name> <text> | open <code> <packet-hex>"); exit(2)
+    print("usage: gen | seal <code> <id> <ts> <sender> <name> <text> | sealraw <key> <id> <ts> <plain> <iv> | open <code> <packet-hex>"); exit(2)
 }

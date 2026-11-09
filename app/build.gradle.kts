@@ -25,6 +25,7 @@ dependencies {
     implementation("org.maplibre.gl:android-sdk:12.3.1") // offline street maps (OpenFreeMap)
     implementation("com.squareup.okhttp3:okhttp:4.12.0") // MapLibre's HTTP client: User-Agent and 4-connection limit
     implementation("info.guardianproject:tor-android:0.4.9.14") // Tor inside the app, for "Connect through Tor" (BSD)
+    implementation("org.bouncycastle:bcprov-jdk18on:1.80.2") // ML-KEM-768 for post-quantum keys: Android has none of its own (MIT-style)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303") // Android's org.json is only a stub in unit tests
 }

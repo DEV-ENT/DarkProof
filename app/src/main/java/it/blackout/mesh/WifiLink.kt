@@ -31,6 +31,8 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
         const val PORT = 7777
         const val MAX_FRAME = 16_064
         const val MAX_LINKS = 32
+        private const val MAX_QUEUED_LINK = 12L * 1024 * 1024 // waiting to go out to one phone; more means it stopped reading
+        private const val MAX_QUEUED_ALL = 32L * 1024 * 1024
         private const val RETRY_MS = 5_000L
         const val HELLO_WAIT_MS = 10_000      // the other side's HELLO must come within this
         private val HELLO = "DPW1".toByteArray()
@@ -41,7 +43,11 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
     private class Link(val id: String, val node: String, val socket: Socket, val out: DataOutputStream, val dialed: Boolean) {
         val writer = Executors.newSingleThreadExecutor()
         val since = System.currentTimeMillis()
+        val queued = java.util.concurrent.atomic.AtomicLong()
     }
+    private val queuedAll = java.util.concurrent.atomic.AtomicLong()
+    private val slots = java.util.concurrent.Semaphore(MAX_LINKS + 8) // connections being served, so they can't use up threads
+    private val watchdog = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "wifi-watchdog").apply { isDaemon = true } }
     private val links = ConcurrentHashMap<String, Link>()   // router peer id -> link
     private val byNode = ConcurrentHashMap<String, Link>()  // node id -> its current link
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
@@ -65,7 +71,9 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
         }
         server = ss
         thread(isDaemon = true, name = "wifi-listen") {
-            try { while (true) { val s = ss.accept(); thread(isDaemon = true, name = "wifi-in") { serve(s, dialed = false) } } }
+            try { while (true) { val s = ss.accept()
+                if (!slots.tryAcquire()) { quiet(s); continue }
+                thread(isDaemon = true, name = "wifi-in") { try { serve(s, dialed = false) } finally { slots.release() } } } }
             catch (_: IOException) { } finally { quiet(ss); server = null; listening.set(false); changed() }
         }
         return ss.localPort
@@ -112,13 +120,25 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
         update("")
     }
 
+    /** At the limit: a link at random, among those over a minute old, makes room, so nobody can hold every place by just staying. */
+    private fun makeRoom(): Boolean {
+        val now = System.currentTimeMillis()
+        val l = links.values.filter { now - it.since > 60_000 }.randomOrNull() ?: return false
+        links.remove(l.id); quiet(l.socket)
+        return true
+    }
+
     /** Called by the router, possibly while it holds its lock: the write happens on the link's own thread. */
     fun send(peer: String, p: Packet) {
         val l = links[peer] ?: return
-        val b = p.encode()
+        val b = p.encode(); val n = b.size.toLong()
+        // A phone that stopped reading: what is waiting for it would pile up here until the app ran out of memory.
+        if (l.queued.get() + n > MAX_QUEUED_LINK || queuedAll.get() + n > MAX_QUEUED_ALL) { quiet(l.socket); return }
+        l.queued.addAndGet(n); queuedAll.addAndGet(n)
+        fun done() { l.queued.addAndGet(-n); queuedAll.addAndGet(-n) }
         try {
-            l.writer.execute { try { l.out.writeInt(b.size); l.out.write(b); l.out.flush() } catch (_: IOException) { quiet(l.socket) } }
-        } catch (_: RejectedExecutionException) { } // link already closed
+            l.writer.execute { try { l.out.writeInt(b.size); l.out.write(b); l.out.flush() } catch (_: IOException) { quiet(l.socket) } finally { done() } }
+        } catch (_: RejectedExecutionException) { done() } // link already closed
     }
 
     /**
@@ -129,6 +149,8 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
         val r = router() ?: run { quiet(s); return }
         sockets += s
         var link: Link? = null
+        // The whole HELLO must come in this time: the socket timeout alone lets one byte every few seconds go on for minutes.
+        val helloCut = watchdog.schedule({ if (link == null) quiet(s) }, HELLO_WAIT_MS.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
         try {
             s.tcpNoDelay = true; s.soTimeout = HELLO_WAIT_MS // the HELLO must come quickly
             val out = DataOutputStream(BufferedOutputStream(s.getOutputStream()))
@@ -145,14 +167,16 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
             s.soTimeout = 0
             val l = Link(PREFIX + node + "#" + count.incrementAndGet(), node, s, out, dialed)
             synchronized(byNode) {
-                if (links.size >= MAX_LINKS) return
+                if (links.size >= MAX_LINKS && !makeRoom()) return
                 val old = byNode[node]
+                // Node ids aren't proof of anything: from another address this may be someone pretending, so the link
+                // that's there stays and this one runs beside it (the router sees each packet once).
+                val samePhone = old == null || old.socket.inetAddress == s.inetAddress
                 // spec "Restarts and duplicate links": both phones keep the same link
-                if (old != null && !DuplicateLinks.keepNew(nodeId, node, dialed, old.dialed, l.since - old.since)) return
+                if (old != null && samePhone && !DuplicateLinks.keepNew(nodeId, node, dialed, old.dialed, l.since - old.since)) return
                 link = l
                 links[l.id] = l
-                byNode[node] = l
-                old?.let { quiet(it.socket) }
+                if (samePhone) { byNode[node] = l; old?.let { quiet(it.socket) } }
             }
             r.peerUp(l.id); changed()
             while (true) {
@@ -163,9 +187,11 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
             }
         } catch (_: IOException) {
         } finally {
+            helloCut.cancel(false)
             quiet(s); sockets -= s
             link?.let { l ->
-                links.remove(l.id); byNode.remove(l.node, l); l.writer.shutdown()
+                links.remove(l.id); l.writer.shutdown()
+                synchronized(byNode) { if (byNode.remove(l.node, l)) links.values.firstOrNull { it.node == l.node }?.let { byNode[l.node] = it } }
                 r.peerDown(l.id); changed()
             }
         }

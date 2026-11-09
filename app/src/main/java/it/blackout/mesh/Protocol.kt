@@ -407,13 +407,14 @@ object Invite {
 
     /** Group name and code in an invite link (either form), or null if it is not one. */
     fun parse(link: String): Pair<String, String>? {
-        val s = link.trim()
+        // A shared message has words around the link.
+        val s = link.trim().split(Regex("\\s+")).firstOrNull { it.startsWith("darkproof://", true) || it.contains("darkproof.app/join", true) } ?: link.trim()
         val items = (APP_LINK.find(s) ?: WEB_LINK.find(s))?.groupValues?.get(1) ?: return null
         val q = LinkedHashMap<String, String>()
         for (kv in items.split("&")) {
             val i = kv.indexOf('='); if (i >= 0) q.putIfAbsent(dec(kv.substring(0, i)), dec(kv.substring(i + 1)))
         }
-        val code = q["code"]?.trim()?.takeIf { it.length >= MIN_CODE_LENGTH } ?: return null
+        val code = q["code"]?.trim()?.takeIf { it.length in MIN_CODE_LENGTH..200 } ?: return null
         val name = q["name"]?.trim().orEmpty().ifEmpty { "Group" }.take(MAX_GROUP_NAME)
         return name to code
     }

@@ -22,6 +22,9 @@ object ApkShare {
     val URI: Uri = Uri.parse("content://it.darkproof.mesh.apk/DarkProof.apk")
 
     fun share(a: Activity) {
+        if (a.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) { // it has test hooks any app could use
+            Toast.makeText(a, "A test build of DarkProof can't be shared.", Toast.LENGTH_LONG).show(); return
+        }
         if (!a.applicationInfo.splitSourceDirs.isNullOrEmpty()) {
             // Installed as split APKs (e.g. from an app store bundle): the base APK alone would not install.
             Toast.makeText(a, "This copy of DarkProof was installed in parts and can't be shared as one file.", Toast.LENGTH_LONG).show()

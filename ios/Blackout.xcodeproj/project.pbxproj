@@ -215,7 +215,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -260,7 +260,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
@@ -283,13 +283,14 @@
 				INFOPLIST_KEY_CFBundleDisplayName = DarkProof;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "DarkProof uses Bluetooth to exchange messages with nearby phones and LoRa radios without internet.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "To scan invite QR codes and to take photos for your group.";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "To unlock DarkProof when you turn on its lock.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "DarkProof connects to nearby phones over Wi-Fi to exchange messages, even with no internet.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "If you choose, DarkProof adds your position to your check-ins, which only your group can read, and to places you share, which everyone can read. It also shows how far friends and places are.";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "To save photos from your group to your library.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -321,13 +322,14 @@
 				INFOPLIST_KEY_CFBundleDisplayName = DarkProof;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "DarkProof uses Bluetooth to exchange messages with nearby phones and LoRa radios without internet.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "To scan invite QR codes and to take photos for your group.";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "To unlock DarkProof when you turn on its lock.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "DarkProof connects to nearby phones over Wi-Fi to exchange messages, even with no internet.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "If you choose, DarkProof adds your position to your check-ins, which only your group can read, and to places you share, which everyone can read. It also shows how far friends and places are.";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "To save photos from your group to your library.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

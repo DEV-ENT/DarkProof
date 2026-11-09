@@ -212,12 +212,63 @@ fun PersonSheet(s: AppState, a: MainActivity, messages: List<Message>, id: Strin
                 PlusCodeRow(sp)
             }
         }
+        if (!p.isReport) CheckCard(p, s.group?.code)
+        if (!p.isReport) AdminButtons(s, a, p, close)
         p.spot?.let { sp -> PrimaryButton("Find ${p.name}", icon = R.drawable.ic_navigation) { s.sheet = Sheet.Find(p.name, sp, p.spotTs) } }
         if (!p.isReport) SecondaryButton("Ask if ${p.name} is safe", icon = R.drawable.ic_notifications) { ask = true }
     }
     if (ask) Confirm("Ask ${p.name}?", "${p.name} gets “${AreYouSafe(p.name).text.removePrefix("❓ ")}” with one-tap answers. The whole group sees the question.", "Ask",
         onYes = { ask = false; if (meshReady(a)) { Thread { MeshEngine.send(AreYouSafe(p.name).text) }.start(); Toast.makeText(a, "Asked ${p.name}", Toast.LENGTH_SHORT).show() } },
         onNo = { ask = false })
+}
+
+/** "Make admin" and "Remove from group", for admins (spec/DESIGN-v0.6-groups.md, "How it works for people"). */
+@Composable
+private fun AdminButtons(s: AppState, a: MainActivity, p: Person, close: () -> Unit) {
+    val code = s.group?.code; val tick = s.tick; val me = MeshEngine.deviceId
+    val admin = remember(tick, code, p.id) { MeshEngine.isAdmin(code, p.id) }
+    val canAct = remember(tick, code, p.id) { p.id != me && MeshEngine.isAdmin(code, me) && MeshEngine.inGroup(code, p.id) && !MeshEngine.removed(code) }
+    var ask by remember { mutableStateOf<String?>(null) }
+    fun result(ok: Boolean, done: String) { Toast.makeText(a, if (ok) done else "Not everyone's keys have reached this phone yet. Try again when they're in reach.", Toast.LENGTH_LONG).show() }
+    if (admin) Txt("${p.name} is an admin of this group.", 15, color = Theme.dim)
+    if (canAct) {
+        if (!admin) SecondaryButton("Make admin") { ask = "admin" }
+        SecondaryButton("Remove from group") { ask = "remove" }
+    }
+    if (ask == "admin") Confirm("Make ${p.name} an admin?", "${p.name} will be able to remove people and make others admins. The group sees this.", "Make admin",
+        onYes = { ask = null; MeshEngine.makeAdmin(code, p.id) { result(it, "${p.name} is now an admin") } }, onNo = { ask = null })
+    if (ask == "remove") Confirm("Remove ${p.name}?", "Everyone else gets a new key and a new invite code, and old invites stop working. ${p.name} can't read anything from now on. The group sees who removed them.", "Remove", danger = true,
+        onYes = { ask = null; MeshEngine.remove(code, p.id) { ok -> result(ok, "${p.name} was removed"); if (ok) close() } }, onNo = { ask = null })
+}
+
+/**
+ * A person's 8 emoji (spec "Person emoji"): compared with the emoji on their phone, then marked as checked. Warns when
+ * a checked person's name now comes with another key.
+ */
+@Composable
+private fun CheckCard(p: Person, code: String?) {
+    val pub = remember(p.id) { MeshEngine.publicKeyOf(code, p.id) }
+    var checked by remember(p.id) { mutableStateOf(MeshEngine.isChecked(code, p.id)) }
+    val newKey = remember(p.id, checked) { MeshEngine.newKeyFor(code, p.id, p.name) }
+    Card {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Txt(if (newKey) "New key for ${p.name}" else "Check ${p.name}", 18, FontWeight.Bold, if (newKey) Theme.help else Theme.text, Modifier.weight(1f))
+            if (checked) Chip("Checked", Theme.safe)
+        }
+        if (newKey) Txt("You checked ${p.name} before, with another key. If ${p.name} didn't reinstall DarkProof or reset their phone, someone else may be using their name. Check their emoji before you trust these messages.", 15, color = Theme.dim)
+        if (pub == null) {
+            Txt("${p.name}'s key hasn't reached this phone yet, so their messages show “Not verified yet”. It comes by itself when their phone or the internet is in reach.", 15, color = Theme.dim)
+        } else {
+            val ix = remember(pub) { P256.emoji(pub) }
+            Txt(Fingerprint.emojiLines(ix), 30, lineHeight = 40)
+            Txt(Fingerprint.spoken(ix), 13, color = Theme.dim)
+            if (checked) Txt("You compared these with ${p.name}'s phone.", 15, color = Theme.dim)
+            else {
+                Txt("Meet ${p.name} or call them. They open Settings › Groups and read you “Your emoji”. If they're the same as these, tap They match.", 15, color = Theme.dim)
+                GhostButton("They match") { MeshEngine.markChecked(code, p.id, p.name); checked = true }
+            }
+        }
+    }
 }
 
 @Composable private fun Fact(label: String, value: String) = Row {

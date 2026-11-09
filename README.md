@@ -57,7 +57,7 @@ There are two apps that work together: one for **Android** and one for **iPhone*
   - Packets carry a 2-byte "mailbox" tag, so a phone asks only for its group's and the Everyone channel's packets.
   - A phone with internet also passes on its neighbours' packets. In a blackout, one phone that still has internet (a satellite link, a working mast) connects its whole neighbourhood to the world.
   - Each phone posts its own new messages first. Anyone else's go up only if no relay has them yet, slowly, and relays that ask phones to slow down are paused.
-  - **Connect through Tor** (off by default) runs Tor inside the app (tor-android on Android, Tor.framework on iPhone), so relays don't see the phone's internet address. Nothing goes to the relays until a check through Tor passes.
+  - **Connect through Tor** (on by default) runs Tor inside the app (tor-android on Android, Tor.framework on iPhone), so relays don't see the phone's internet address. Nothing goes to the relays until a check through Tor passes.
   - Details: `spec/FORMAT.md`, "Internet relays".
 - **Everyone channel.** Anyone with DarkProof can read and post on it, whatever their group, nearby or online. Every phone relays every message, including messages from other groups that it cannot read. Offensive words in other people's posts are masked; hold a message to report it or block its sender. Contact for abuse: support@darkproof.app.
 - **Android extras:**

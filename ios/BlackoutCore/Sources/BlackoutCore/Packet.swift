@@ -1,12 +1,28 @@
 import Foundation
 
+/// How a packet is padded (spec "Padding"): `.size` up to the next listed size, `.full` to the largest, `.none` only for test vectors.
+public enum Pad: Sendable { case none, size, full }
+
 /// Unit carried over the network, compact enough to fit in a LoRa packet. Relays see only the id, timestamp, and remaining hops.
 /// Wire format: spec/FORMAT.md (shared with the Android app).
 public struct Packet: Equatable, Sendable {
-    public static let marker: UInt8 = 0xB2
+    public static let marker: UInt8 = 0xB3 // 0xB2 = v0.3–0.4 (PBKDF2 keys, device ids), 0xB3 = v0.5
     public static let headerSize = 18
     public static let maxCipher = 16_000
     public static let maxTtl = 64
+    /// The whole-packet sizes everything is padded to. 163 and 233 are the LoRa limits, so short packets still fit.
+    public static let sizes = [163, 233, 512, 1024, 2048, 4096, 8192, headerSize + maxCipher]
+    /// What sealing adds around the body: packet header, IV, signature, tag.
+    public static let overhead = headerSize + 12 + 64 + 16
+
+    /// Bytes of plaintext padding for a sealed packet that would otherwise be `size` bytes long.
+    public static func padding(_ size: Int, _ pad: Pad) -> Int {
+        switch pad {
+        case .none: return 0
+        case .full: return max(0, headerSize + maxCipher - size)
+        case .size: return (sizes.first { $0 >= size } ?? size) - size
+        }
+    }
 
     /// 16 lowercase hex chars (8 random bytes).
     public let id: String

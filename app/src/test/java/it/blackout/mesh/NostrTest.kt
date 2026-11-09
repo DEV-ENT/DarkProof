@@ -6,7 +6,8 @@ import org.junit.Test
 import java.security.MessageDigest
 
 /**
- * Event ids checked against Python's json.dumps (NIP-01 serialization) and signatures against @noble/curves 1.9.7.
+ * Event ids checked against Python's json.dumps (NIP-01 serialization) and signatures against @noble/curves 1.9.7;
+ * for the v0.5 packet (marker 0xB3) both against a Python BIP-340 that reproduces the noble values for 0xB2.
  * The full-event vector depends on Nostr.KIND: regenerate it if the kind changes.
  */
 class NostrTest {
@@ -23,7 +24,7 @@ class NostrTest {
     @Test fun signedEventMatchesNoble() {
         val e = Nostr.event(packet, secret, now = 1_793_990_000, aux = ByteArray(32) { 2 })
         assertEquals("6dd447ac274cd77ed2bb1373b5571a181271583014de6a085437d709bc613bd5", e.getString("pubkey"))
-        assertEquals("sqjQAAAAAAABAAABobIi/YAQAQID", e.getString("content"))
+        assertEquals("s6jQAAAAAAABAAABobIi/YAQAQID", e.getString("content"))
         assertEquals("[[\"t\",\"dp1-a8d0\"],[\"x\",\"a8d0000000000001\"],[\"expiration\",\"1794594800\"]]", e.getJSONArray("tags").toString())
         assertEquals(EXPECTED_ID, e.getString("id"))
         assertEquals(EXPECTED_SIG, e.getString("sig"))
@@ -147,7 +148,7 @@ class NostrTest {
         var t = 1_800_000_000_000L
         val o = RelayOutbox(now = { t }, jitter = { 0L })
         o.offer(pkt(1, t - 1_000), mine = true)                 // fresh own: straight up
-        o.offer(pkt(2, t - 5 * 60_000), mine = true)            // older own: looked up first
+        o.offer(pkt(2, t - 50 * 60_000), mine = true)           // older own: looked up first
         o.offer(pkt(3, t - 8 * 24 * 3_600_000L), mine = false)  // too old: never
         val (p1, own) = o.next(bridged = false)!!
         assertEquals(pkt(1, 0).id, p1.id); assertTrue(own); assertNull(o.next(bridged = true))
@@ -196,8 +197,8 @@ class NostrTest {
     }
 
     companion object {
-        // From scratchpad/noble/event.mjs with kind = Nostr.KIND.
-        const val EXPECTED_ID = "f1cfcc88f725896d6159d0035e17e1fca77ad130acc200a2cb798c550df4390a"
-        const val EXPECTED_SIG = "eefea03d7b56a59850db2ea11651cc3988def98b4c01b1f38c6c42226b64c45a895ba6ccba4e370ca70b0ee19f944b651cb703becee4b177ae5ab21e5c573335"
+        // v0.5 packet: from a Python json.dumps + BIP-340 (it gives noble's values for the old 0xB2 packet).
+        const val EXPECTED_ID = "60d8d1b5949f5e695a0914f7e6ffd6ef069cf7b9f3ad03cb936776b017875f20"
+        const val EXPECTED_SIG = "eeba77276dbb66aaf7467f1cf9eb30fefaea63f67ccb9a4ad4e1b1db6caae86f8d8cbfa74487c77aaacaca420f790b606cadd0a05718399e86453663e8370b97"
     }
 }

@@ -53,19 +53,40 @@ fun DarkProofApp(s: AppState, a: MainActivity) {
                     a.started(name, group); s.invite = null
                     if (created) s.sheet = Sheet.Invite
                 }
+            } else if (s.locked) {
+                LockScreen(a)
             } else if (s.introPermissions) {
                 PermissionIntro(a)
             } else {
                 MainView(s, a)
                 s.invite?.let { i ->
                     val saved = Groups.find(a, i.code) != null
-                    Confirm(if (saved) "Switch to ${i.name}?" else "Join ${i.name}?",
-                        "You'll see ${i.name}'s messages instead of ${g.name}'s. To switch back, tap the group name on Home.", if (saved) "Switch" else "Join",
+                    val twin = !saved && Groups.all(a).any { it.name.equals(i.name, ignoreCase = true) } // a look-alike: check-ins would go to someone else
+                    Confirm(if (twin) "Another group called ${i.name}?" else if (saved) "Switch to ${i.name}?" else "Join ${i.name}?",
+                        if (twin) "You already have a group called ${i.name}, and this invite is for a different one. Someone could be copying the name to get your check-ins. Only join if you trust who sent it." else "You'll see ${i.name}'s messages instead of ${g.name}'s. To switch back, tap the group name on Home.", if (saved) "Switch" else "Join",
                         onYes = { a.switchTo(Groups.find(a, i.code) ?: i); s.invite = null; s.tab = 0 }, onNo = { s.invite = null })
                 }
             }
         }
     }
+}
+
+/** "Lock DarkProof": nothing of the app shows here, but asking for help doesn't need unlocking. */
+@Composable
+private fun LockScreen(a: MainActivity) {
+    var ask by remember { mutableStateOf(false) }
+    var sent by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically)) {
+        Logo(88.dp)
+        Txt("DarkProof is locked", 26, FontWeight.Black)
+        Spacer(Modifier.height(16.dp))
+        PrimaryButton("Unlock") { AppLock.ask(a, "Unlock DarkProof") { a.justUnlocked() } }
+        DangerButton("I need help") { ask = true }
+        if (sent) Txt("Sent to your group.", 16, FontWeight.SemiBold, Theme.safe)
+    }
+    if (ask) Confirm("Send “I need help”?", "Your group gets it right away. You don't need to unlock.", "Send", danger = true,
+        onYes = { ask = false; QuickCheckIn.send(a, CheckIn.HELP); sent = true }, onNo = { ask = false })
 }
 
 // MARK: - Setup
@@ -111,7 +132,9 @@ fun SetupFlow(invite: SavedGroup?, askName: Boolean, modifier: Modifier = Modifi
                 }
                 InputField("Group name (you can leave it)", groupName, { groupName = it.take(Invite.MAX_GROUP_NAME) }, fallback, keyboard = KeyboardOptions(KeyboardCapitalization.Words))
                 PrimaryButton("Create group", enabled = !askName || name.isNotBlank()) {
-                    done(name.trim(), SavedGroup(groupName.trim().ifEmpty { fallback }, Invite.newCode()), true)
+                    val code = Invite.newCode()
+                    MeshEngine.found(ctx, code) // its first epoch is made on this phone (v0.6)
+                    done(name.trim(), SavedGroup(groupName.trim().ifEmpty { fallback }, code), true)
                 }
                 if (askName && name.isBlank()) Txt("Type your name first. Your group sees it next to your messages.", 14, color = Theme.dim)
             }
@@ -125,22 +148,20 @@ fun SetupFlow(invite: SavedGroup?, askName: Boolean, modifier: Modifier = Modifi
                     }
                     // A pasted invite link works too: its code is used and its name filled in.
                     InputField("Group code", code, { v -> Invite.parse(v)?.let { (n, c) -> code = c; if (groupName.isBlank() || groupName == "Group") groupName = n } ?: run { code = v.take(64) } },
-                        "XXXX-XXXX-XXXX-XXXX", keyboard = KeyboardOptions(KeyboardCapitalization.Characters))
+                        "XXXX-XXXX-XXXX-XXXX", keyboard = KeyboardOptions(KeyboardCapitalization.Characters, keyboardType = androidx.compose.ui.text.input.KeyboardType.Password))
                     InputField("Group name (you can leave it)", groupName, { groupName = it.take(Invite.MAX_GROUP_NAME) }, "Family", keyboard = KeyboardOptions(KeyboardCapitalization.Words))
                 }
                 val clean = Invite.normalizeCode(code)
                 val why = when {
                     askName && name.isBlank() -> "Type your name first. Your group sees it next to your messages."
                     code.isBlank() -> "Scan the QR code, or type or paste the group code."
-                    clean.length < Invite.MIN_CODE_LENGTH -> "A group code has at least ${Invite.MIN_CODE_LENGTH} characters."
+                    !Invite.isGeneratedCode(clean) -> "That isn't a code DarkProof made. Codes look like XXXX-XXXX-XXXX-XXXX."
                     else -> null
                 }
                 PrimaryButton(if (invite != null) "Join ${invite.name}" else "Join", enabled = why == null) {
                     done(name.trim(), SavedGroup(groupName.trim().ifEmpty { invite?.name ?: "Group" }, clean), false)
                 }
                 if (why != null) Txt(why, 14, color = Theme.dim)
-                else if (!Invite.isGeneratedCode(clean)) Txt("This isn't a code DarkProof made. Short or simple codes can be guessed, and anyone who guesses it can read the group.",
-                    14, color = Theme.help)
             }
         }
     }
@@ -275,8 +296,8 @@ fun MainView(s: AppState, a: MainActivity) {
         Sheet.NewGroup -> SheetPage("Another group", close) {
             SetupFlow(null, askName = false, inSheet = true, myName = s.name) { _, group, created -> a.switchTo(group); s.tab = 0; s.sheet = if (created) Sheet.Invite else null }
         }
-        Sheet.Settings -> SettingsSheet(s, a, { s.sheet = Sheet.NewGroup }, close)
-        Sheet.Radio -> ConnectionsSheet(s, a, close)
+        Sheet.Settings -> SettingsSheet(s, a, all, { s.sheet = Sheet.Invite }, { s.sheet = Sheet.NewGroup }, close)
+        Sheet.Radio -> SettingsSheet(s, a, all, { s.sheet = Sheet.Invite }, { s.sheet = Sheet.NewGroup }, close, connections = true)
         is Sheet.Find -> FindSheet(sh, close)
         Sheet.AddPlace -> AddPlaceSheet(close)
         is Sheet.SendPhoto -> SendPhotoSheet(sh.jpeg, close)
@@ -567,196 +588,295 @@ private fun InviteSheet(g: SavedGroup, a: MainActivity, close: () -> Unit) {
 
 @Composable
 private fun GroupsSheet(g: SavedGroup, a: MainActivity, all: List<Message>, invite: () -> Unit, add: () -> Unit, close: () -> Unit) {
+    SheetPage("Groups", close) { GroupsContent(g, a, all, invite, add, close) }
+}
+
+/** The group in use, the others to switch to, and "Join or start another group" (the Groups sheet, Settings > Groups). */
+@Composable
+private fun GroupsContent(g: SavedGroup, a: MainActivity, all: List<Message>, invite: () -> Unit, add: () -> Unit, close: () -> Unit) {
     val others = remember(g) { Groups.others(a) }
-    SheetPage("Groups", close) {
-        Card {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Txt(g.name, 18, FontWeight.Bold, modifier = Modifier.weight(1f)); Chip("In use", Theme.safe)
-            }
-            GhostButton("Invite people") { invite() }
+    Card {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Txt(g.name, 18, FontWeight.Bold, modifier = Modifier.weight(1f)); Chip("In use", Theme.safe)
         }
-        if (others.isNotEmpty()) {
-            Kicker("Your other groups")
-            Card(padding = 16.dp) {
-                others.forEach { o ->
-                    val unread = remember(all, o) { ReadMarks.unread(a, all, o.code) }
-                    val help = remember(all, o) { groupNeedsHelp(all, o.code) }
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Txt(o.name, 17, FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1)
-                        if (help) Chip("Needs help", Theme.help)
-                        if (unread > 0) Chip("$unread new", Theme.text)
-                        GhostButton("Switch") { a.switchTo(o); close() }
+        GhostButton("Invite people") { invite() }
+    }
+    if (others.isNotEmpty()) {
+        Kicker("Your other groups")
+        Card(padding = 16.dp) {
+            others.forEach { o ->
+                val unread = remember(all, o) { ReadMarks.unread(a, all, o.code) }
+                val help = remember(all, o) { groupNeedsHelp(all, o.code) }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Txt(o.name, 17, FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1)
+                    if (help) Chip("Needs help", Theme.help)
+                    if (unread > 0) Chip("$unread new", Theme.text)
+                    GhostButton("Switch") { a.switchTo(o); close() }
+                }
+            }
+        }
+        Txt("Switching shows the other group's messages. You still get alerts from every group, and their messages stay on the phone.", 14, color = Theme.dim)
+    }
+    SecondaryButton("Join or start another group", icon = R.drawable.ic_add) { add() }
+}
+
+/**
+ * Settings, and Home's "Connect" tile ([connections]: only the Advanced lines). One line each, in plain words: a line
+ * with more to it opens a page inside the sheet (the back arrow or Back returns); a plain on/off switches in the list.
+ */
+@Composable
+private fun SettingsSheet(s: AppState, a: MainActivity, all: List<Message>, invite: () -> Unit, add: () -> Unit, close: () -> Unit,
+                          connections: Boolean = false) {
+    var page by rememberSaveable { mutableStateOf("") }
+    val title = when (page) {
+        "name" -> "Your name"; "groups" -> "Groups"; "notifications" -> "Notifications"; "help" -> "Help and privacy"
+        "nearby" -> "Nearby phones"; "radio" -> "Long-range radio"; "board" -> "Wi-Fi board"; "share" -> "Send through another app"
+        "blocked" -> "Blocked people"; else -> if (connections) "Connections" else "Settings"
+    }
+    SheetPage(title, close, onBack = if (page.isEmpty()) null else ({ page = "" }), scrollKey = page) {
+        BackHandler(enabled = page.isNotEmpty()) { page = "" }
+        Perms.version // re-read permissions when they change
+        when (page) {
+            "name" -> NamePage(s, a) { page = "" }
+            "groups" -> s.group?.let { g ->
+                GroupsContent(g, a, all, invite, add, close)
+                FingerprintCard(g.code, "Check your group", "Compare these with the other phone. The same emoji mean you're in the same group; different ones mean a wrong code.")
+                MeshEngine.myPublicKey(g.code)?.let { pub ->
+                    val ix = remember(pub) { P256.emoji(pub) }
+                    Card {
+                        Txt("Your emoji in ${g.name}", 16, FontWeight.SemiBold)
+                        Txt(Fingerprint.emojiLines(ix), 30, lineHeight = 40)
+                        Txt(Fingerprint.spoken(ix), 13, color = Theme.dim)
+                        Txt("When someone checks you, read them these. If their phone shows the same, it's really you writing.", 14, color = Theme.dim)
                     }
                 }
             }
-            Txt("Switching shows the other group's messages. You still get alerts from every group, and their messages stay on the phone.", 14, color = Theme.dim)
+            "notifications" -> Card {
+                Txt("Notifications", 16, FontWeight.SemiBold)
+                Txt("Alerts when any of your groups writes or checks in, also when DarkProof is closed. While it is open, someone needing help or asking if you're safe shows at the top of the screen. Made on your phone: no internet needed.",
+                    14, color = Theme.dim)
+                if (s.notificationsOff) GhostButton("Turn on notifications") { a.askNotifications() }
+                else Txt("On", 15, FontWeight.SemiBold, Theme.safe)
+            }
+            "help" -> HelpPage(s, a, close)
+            "nearby" -> NearbyPage(s, a)
+            "radio" -> RadioPage(s)
+            "board" -> BoardPage(s, a)
+            "share" -> Card {
+                Txt("For satellite messengers such as Garmin inReach or Zoleo, text messages once the network is back, or any app. It includes your battery and, if location is on, where you are. It leaves DarkProof: that app decides who can read it.", 15, color = Theme.dim)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    GhostButton("Share “I'm safe”") { shareStatus(a, s, CheckIn.SAFE) }
+                    GhostButton("Share “I need help”") { shareStatus(a, s, CheckIn.HELP) }
+                }
+            }
+            "blocked" -> BlockedPage(s, a)
+            else -> {
+                if (connections) {
+                    Txt("The ways your messages travel. All but Internet keep working in a blackout.", 15, color = Theme.dim)
+                    if (s.permissionsMissing) NearbyPermissionCard(a)
+                } else {
+                    EverydayRows(s, a) { page = it }
+                    Box(Modifier.padding(start = 6.dp, top = 6.dp)) { Kicker("Advanced") }
+                }
+                AdvancedRows(s, a, showBlocked = !connections) { page = it }
+            }
         }
-        SecondaryButton("Join or start another group", icon = R.drawable.ic_add) { add() }
     }
 }
 
+/** Settings' first card: name, groups, location, notifications, sharing the app, help. */
 @Composable
-private fun SettingsSheet(s: AppState, a: MainActivity, add: () -> Unit, close: () -> Unit) {
-    var name by rememberSaveable { mutableStateOf(s.name) }
-    val tick = s.tick
+private fun EverydayRows(s: AppState, a: MainActivity, open: (String) -> Unit) {
     val g = s.group
-    Perms.version // re-read permissions when they change
-    SheetPage("Settings", close) {
-        InputField("Your name", name, { name = it.take(40) }, keyboard = KeyboardOptions(KeyboardCapitalization.Words))
-        if (name.trim() != s.name && name.isNotBlank()) GhostButton("Save") {
-            s.name = name.trim(); a.getSharedPreferences("mesh", 0).edit().putString("name", s.name).apply(); MeshEngine.rename(s.name)
+    val groups = remember(g) { (listOfNotNull(g?.name) + Groups.others(a).map { it.name }).joinToString(", ") }
+    val noLocation = s.shareLocation && !Locator.allowed(a)
+    RowCard {
+        LinkRow(R.drawable.ic_person, "Your name", s.name) { open("name") }
+        LinkRow(R.drawable.ic_group, "Groups", groups) { open("groups") }
+        ToggleRow(R.drawable.ic_location_on, "Share my location", s.shareLocation,
+            if (noLocation) "Location isn't allowed for DarkProof, so check-ins go out without it."
+            else "When you check in, your group sees where you are and can find you with a compass.",
+            if (noLocation) Theme.help else Theme.dim) { a.shareLocation(it) }
+        if (noLocation) Box(Modifier.padding(start = 50.dp, bottom = 8.dp)) { GhostButton("Allow location") { a.askLocation() } }
+        LinkRow(R.drawable.ic_notifications, "Notifications", if (s.notificationsOff) "Off" else "On") { open("notifications") }
+        val noScreenLock = !AppLock.available(a); val canLock = s.lockOn || !noScreenLock
+        ToggleRow(R.drawable.ic_shield, "Lock DarkProof", s.lockOn,
+            if (s.lockOn && noScreenLock) "This phone has no screen lock any more, so this lock can't protect DarkProof. Set one in the phone's settings."
+            else if (canLock) "Asks for your fingerprint, face or phone PIN when you open DarkProof. Hides message text in notifications and blocks screenshots. “I need help” still works while it's locked."
+            else "Set a screen lock on this phone first.", if (s.lockOn && noScreenLock) Theme.help else Theme.dim) { on ->
+            if (canLock) AppLock.ask(a, if (on) "Turn on the lock" else "Turn off the lock") { a.setAppLock(on) }
+            else Toast.makeText(a, "Set a screen lock on this phone first", Toast.LENGTH_LONG).show()
         }
-        Card {
-            SwitchRow("Share my location in check-ins", s.shareLocation, { a.shareLocation(it) },
-                "When you tap I'm safe or I need help, your group also sees where you are, and can find you with a compass. It works without internet. Only your group can read it.")
-            if (s.shareLocation && !Locator.allowed(a)) {
-                Txt("Location isn't allowed for DarkProof, so check-ins go out without it.", 14, color = Theme.help)
-                GhostButton("Allow location") { a.askLocation() }
-            }
-        }
-        Card {
-            Txt("Notifications", 16, FontWeight.SemiBold)
-            Txt("Alerts when any of your groups writes or checks in, also when DarkProof is closed. While it is open, someone needing help or asking if you're safe shows at the top of the screen. Made on your phone: no internet needed.",
-                14, color = Theme.dim)
-            if (s.notificationsOff) GhostButton("Turn on notifications") { a.askNotifications() }
-        }
-        if (g != null) FingerprintCard(g.code, "Check your group", "Compare these with the other phone. The same emoji mean you're in the same group; different ones mean a wrong code.")
-        Card {
-            Txt("Practice", 16, FontWeight.SemiBold)
-            Txt("Walk through asking for help, step by step. Nothing is sent.", 14, color = Theme.dim)
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                GhostButton("Practice now") { s.sheet = Sheet.Practice }
-                if (Ready.done(a, Ready.HIDDEN)) GhostButton("Show “Get ready”") { a.getSharedPreferences("ready", 0).edit().remove(Ready.HIDDEN).apply(); s.tick++; close() }
-            }
-        }
-        Card {
-            Txt("Share DarkProof", 16, FontWeight.SemiBold)
-            Txt("Give the app to another Android phone without internet, with Quick Share or Bluetooth.", 14, color = Theme.dim)
-            GhostButton("Share the app") { ApkShare.share(a) }
-        }
-        Card {
-            Txt("Wi-Fi board", 16, FontWeight.SemiBold)
-            Txt("People without the app join this phone's Wi-Fi network, then read and post Everyone messages in their browser. Android users can also download DarkProof there.", 14, color = Theme.dim)
-            key(tick) {
-                GhostButton(if (WifiBoard.running) "Stop the Wi-Fi board" else "Start the Wi-Fi board") {
-                    if (WifiBoard.running) WifiBoard.stop() else WifiBoard.start(a) { MeshEngine.notifyUi() }
-                    s.tick++
-                }
-                WifiBoard.status.takeIf { it != "Off" }?.let { Txt(it, 14, color = if (WifiBoard.running) Theme.safe else Theme.help) }
-            }
-        }
-        SecondaryButton("Join or start another group", icon = R.drawable.ic_add) { add() }
-        key(s.moderated) {
-            val blocked = Moderation.blocked(a)
-            if (blocked.isNotEmpty()) Card {
-                Txt("Blocked people", 16, FontWeight.SemiBold)
-                Txt("Their messages, places and check-ins are hidden on this phone.", 14, color = Theme.dim)
-                blocked.forEach { (id, n) ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Txt(n, 16, modifier = Modifier.weight(1f), maxLines = 1)
-                        GhostButton("Unblock") { Moderation.unblock(a, id); s.moderated++ }
-                    }
-                }
-            }
-        }
-        Card {
-            Txt("Help and safety", 16, FontWeight.SemiBold)
-            Txt("In Everyone, hold a message to report it or block its sender. To report abuse or a problem, write to ${Contact.EMAIL}.", 14, color = Theme.dim)
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                GhostButton("Email us") { Contact.open(a, Contact.MAIL) }
-                GhostButton("Privacy policy") { Contact.open(a, Contact.PRIVACY) }
-            }
-        }
+        LinkRow(R.drawable.ic_share, "Share the app", detail = "To an Android phone nearby, no internet needed") { ApkShare.share(a) }
+        LinkRow(R.drawable.ic_help, "Help and privacy") { open("help") }
     }
 }
 
-/** Every way messages travel, in one place: what is linked now, switches, pairing, and other apps. */
+/** Settings > Advanced (and the Connect tile): every way messages travel, the battery saver and blocked people. */
 @Composable
-private fun ConnectionsSheet(s: AppState, a: MainActivity, close: () -> Unit) {
-    val tick = s.tick
+private fun AdvancedRows(s: AppState, a: MainActivity, showBlocked: Boolean, open: (String) -> Unit) {
     var clock by remember { mutableIntStateOf(0) } // Tor's "can't connect" appears after 2 minutes without other news
     LaunchedEffect(Unit) { while (true) { kotlinx.coroutines.delay(5_000); clock++ } }
-    SheetPage("Connections", close) {
-        Txt("The ways your messages travel. All but Internet keep working in a blackout.", 15, color = Theme.dim)
-        if (s.permissionsMissing) Card {
-            Txt("Nearby devices permission needed", 18, FontWeight.Bold, Theme.help)
-            Txt("Without it DarkProof can't use Bluetooth or Wi-Fi Direct, so it can't find phones or radios. Wi-Fi networks and the internet still work.", 15, color = Theme.dim)
-            GhostButton("Allow") { a.askNearby() }
-        }
-        // Read here so the cards below are drawn again with fresh link states; no key(), which would reset their searches.
-        tick; clock
-        run {
-            val phones = phonesInRange()
-            Card {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Txt("Nearby phones", 18, FontWeight.Bold, modifier = Modifier.weight(1f))
-                    Chip(if (phones > 0) "$phones linked" else if (s.permissionsMissing || s.bluetoothOff) "Off" else "Searching", if (phones > 0) Theme.safe else Theme.dim)
-                }
-                Txt("Phones with DarkProof within about 10–50 m connect by themselves, over Bluetooth and Wi-Fi Direct.", 15, color = Theme.dim)
-                if (!s.permissionsMissing) {
-                    Txt("Nearby: ${MeshEngine.transportStatus.replaceFirstChar { it.lowercase() }} · ${MeshEngine.ble?.statusLine() ?: "Bluetooth: not started"}", 14, color = Theme.dim)
-                    if (s.bluetoothOff) GhostButton("Turn on Bluetooth") { a.turnOnBluetooth() }
-                }
-            }
-            WifiCard()
-            InternetCard()
-            Card {
-                SwitchRow("Battery saver", MeshEngine.batterySaver(a), { MeshEngine.setBatterySaver(it); s.tick++ },
-                    "Searches for phones less often, so the battery lasts longer. Linked phones stay linked; new ones can take up to 2 minutes to show up.")
-            }
-            val blocked = if (s.permissionsMissing) "Allow Nearby devices first: DarkProof needs it to use Bluetooth." else if (s.bluetoothOff) "Turn on Bluetooth first." else null
-            RadioCard("LoRa radio · Meshtastic",
-                "Reaches other radios kilometers away: about 2–10 km in a city, more from high places. Short messages only. Use a Meshtastic radio with the region set (EU_868 in Europe).",
-                MeshEngine.lora?.status?.removePrefix("LoRa: "), MeshEngine.lora?.connected == true, MeshEngine.lora?.paired == true, blocked,
-                MeshEngine.lora?.let { l -> { found: (String, String) -> Unit -> l.scan(found) } }, { MeshEngine.lora?.select(it) }, { MeshEngine.lora?.forget() })
-            RadioCard("LoRa radio · MeshCore",
-                "The same kind of radio with MeshCore firmware, version 1.15 or newer. DarkProof adds a #darkproof channel to the radio and every MeshCore repeater passes it on. Short messages only. The radio's PIN is often 123456 or shown on its screen.",
-                MeshEngine.meshcore?.status?.removePrefix("MeshCore: "), MeshEngine.meshcore?.connected == true, MeshEngine.meshcore?.paired == true, blocked,
-                MeshEngine.meshcore?.let { l -> { found: (String, String) -> Unit -> l.scan(found) } }, { MeshEngine.meshcore?.select(it) }, { MeshEngine.meshcore?.forget() })
-        }
-        Card {
-            Txt("Send via another app", 18, FontWeight.Bold)
-            Txt("For satellite messengers such as Garmin inReach or Zoleo, text messages once the network is back, or any app. It includes your battery and, if location is on, where you are. It leaves DarkProof: that app decides who can read it.", 15, color = Theme.dim)
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                GhostButton("Share “I'm safe”") { shareStatus(a, s, CheckIn.SAFE) }
-                GhostButton("Share “I need help”") { shareStatus(a, s, CheckIn.HELP) }
-            }
-        }
-    }
-}
-
-/** Internet relays: on/off, how many answer, and "Connect through Tor". */
-@Composable
-private fun InternetCard() {
-    val ctx = LocalContext.current
+    s.tick; clock // read here so the lines are drawn again with fresh link states
+    val phones = phonesInRange()
+    val wifi = MeshEngine.wifi
     val n = MeshEngine.nostr
-    Card {
-        SwitchRow("Internet", n != null, { MeshEngine.setInternet(it) },
-            "While there is Wi-Fi or mobile data, messages also travel through free public relays (Nostr), so friends far away get them and this phone passes on its neighbours' messages. In a blackout the other ways keep working. Group messages stay encrypted; relays see your internet address unless you use Tor.")
-        if (n != null) {
-            when {
-                n.torStuck -> Txt("Tor can't connect right now. Nearby links still work. DarkProof keeps trying.", 15, FontWeight.SemiBold, Theme.help)
-                n.throughTor == false -> Txt("Starting Tor… the first time can take a minute", 15, FontWeight.SemiBold, Theme.text)
-                else -> Txt(if (n.connected > 0) "Connected to ${n.connected} of ${n.total} relays" + (if (n.throughTor == true) " through Tor" else "")
-                            else "No internet right now: the other ways keep working",
-                    15, FontWeight.SemiBold, if (n.connected > 0) Theme.safe else Theme.dim)
-            }
-            SwitchRow("Connect through Tor", Tor.enabled(ctx), { MeshEngine.setTor(it) },
-                "Relays then can't see your internet address. Tor runs inside DarkProof: nothing else to install. Slower and uses more battery. Nothing goes to the relays until DarkProof has checked that Tor is working.")
+    RowCard {
+        LinkRow(R.drawable.ic_bluetooth, "Nearby phones",
+            when { phones > 0 -> "$phones linked"; s.permissionsMissing || s.bluetoothOff -> "Off"; else -> "Searching" }) { open("nearby") }
+        val wl = wifi?.links?.linkCount() ?: 0
+        ToggleRow(R.drawable.ic_wifi, "Wi-Fi network", wifi != null,
+            when { wifi == null -> "Off"; wl > 0 -> "$wl phone${if (wl == 1) "" else "s"} linked"; else -> "Finds phones on the same Wi-Fi, even with no internet" },
+            if (wl > 0) Theme.safe else Theme.dim) { MeshEngine.setWifi(it); s.tick++ }
+        val (net, netColor) = when {
+            n == null -> "Off: messages go only from phone to phone" to Theme.dim
+            n.torStuck -> "Tor can't connect right now. Nearby phones still work." to Theme.help
+            n.throughTor == false -> "Starting Tor… the first time can take a minute" to Theme.dim
+            n.connected > 0 -> ("Online" + (if (n.throughTor == true) " through Tor" else "") + ": reaches friends far away") to Theme.safe
+            else -> "No internet right now" to Theme.dim
+        }
+        ToggleRow(R.drawable.ic_public, "Internet", n != null, net, netColor) { MeshEngine.setInternet(it); s.tick++ }
+        if (n != null) ToggleRow(R.drawable.ic_shield, "Through Tor", Tor.enabled(a),
+            "Hides your internet address from the relays. Slower, uses more battery.") { MeshEngine.setTor(it); s.tick++ }
+        val radio = when {
+            MeshEngine.lora?.connected == true || MeshEngine.meshcore?.connected == true -> "Linked"
+            MeshEngine.lora?.paired == true || MeshEngine.meshcore?.paired == true -> "Paired"
+            else -> "None"
+        }
+        LinkRow(R.drawable.ic_settings_input_antenna, "Long-range radio", radio) { open("radio") }
+        val hours = remember(s.tick / 20) { BatteryLife.hoursLeft(a) }
+        ToggleRow(R.drawable.ic_battery_full, "Battery saver", MeshEngine.batterySaver(a),
+            hours?.let { "Battery: about $it h left at this rate" } ?: "Looks for phones less often, so the battery lasts longer") {
+            MeshEngine.setBatterySaver(it); s.tick++
+        }
+        LinkRow(R.drawable.ic_chat, "Wi-Fi board", if (WifiBoard.running) "On" else "Off") { open("board") }
+        LinkRow(R.drawable.ic_share, "Send through another app") { open("share") }
+        if (showBlocked) {
+            val blocked = remember(s.moderated) { Moderation.blocked(a).size }
+            LinkRow(R.drawable.ic_block, "Blocked people", if (blocked == 0) "None" else "$blocked") { open("blocked") }
         }
     }
 }
 
-/** Links over Wi-Fi networks: on/off, what is linked, this phone's address, and an address to dial by hand. */
 @Composable
-private fun WifiCard() {
+private fun NearbyPermissionCard(a: MainActivity) = Card {
+    Txt("Nearby devices permission needed", 18, FontWeight.Bold, Theme.help)
+    Txt("Without it DarkProof can't use Bluetooth or Wi-Fi Direct, so it can't find phones or radios. Wi-Fi networks and the internet still work.", 15, color = Theme.dim)
+    GhostButton("Allow") { a.askNearby() }
+}
+
+@Composable
+private fun NamePage(s: AppState, a: MainActivity, done: () -> Unit) {
+    var name by rememberSaveable { mutableStateOf(s.name) }
+    InputField("Your name", name, { name = it.take(40) }, keyboard = KeyboardOptions(KeyboardCapitalization.Words))
+    Txt("Shown next to your messages and check-ins.", 14, color = Theme.dim)
+    PrimaryButton("Save", enabled = name.isNotBlank() && name.trim() != s.name) {
+        s.name = name.trim(); a.getSharedPreferences("mesh", 0).edit().putString("name", s.name).apply(); MeshEngine.rename(s.name)
+        Toast.makeText(a, "Saved", Toast.LENGTH_SHORT).show()
+        done()
+    }
+}
+
+@Composable
+private fun HelpPage(s: AppState, a: MainActivity, close: () -> Unit) {
+    Card {
+        Txt("Practice", 16, FontWeight.SemiBold)
+        Txt("Walk through asking for help, step by step. Nothing is sent.", 14, color = Theme.dim)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            GhostButton("Practice now") { s.sheet = Sheet.Practice }
+            if (Ready.done(a, Ready.HIDDEN)) GhostButton("Show “Get ready”") { a.getSharedPreferences("ready", 0).edit().remove(Ready.HIDDEN).apply(); s.tick++; close() }
+        }
+    }
+    Card {
+        Txt("Help and safety", 16, FontWeight.SemiBold)
+        Txt("In Everyone, hold a message to report it or block its sender. To report abuse or a problem, write to ${Contact.EMAIL}.", 14, color = Theme.dim)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            GhostButton("Email us") { Contact.open(a, Contact.MAIL) }
+            GhostButton("Privacy policy") { Contact.open(a, Contact.PRIVACY) }
+        }
+    }
+}
+
+/** Settings > Advanced > Nearby phones: Bluetooth and Wi-Fi Direct, and a Wi-Fi address to dial by hand. */
+@Composable
+private fun NearbyPage(s: AppState, a: MainActivity) {
+    val tick = s.tick
+    val phones = phonesInRange()
+    if (s.permissionsMissing) NearbyPermissionCard(a)
+    Card {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Txt("Bluetooth", 18, FontWeight.Bold, modifier = Modifier.weight(1f))
+            Chip(if (phones > 0) "$phones linked" else if (s.permissionsMissing || s.bluetoothOff) "Off" else "Searching", if (phones > 0) Theme.safe else Theme.dim)
+        }
+        Txt("Phones with DarkProof within about 10–50 m connect by themselves, over Bluetooth and Wi-Fi Direct.", 15, color = Theme.dim)
+        if (!s.permissionsMissing) {
+            Txt("Nearby: ${MeshEngine.transportStatus.replaceFirstChar { it.lowercase() }} · ${MeshEngine.ble?.statusLine() ?: "Bluetooth: not started"}", 14, color = Theme.dim)
+            if (s.bluetoothOff) GhostButton("Turn on Bluetooth") { a.turnOnBluetooth() }
+        }
+    }
+    WifiCard(tick)
+}
+
+/** Settings > Advanced > Long-range radio: pair a Meshtastic or MeshCore LoRa radio. */
+@Composable
+private fun RadioPage(s: AppState) {
+    s.tick
+    Txt("A LoRa radio paired with this phone reaches other radios kilometers away, with no network at all. Short messages only.", 15, color = Theme.dim)
+    val blocked = if (s.permissionsMissing) "Allow Nearby devices first: DarkProof needs it to use Bluetooth." else if (s.bluetoothOff) "Turn on Bluetooth first." else null
+    RadioCard("LoRa radio · Meshtastic",
+        "Reaches other radios kilometers away: about 2–10 km in a city, more from high places. Short messages only. Use a Meshtastic radio with the region set (EU_868 in Europe).",
+        MeshEngine.lora?.status?.removePrefix("LoRa: "), MeshEngine.lora?.connected == true, MeshEngine.lora?.paired == true, blocked,
+        MeshEngine.lora?.let { l -> { found: (String, String) -> Unit -> l.scan(found) } }, { MeshEngine.lora?.select(it) }, { MeshEngine.lora?.forget() })
+    RadioCard("LoRa radio · MeshCore",
+        "The same kind of radio with MeshCore firmware, version 1.15 or newer. DarkProof adds a #darkproof channel to the radio and every MeshCore repeater passes it on. Short messages only. The radio's PIN is often 123456 or shown on its screen.",
+        MeshEngine.meshcore?.status?.removePrefix("MeshCore: "), MeshEngine.meshcore?.connected == true, MeshEngine.meshcore?.paired == true, blocked,
+        MeshEngine.meshcore?.let { l -> { found: (String, String) -> Unit -> l.scan(found) } }, { MeshEngine.meshcore?.select(it) }, { MeshEngine.meshcore?.forget() })
+}
+
+/** Settings > Advanced > Wi-Fi board: Everyone in a browser, for people without the app. */
+@Composable
+private fun BoardPage(s: AppState, a: MainActivity) {
+    val tick = s.tick
+    Card {
+        Txt("People without the app join this phone's Wi-Fi network, then read and post Everyone messages in their browser. Android users can also download DarkProof there.", 15, color = Theme.dim)
+        key(tick) {
+            GhostButton(if (WifiBoard.running) "Stop the Wi-Fi board" else "Start the Wi-Fi board") {
+                if (WifiBoard.running) WifiBoard.stop() else WifiBoard.start(a) { MeshEngine.notifyUi() }
+                s.tick++
+            }
+            WifiBoard.status.takeIf { it != "Off" }?.let { Txt(it, 14, color = if (WifiBoard.running) Theme.safe else Theme.help) }
+        }
+    }
+}
+
+@Composable
+private fun BlockedPage(s: AppState, a: MainActivity) {
+    Txt("Their messages, places and check-ins are hidden on this phone. In Everyone, hold a message to block its sender.", 15, color = Theme.dim)
+    key(s.moderated) {
+        val blocked = Moderation.blocked(a)
+        Card {
+            if (blocked.isEmpty()) Txt("No one is blocked.", 16, FontWeight.SemiBold)
+            blocked.forEach { (id, n) ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Txt(n, 16, modifier = Modifier.weight(1f), maxLines = 1)
+                    GhostButton("Unblock") { Moderation.unblock(a, id); s.moderated++ }
+                }
+            }
+        }
+    }
+}
+
+/** Links over Wi-Fi networks: what is linked, this phone's address, and an address to dial by hand. [tick] redraws it. */
+@Composable
+private fun WifiCard(tick: Int) {
     val ctx = LocalContext.current
     val wifi = MeshEngine.wifi
     var address by rememberSaveable { mutableStateOf(wifi?.links?.manual ?: "") }
     Card {
-        SwitchRow("Wi-Fi network", wifi != null, { MeshEngine.setWifi(it) },
-            "Phones on the same Wi-Fi find each other: a router with no internet, a phone hotspot, a neighbourhood network or a long-range rooftop link.")
-        if (wifi != null) {
+        Txt("Same Wi-Fi network", 18, FontWeight.Bold)
+        Txt("Phones on the same Wi-Fi find each other: a router with no internet, a phone hotspot, a neighbourhood network or a long-range rooftop link.", 15, color = Theme.dim)
+        if (wifi == null) Txt("Wi-Fi network is off in Settings.", 15, FontWeight.SemiBold, Theme.dim)
+        else {
             val n = wifi.links.linkCount()
             Txt(if (n > 0) "$n phone${if (n == 1) "" else "s"} linked over Wi-Fi" else "Looking on this network", 15, FontWeight.SemiBold, if (n > 0) Theme.safe else Theme.dim)
             localAddress()?.let { ip -> if (wifi.links.port > 0) Txt("This phone: $ip:${wifi.links.port}", 14, color = Theme.dim) }
@@ -872,6 +992,7 @@ fun PersonRow(p: Person, tap: () -> Unit, find: (Spot) -> Unit) {
                 null -> Txt("Last seen ${ago(p.lastTs)}", 15, color = Theme.dim)
             }
             needsLine(p)?.let { Txt(it, 14, color = if (p.checkIn == CheckIn.HELP) Theme.text else Theme.dim, maxLines = 2) }
+            if (!p.isReport && MeshEngine.newKeyFor(MeshEngine.currentCode, p.id, p.name)) Txt("New key: check their emoji", 14, FontWeight.SemiBold, Theme.help)
         }
         p.battery?.let { BatteryLabel(it); Spacer(Modifier.width(12.dp)) }
         p.spot?.let { sp -> RoundIcon(R.drawable.ic_navigation, 46.dp, desc = "Find ${p.name}") { find(sp) } }

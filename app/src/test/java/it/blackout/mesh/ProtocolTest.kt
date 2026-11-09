@@ -11,8 +11,8 @@ class ProtocolTest {
 
     @Test fun receiptKeyVector() {
         val key = GroupCrypto.deriveKey("test-group-1")
-        assertEquals("5b3b419c3127c6562d34f9357179690746274ea9f6088385901e83d1d4055a9a", hex(key))
-        assertEquals("496bfa142c33041abecd0fdb71763051e81c2fed0a55cbc1c0a7af8311d4a225", hex(GroupCrypto.deriveReceiptKey(key)))
+        assertEquals("f5dbd9efb376f8e61a21bd63c2db282b5dfffffd21b1df45ff2af54139a6cd89", hex(key))
+        assertEquals("738e7a99ea6284081ccd3d830969a9cb6ad62fd6161f1adedf4d34f13677e479", hex(GroupCrypto.deriveReceiptKey(key)))
     }
 
     @Test fun receiptsOnlyOpenWithTheReceiptKey() {
@@ -135,12 +135,11 @@ class ProtocolTest {
 
     /** Older readers parse three fields and stop; with the same IV the message without a photo is a prefix of the one with it. */
     @Test fun olderReadersSeeTheSameThreeFields() {
-        val iv = ByteArray(12) { 7 }
-        val without = group.seal("00000000000000cc", 9, "dev-a", "Ann", Photo.PLACEHOLDER, iv = iv)
-        val with = group.seal("00000000000000cc", 9, "dev-a", "Ann", Photo.PLACEHOLDER, jpeg, iv)
-        val body = without.size - 16
-        assertArrayEquals(without.copyOf(body), with.copyOf(body))
-        assertTrue(with.size > without.size + jpeg.size)
+        // The photo is a 4th field: the first three read the same with or without it.
+        val without = group.open(Packet("00000000000000cc", 9, 16, group.seal("00000000000000cc", 9, "dev-a", "Ann", Photo.PLACEHOLDER)))!!
+        val with = group.open(Packet("00000000000000cc", 9, 16, group.seal("00000000000000cc", 9, "dev-a", "Ann", Photo.PLACEHOLDER, jpeg)))!!
+        assertEquals(listOf(without.sender, without.name, without.text), listOf(with.sender, with.name, with.text))
+        assertNull(without.photo); assertArrayEquals(jpeg, with.photo)
     }
 
     @Test fun photoLimits() {
@@ -203,12 +202,18 @@ class ProtocolTest {
 
     /** Same values as the iPhone (and Python, see spec/FORMAT.md "Mailboxes"). */
     @Test fun mailboxes() {
-        assertEquals(0xa8d0, GroupCrypto("test-group-1").mailbox)
-        assertEquals(0x0794, GroupCrypto(GroupCrypto.PUBLIC_CODE).mailbox)
-        assertEquals(0xa8d0, GroupCrypto("test-group-1").receipts().mailbox) // receipts go to the group's mailbox
-        val id = Packet.newId(0xa8d0)
-        assertTrue(id.matches(Regex("^a8d0[0-9a-f]{12}$"))); assertEquals(0xa8d0, Packet.mailbox(id))
-        assertNotEquals(Packet.newId(0xa8d0), Packet.newId(0xa8d0))
-        assertEquals("0794", Packet.newId(0x0794).take(4))
+        assertEquals(0x6a44, GroupCrypto("test-group-1").mailbox)
+        assertEquals(0x9576, GroupCrypto(GroupCrypto.PUBLIC_CODE).mailbox)
+        assertEquals(Nostr.PUBLIC_MAILBOX, GroupCrypto(GroupCrypto.PUBLIC_CODE).mailbox)
+        assertEquals(0x6a44, GroupCrypto("test-group-1").receipts().mailbox) // receipts go to the group's mailbox
+        val id = Packet.newId(0x6a44)
+        assertTrue(id.matches(Regex("^6a44[0-9a-f]{12}$"))); assertEquals(0x6a44, Packet.mailbox(id))
+        assertNotEquals(Packet.newId(0x6a44), Packet.newId(0x6a44))
+        assertEquals("9576", Packet.newId(0x9576).take(4))
+    }
+
+    @Test fun anInviteInsideASharedMessageIsFoundAndHugeCodesAreRefused() {
+        assertEquals("Family" to "ABCD-EFGH-1234", Invite.parse("Join my group on DarkProof: darkproof://join?name=Family&code=ABCD-EFGH-1234 see you"))
+        assertNull(Invite.parse("darkproof://join?name=x&code=" + "A".repeat(2500)))
     }
 }

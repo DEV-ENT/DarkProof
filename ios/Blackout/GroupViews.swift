@@ -15,19 +15,29 @@ enum InviteLinks {
 }
 
 /// Groups this phone has been in, so random codes are never lost when switching. Stored only on this phone.
+/// The code of the group in use, for the screens: `@CurrentCode private var code`.
+@propertyWrapper struct CurrentCode: DynamicProperty {
+    @ObservedObject private var store = GroupSecrets.shared
+    var wrappedValue: String {
+        get { store.code }
+        nonmutating set { store.setCode(newValue) }
+    }
+}
+
 enum SavedGroups {
     struct Entry: Codable, Identifiable, Hashable { var name: String; var code: String; var id: String { code } }
     static let max = 20 // like Android
-    private static let key = "savedGroups"
 
-    static func all() -> [Entry] {
-        guard let d = UserDefaults.standard.data(forKey: key) else { return [] }
-        return (try? JSONDecoder().decode([Entry].self, from: d)) ?? []
-    }
+    static func all() -> [Entry] { GroupSecrets.shared.groups }
 
     static func remember(_ e: Entry) {
         let list = [e] + all().filter { $0.code != e.code }
-        UserDefaults.standard.set(try? JSONEncoder().encode(Array(list.prefix(max))), forKey: key)
+        GroupSecrets.shared.setGroups(Array(list.prefix(max)))
+    }
+
+    /// Someone was removed from a group: it now has a new code (spec "Removing and the code"). Its name stays.
+    static func replaceCode(_ old: String, _ new: String) {
+        GroupSecrets.shared.setGroups(all().map { Entry(name: $0.name, code: $0.code == old ? new : $0.code) })
     }
 
     /// The saved group that would be dropped to make room for `code`, if the list is full.
@@ -40,11 +50,11 @@ enum SavedGroups {
     /// Makes [code] this phone's group: keeps the old one in the list, saves the new one, and shows its messages.
     static func switchTo(groupName: String, code: String, engine: Engine) {
         let d = UserDefaults.standard
-        if let old = d.string(forKey: "code"), !old.isEmpty, old != code {
+        if let old = GroupSecrets.shared.current, !old.isEmpty, old != code {
             remember(Entry(name: d.string(forKey: "groupName") ?? "My group", code: old))
         }
         remember(Entry(name: groupName, code: code))
-        d.set(code, forKey: "code"); d.set(groupName, forKey: "groupName")
+        GroupSecrets.shared.setCode(code); d.set(groupName, forKey: "groupName")
         engine.rejoin(name: engine.name, code: code)
     }
 
@@ -53,7 +63,7 @@ enum SavedGroups {
         let n = me.trimmingCharacters(in: .whitespacesAndNewlines)
         let base = String((n.isEmpty ? "My group" : "\(n)'s group").prefix(Invite.maxGroupName - 3))
         let taken = Set(all().map(\.name) + [UserDefaults.standard.string(forKey: "groupName") ?? ""])
-        guard taken.contains(base), UserDefaults.standard.string(forKey: "code")?.isEmpty == false else { return base }
+        guard taken.contains(base), GroupSecrets.shared.current?.isEmpty == false else { return base }
         return (2...99).lazy.map { "\(base) \($0)" }.first { !taken.contains($0) } ?? base
     }
 }
@@ -126,7 +136,7 @@ struct InviteSheet: View {
                 if showCode {
                     Text(code).scaledFont(22, .bold, design: .monospaced).foregroundStyle(Theme.text)
                         .textSelection(.enabled)
-                    Button("Copy code") { UIPasteboard.general.string = code; didInvite = true; Nav.shared.toast("Code copied") }
+                    Button("Copy code") { UIPasteboard.general.setItems([["public.utf8-plain-text": code]], options: [.expirationDate: Date().addingTimeInterval(60), .localOnly: true]); didInvite = true; Nav.shared.toast("Code copied") }
                         .buttonStyle(GhostButton())
                 } else {
                     Button("Show code") { showCode = true }.buttonStyle(GhostButton())
@@ -271,10 +281,7 @@ struct CodeEntry: View {
     static func warning(_ code: String) -> String? {
         let c = Invite.normalizeCode(code)
         if c.isEmpty { return nil }
-        if c.count < Invite.minCodeLength { return "Codes have at least \(Invite.minCodeLength) characters." }
-        if !Invite.isGeneratedCode(c) {
-            return "This isn't a code made by DarkProof. Short or simple codes can be guessed, and then others can read the group."
-        }
+        if !Invite.isGeneratedCode(c) { return "That isn't a code DarkProof made. Codes look like XXXX-XXXX-XXXX-XXXX." }
         return nil
     }
 
@@ -283,7 +290,7 @@ struct CodeEntry: View {
             Button { scanning = true } label: { Label("Scan invite QR code", systemImage: "qrcode.viewfinder") }
                 .buttonStyle(SecondaryButton())
             InputField(label: "Group code", hint: fromLink.map { "From the invite link for “\($0)”." } ?? "Or paste the invite link.") {
-                let f = TextField("", text: $code, prompt: Text("XXXX-XXXX-XXXX-XXXX").foregroundColor(Theme.faint))
+                let f = TextField("", text: $code, prompt: Text("XXXX-XXXX-XXXX-XXXX").foregroundColor(Theme.faint)).autocorrectionDisabled()
                     .textInputAutocapitalization(.characters).autocorrectionDisabled().submitLabel(.done)
                 if let focusCode { f.focused(focusCode) } else { f }
             }
@@ -311,7 +318,7 @@ struct JoinGroupSheet: View {
     @ObservedObject var engine: Engine
     var prefill: (name: String, code: String)? = nil
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("code") private var current = ""
+    @CurrentCode private var current
     @AppStorage("groupName") private var currentName = "My group"
     @State private var code = ""
     @State private var name = ""
@@ -328,13 +335,16 @@ struct JoinGroupSheet: View {
                     .scaledFont(15, .semibold).foregroundStyle(Theme.safe)
             } else if let s = saved {
                 Text("You were in this group before. It keeps its name, \(s.name).").scaledFont(14).foregroundStyle(Theme.dim)
+            } else if !clean.isEmpty, name.caseInsensitiveCompare(currentName) == .orderedSame || SavedGroups.all().contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+                Text("You already have a group called \(name), and this code is for a different one. Someone could be copying the name to get your check-ins. Only join if you trust who sent it.")
+                    .scaledFont(14).foregroundStyle(Theme.help).fixedSize(horizontal: false, vertical: true)
             } else if let drop = SavedGroups.wouldDrop(for: clean), !clean.isEmpty {
                 Text("You have \(SavedGroups.max) groups saved. Joining removes the oldest, \(drop.name), from this phone.")
                     .scaledFont(14).foregroundStyle(Theme.help).fixedSize(horizontal: false, vertical: true)
             }
             Button("Join group") { join() }
                 .buttonStyle(PrimaryButton())
-                .disabled(clean.count < Invite.minCodeLength || clean == current)
+                .disabled(!Invite.isGeneratedCode(clean) || clean == current)
             Text("Switching shows the other group's messages. This group's messages stay on the phone.")
                 .font(.footnote).foregroundStyle(Theme.dim)
         }
@@ -377,6 +387,7 @@ struct CreateGroupSheet: View {
 
     private func create() {
         let typed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Invite.maxGroupName))
+        Engine.found(code) // its first epoch is made on this phone (v0.6)
         SavedGroups.switchTo(groupName: typed.isEmpty ? SavedGroups.defaultName(for: myName) : typed, code: code, engine: engine)
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         Nav.shared.sheet = nil
@@ -391,7 +402,7 @@ struct CreateGroupSheet: View {
 struct GroupsCard: View {
     @ObservedObject var engine: Engine
     @ObservedObject private var unread = Unread.shared
-    @AppStorage("code") private var code = ""
+    @CurrentCode private var code
     @AppStorage("groupName") private var groupName = "My group"
     @State private var joining = false
     @State private var creating = false

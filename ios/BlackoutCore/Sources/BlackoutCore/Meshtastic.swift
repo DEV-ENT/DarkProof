@@ -53,8 +53,7 @@ public enum Meshtastic {
             case 0: on(field, try readVarint(), nil)
             case 1: guard i + 8 <= b.count else { throw Malformed.truncated }; i += 8
             case 2:
-                let n = Int(try readVarint())
-                guard n >= 0, i + n <= b.count else { throw Malformed.truncated }
+                guard let n = Int(exactly: try readVarint()), n >= 0, n <= b.count - i else { throw Malformed.truncated }
                 on(field, 0, Array(b[i..<(i + n)])); i += n
             case 5: guard i + 4 <= b.count else { throw Malformed.truncated }; i += 4
             default: return

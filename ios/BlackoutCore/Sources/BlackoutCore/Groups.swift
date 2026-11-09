@@ -25,7 +25,9 @@ public enum Invite {
 
     /// The group name and code in an invite link (either form), or nil if it is not one.
     public static func parse(_ link: String) -> (name: String, code: String)? {
-        let s = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A shared message has words around the link.
+        let whole = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        let s = whole.split(whereSeparator: \.isWhitespace).map(String.init).first { $0.lowercased().hasPrefix("darkproof://") || $0.lowercased().contains("darkproof.app/join") } ?? whole
         guard let items = match(appLink, s) ?? match(webLink, s) else { return nil }
         var q: [String: String] = [:]
         for kv in items.split(separator: "&", omittingEmptySubsequences: false) {
@@ -33,7 +35,7 @@ public enum Invite {
             let k = dec(kv[..<i])
             if q[k] == nil { q[k] = dec(kv[kv.index(after: i)...]) }
         }
-        guard let code = q["code"]?.trimmingCharacters(in: .whitespacesAndNewlines), code.count >= minCodeLength else { return nil }
+        guard let code = q["code"]?.trimmingCharacters(in: .whitespacesAndNewlines), code.count >= minCodeLength, code.count <= 200 else { return nil }
         let name = q["name"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return (String((name.isEmpty ? "Group" : name).prefix(maxGroupName)), code)
     }

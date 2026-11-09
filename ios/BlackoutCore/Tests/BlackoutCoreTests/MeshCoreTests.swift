@@ -49,9 +49,11 @@ final class MeshCoreTests: XCTestCase {
     func testCheckInsFitButLongMessagesDont() throws {
         let c = GroupCrypto(code: "group-code")
         func packet(_ name: String, _ text: String) throws -> Packet {
-            let id = Packet.newId(); return Packet(id: id, ts: 1, ttl: 16, cipher: try c.seal(id: id, ts: 1, sender: "7c0d995b-2c4", name: name, text: text))
+            let id = Packet.newId(); return Packet(id: id, ts: 1, ttl: 16, cipher: try c.seal(id: id, ts: 1, sender: "c482f374ea24d954", name: name, text: text))
         }
-        XCTAssertTrue(MeshCore.fits(try packet("Anna", CheckIn.safe.text(battery: 23, spot: Spot(lat: 45.4642, lon: 9.19, accuracy: 12)))))
+        // Signed (spec "Signatures"): a check-in fits with a short name and no position; with a position it doesn't.
+        XCTAssertTrue(MeshCore.fits(try packet("Anna", CheckIn.safe.text(battery: 23, spot: nil))))
+        XCTAssertFalse(MeshCore.fits(try packet("Anna", CheckIn.safe.text(battery: 23, spot: Spot(lat: 45.4642, lon: 9.19, accuracy: 12)))))
         XCTAssertFalse(MeshCore.fits(try packet("Anna", String(repeating: "x", count: 120))))
         let q = LoraQueue(maxBytes: MeshCore.payloadMax, now: { 1 })
         q.offer(try packet("Anna", String(repeating: "x", count: 120))); XCTAssertNil(q.next())

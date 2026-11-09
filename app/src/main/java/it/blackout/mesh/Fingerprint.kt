@@ -43,6 +43,9 @@ object Fingerprint {
     /** "🐶 😀 🐼 🔨 🐧" */
     fun emojiText(indices: List<Int>) = indices.joinToString(" ") { EMOJI[it] }
 
+    /** A person's emoji, eight to a line (spec "Person emoji"). */
+    fun emojiLines(indices: List<Int>) = indices.chunked(8).joinToString("\n", transform = ::emojiText)
+
     /** "Dog, Smiley, Panda, Hammer, Penguin": what people say out loud. */
     fun spoken(indices: List<Int>) = indices.joinToString(", ") { NAMES[it] }
 }

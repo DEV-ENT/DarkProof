@@ -11,8 +11,9 @@ final class InAppTor {
     private var thread: TorThread?
     private var port = 0
 
-    /// A session configuration that goes only through Tor's SOCKS port. Starts Tor the first time.
-    func sessionConfiguration() -> URLSessionConfiguration? {
+    /// A session configuration that goes only through Tor's SOCKS port. Starts Tor the first time. Tor keeps streams with
+    /// different SOCKS user names on different circuits: `user` gives each group its own.
+    func sessionConfiguration(user: String) -> URLSessionConfiguration? {
         q.sync {
             if thread == nil { start() }
             guard port > 0 else { return nil }
@@ -20,7 +21,9 @@ final class InAppTor {
             // "localhost", not 127.0.0.1: with the address, real devices resolve host names outside Tor (Tor.framework's note).
             c.connectionProxyDictionary = [kCFProxyTypeKey: kCFProxyTypeSOCKS,
                                            kCFStreamPropertySOCKSProxyHost: "localhost",
-                                           kCFStreamPropertySOCKSProxyPort: port]
+                                           kCFStreamPropertySOCKSProxyPort: port,
+                                           kCFStreamPropertySOCKSUser: user,
+                                           kCFStreamPropertySOCKSPassword: "x"]
             return c
         }
     }

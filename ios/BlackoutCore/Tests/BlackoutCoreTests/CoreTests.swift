@@ -121,10 +121,40 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(sent, ["00000000000000e1"])
     }
 
+    func testJunkSentFirstUnderAnIdDoesNotStopTheRealPacket() {
+        var got: [UInt8] = []
+        let t = now(), r = MeshRouter(send: { _, _ in }, deliver: { got.append($0.cipher.first!) })
+        func send(_ b: UInt8) { r.receive(from: "x", Packet(id: m1, ts: t, ttl: 16, cipher: Data([b]))) }
+        send(9); send(1); send(1)
+        XCTAssertEqual(got, [9, 1])
+        send(2); send(3); send(4)
+        XCTAssertEqual(got, [9, 1, 2, 3, 4])
+    }
+
+    func testTooSmallPacketsAndFloodsFromOneLinkAreRefused() {
+        var t: Int64 = 1_000_000, got: [String] = []
+        let r = MeshRouter(send: { _, _ in }, deliver: { got.append($0.id) }, now: { t }, minCipher: 5, maxPerMinute: 3, unlimited: { $0 == "relay" })
+        func p(_ i: Int, _ n: Int = 5) -> Packet { Packet(id: String(format: "%016x", i), ts: t, ttl: 16, cipher: Data(count: n)) }
+        r.receive(from: "a", p(1, 4)); XCTAssertTrue(got.isEmpty)
+        for i in 2...6 { r.receive(from: "a", p(i)) }; XCTAssertEqual(got.count, 3)
+        r.receive(from: "b", p(7)); XCTAssertEqual(got.count, 4)
+        for i in 8...12 { r.receive(from: "relay", p(i)) }; XCTAssertEqual(got.count, 9)
+        t += 60_000; r.receive(from: "a", p(6)); XCTAssertEqual(got.count, 10)
+    }
+
+    func testOneLinkCantPushOutEveryoneElse() {
+        var sent = Set<String>()
+        let t = now(), r = MeshRouter(send: { _, p in sent.insert(p.id) }, deliver: { _ in }, maxStored: 8)
+        r.receive(from: "good", Packet(id: m1, ts: t, ttl: 16, cipher: Data([1])))
+        for i in 0..<50 { r.receive(from: "bad", Packet(id: String(format: "%016x", 1000 + i), ts: t, ttl: 16, cipher: Data([1]))) }
+        sent = []; r.peerUp("new")
+        XCTAssertTrue(sent.contains(m1))
+    }
+
     func testRestoredSeenIdsAreNotDeliveredAgain() {
         var got: [String] = []
         let r = MeshRouter(send: { _, _ in }, deliver: { got.append($0.id) })
-        r.restore([], seenIds: [m1])
+        r.restore([], seenIds: [MeshRouter.key(pkt(m1))])
         r.receive(from: "peer", pkt(m1))
         XCTAssertEqual(got, [])
         r.receive(from: "peer", pkt("00000000000000b2"))

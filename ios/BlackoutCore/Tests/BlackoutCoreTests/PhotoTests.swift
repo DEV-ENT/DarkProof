@@ -20,11 +20,13 @@ final class PhotoTests: XCTestCase {
     /// Older readers parse three fields and stop. AES-GCM encrypts like a stream, so with the same IV the message
     /// without a photo is a byte-for-byte prefix of the one with it: old apps see exactly the same three fields.
     func testOlderReadersSeeTheSameThreeFields() throws {
-        let without = try group.seal(id: "00000000000000cc", ts: 9, sender: "dev-a", name: "Ann", text: Photo.placeholder, iv: iv)
-        let with = try group.seal(id: "00000000000000cc", ts: 9, sender: "dev-a", name: "Ann", text: Photo.placeholder, photo: jpeg, iv: iv)
-        let body = without.count - 16 // without the 16-byte tag
-        XCTAssertEqual(with.prefix(body), without.prefix(body))
-        XCTAssertGreaterThan(with.count, without.count + jpeg.count)
+        // The photo is a 4th field: the first three read the same with or without it.
+        let a = try group.seal(id: "00000000000000cc", ts: 9, sender: "dev-a", name: "Ann", text: Photo.placeholder, iv: iv)
+        let b = try group.seal(id: "00000000000000cc", ts: 9, sender: "dev-a", name: "Ann", text: Photo.placeholder, photo: jpeg, iv: iv)
+        let without = try XCTUnwrap(group.open(Packet(id: "00000000000000cc", ts: 9, ttl: 16, cipher: a)))
+        let with = try XCTUnwrap(group.open(Packet(id: "00000000000000cc", ts: 9, ttl: 16, cipher: b)))
+        XCTAssertEqual([without.sender, without.name, without.text], [with.sender, with.name, with.text])
+        XCTAssertNil(without.photo); XCTAssertEqual(with.photo, jpeg)
     }
 
     func testLimits() throws {

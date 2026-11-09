@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -220,24 +221,64 @@ fun vaultShape(cut: Dp = 42.dp, radius: Dp = 46.dp, small: Dp = 8.dp): Shape = o
     }
 }
 
-/** A full-height sheet with a title and a close button, like the iPhone's SheetPage. */
+/**
+ * A full-height sheet with a title and a close button, like the iPhone's SheetPage. With [onBack] it shows a page
+ * inside the sheet (Settings > Groups, …) with a back arrow; [scrollKey] starts each such page at the top.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable fun SheetPage(title: String, onClose: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+@Composable fun SheetPage(title: String, onClose: () -> Unit, onBack: (() -> Unit)? = null, scrollKey: Any? = null,
+                          content: @Composable ColumnScope.() -> Unit) {
     ModalBottomSheet(onClose, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = Theme.bg, contentColor = Theme.text, dragHandle = null,
         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
         Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 20.dp).padding(top = 18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Txt(title, 26, FontWeight.Black, modifier = Modifier.weight(1f), maxLines = 1)
+                if (onBack != null) { RoundIcon(R.drawable.ic_arrow_back, 36.dp, desc = "Back", onClick = onBack); Spacer(Modifier.width(12.dp)) }
+                Txt(title, if (onBack != null) 22 else 26, FontWeight.Black, modifier = Modifier.weight(1f), maxLines = 1)
                 RoundIcon(R.drawable.ic_close, 36.dp, desc = "Close", onClick = onClose)
             }
             Spacer(Modifier.height(16.dp))
-            Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).imePadding().navigationBarsPadding(),
+            val scroll = key(scrollKey) { rememberScrollState() }
+            Column(Modifier.weight(1f, fill = false).verticalScroll(scroll).imePadding().navigationBarsPadding(),
                 verticalArrangement = Arrangement.spacedBy(16.dp), content = content)
             Spacer(Modifier.height(20.dp))
         }
     }
 }
+
+/** Settings lines on one charcoal card. */
+@Composable fun RowCard(content: @Composable ColumnScope.() -> Unit) =
+    Column(Modifier.fillMaxWidth().background(Theme.card, RoundedCornerShape(24.dp)).padding(horizontal = 6.dp, vertical = 6.dp), content = content)
+
+/** Icon, title and an optional line under it, for [LinkRow] and [ToggleRow]. */
+@Composable private fun RowScope.RowText(@DrawableRes icon: Int, title: String, detail: String?, detailColor: Color) {
+    Ic(icon, Theme.text, 22.dp); Spacer(Modifier.width(16.dp))
+    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Txt(title, 17, FontWeight.SemiBold, maxLines = 2)
+        if (!detail.isNullOrEmpty()) Txt(detail, 14, color = detailColor)
+    }
+}
+
+/** A line that opens a page or does one thing: the current value on the right, then a chevron. */
+@Composable fun LinkRow(@DrawableRes icon: Int, title: String, value: String? = null, detail: String? = null, onClick: () -> Unit) =
+    Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clip(RoundedCornerShape(18.dp)).clickable(role = Role.Button, onClick = onClick)
+        .padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        RowText(icon, title, detail, Theme.dim)
+        if (!value.isNullOrEmpty()) { Spacer(Modifier.width(8.dp)); Txt(value, 15, color = Theme.dim, maxLines = 1, modifier = Modifier.widthIn(max = 150.dp)) }
+        Spacer(Modifier.width(4.dp))
+        Ic(R.drawable.ic_chevron_right, Theme.faint, 22.dp)
+    }
+
+/** An on/off line, with what it does (or what is happening) under the title. The whole line toggles. */
+@Composable fun ToggleRow(@DrawableRes icon: Int, title: String, on: Boolean, detail: String? = null, detailColor: Color = Theme.dim, set: (Boolean) -> Unit) =
+    Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clip(RoundedCornerShape(18.dp)).toggleable(on, role = Role.Switch, onValueChange = set)
+        .padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        RowText(icon, title, detail, detailColor)
+        Spacer(Modifier.width(8.dp))
+        Switch(on, null, colors = SwitchDefaults.colors(
+            checkedThumbColor = Color.White, checkedTrackColor = Theme.safe, checkedBorderColor = Theme.safe,
+            uncheckedThumbColor = Theme.dim, uncheckedTrackColor = Theme.tile, uncheckedBorderColor = Theme.line))
+    }
 
 /** Simple confirm dialog in the app's colors. */
 @Composable fun Confirm(title: String, text: String, yes: String, danger: Boolean = false, onYes: () -> Unit, onNo: () -> Unit) =

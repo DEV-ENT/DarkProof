@@ -14,6 +14,9 @@ final class WifiLink {
     static let port: UInt16 = 7777
     static let maxFrame = 16_064
     static let maxLinks = 32
+    private static let maxQueuedLink = 12 * 1024 * 1024 // waiting to go out to one phone; more means it stopped reading
+    private static let maxQueuedAll = 32 * 1024 * 1024
+    private var queued: [String: Int] = [:], queuedAll = 0 // on q
     private static let hello = Data("DPW1".utf8)
     private static let retryDelay = 5.0
     private static let helloWait = 10.0   // the other side's HELLO must come within this
@@ -99,7 +102,20 @@ final class WifiLink {
     /// Called by the router, possibly while it holds its lock: the write happens on this link's queue.
     func send(_ peer: String, _ p: Packet) {
         let b = p.encode()
-        q.async { self.links[peer]?.conn.send(content: Self.frame(b), completion: .contentProcessed { _ in }) }
+        q.async {
+            guard let l = self.links[peer] else { return }
+            let n = b.count + 4
+            // A phone that stopped reading: what is waiting for it would pile up here until iOS ended the app.
+            if self.queued[peer, default: 0] + n > Self.maxQueuedLink || self.queuedAll + n > Self.maxQueuedAll { l.conn.cancel(); return }
+            self.queued[peer, default: 0] += n; self.queuedAll += n
+            l.conn.send(content: Self.frame(b), completion: .contentProcessed { _ in
+                self.q.async {
+                    self.queuedAll -= n
+                    let left = self.queued[peer, default: n] - n
+                    self.queued[peer] = left > 0 ? left : nil
+                }
+            })
+        }
     }
 
     // MARK: - Listening and discovery
@@ -228,7 +244,10 @@ final class WifiLink {
             finished = true
             if let id {
                 links.removeValue(forKey: id)
-                if let n = linkNode, byNode[n] == id { byNode.removeValue(forKey: n) } // unless a newer link replaced it
+                if let n = linkNode, byNode[n] == id { // unless a newer link replaced it
+                    byNode.removeValue(forKey: n)
+                    if let other = links.first(where: { $0.value.node == n }) { byNode[n] = other.key }
+                }
                 router.peerDown(id)
             }
             report()
@@ -244,20 +263,26 @@ final class WifiLink {
                 self.readHello(c) { node in
                     guard let node, node != self.nodeId, !finished else { c.cancel(); return }
                     hello?(node)
-                    guard self.links.count < Self.maxLinks else { c.cancel(); return }
+                    guard self.links.count < Self.maxLinks || self.makeRoom() else { c.cancel(); return }
                     let now = Date()
+                    var samePhone = true
                     if let old = self.byNode[node], let o = self.links[old] {
-                        // spec "Restarts and duplicate links": both phones keep the same link
-                        let ageMs = Int64(now.timeIntervalSince(o.since) * 1000)
-                        guard DuplicateLinks.keepNew(myId: self.nodeId, remoteId: node, newDialedByMe: dialed,
-                                                     oldDialedByMe: o.dialed, oldAgeMs: ageMs) else { c.cancel(); return }
-                        o.conn.cancel()
+                        // Node ids aren't proof of anything: from another address this may be someone pretending, so the
+                        // link that's there stays and this one runs beside it (the router sees each packet once).
+                        samePhone = Self.address(o.conn) == Self.address(c)
+                        if samePhone {
+                            // spec "Restarts and duplicate links": both phones keep the same link
+                            let ageMs = Int64(now.timeIntervalSince(o.since) * 1000)
+                            guard DuplicateLinks.keepNew(myId: self.nodeId, remoteId: node, newDialedByMe: dialed,
+                                                         oldDialedByMe: o.dialed, oldAgeMs: ageMs) else { c.cancel(); return }
+                            o.conn.cancel()
+                        }
                     }
                     self.count += 1
                     let peer = Self.prefix + node + "#" + String(self.count)
                     id = peer; linkNode = node
                     self.links[peer] = (node, c, dialed, now)
-                    self.byNode[node] = peer
+                    if samePhone { self.byNode[node] = peer }
                     self.router.peerUp(peer)
                     self.report()
                     self.readFrames(c, peer)
@@ -268,6 +293,21 @@ final class WifiLink {
             }
         }
         c.start(queue: q)
+    }
+
+    private static func address(_ c: NWConnection) -> String {
+        if case .hostPort(let host, _) = c.endpoint { return "\(host)" }
+        return "\(c.endpoint)"
+    }
+
+    /// At the limit: a link at random, among those over a minute old, makes room, so nobody can hold every place by just staying.
+    private func makeRoom() -> Bool {
+        let now = Date()
+        guard let l = links.filter({ now.timeIntervalSince($0.value.since) > 60 }).randomElement() else { return false }
+        links.removeValue(forKey: l.key)
+        router.peerDown(l.key)
+        l.value.conn.cancel()
+        return true
     }
 
     private func readHello(_ c: NWConnection, _ done: @escaping (String?) -> Void) {

@@ -36,6 +36,8 @@ class AppState(a: ComponentActivity) {
     private val prefs = a.getSharedPreferences("mesh", 0)
     var tick by mutableIntStateOf(0)
     var group by mutableStateOf(Groups.current(a))
+    var locked by mutableStateOf(AppLock.due(a)) // "Lock DarkProof" is asking
+    var lockOn by mutableStateOf(AppLock.enabled(a))
     var name by mutableStateOf(prefs.getString("name", "") ?: "")
     var invite by mutableStateOf<SavedGroup?>(null)          // an invite link that was opened
     var shareLocation by mutableStateOf(prefs.getBoolean("shareLocation", false))
@@ -79,10 +81,38 @@ object Perms { var version by mutableIntStateOf(0) }
 
 class MainActivity : ComponentActivity() {
     lateinit var state: AppState
-    private val refresh: () -> Unit = { state.tick++ }
+    private val refresh: () -> Unit = { Groups.current(this)?.let { if (it != state.group) state.group = it }; state.tick++ } // a removal changes the group's code
     private val prefs get() = getSharedPreferences("mesh", 0)
     private val main = Handler(Looper.getMainLooper())
     private var shareLocationAsked = false
+    private var afterCredential: (() -> Unit)? = null
+    private val credential = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { r ->
+        if (r.resultCode == RESULT_OK) afterCredential?.invoke()
+        afterCredential = null
+    }
+
+    /** Before Android 11: the phone's own unlock screen ([AppLock.ask]). */
+    @Suppress("DEPRECATION")
+    fun confirmCredential(title: String, ok: () -> Unit) {
+        val i = getSystemService(android.app.KeyguardManager::class.java).createConfirmDeviceCredentialIntent(title, null) ?: run { ok(); return }
+        afterCredential = ok; credential.launch(i)
+    }
+
+    /** With the lock on, screenshots and the recent-apps picture are blocked. */
+    fun applySecure() {
+        val flag = android.view.WindowManager.LayoutParams.FLAG_SECURE
+        if (AppLock.enabled(this)) window.addFlags(flag) else window.clearFlags(flag)
+    }
+
+    fun setAppLock(on: Boolean) {
+        AppLock.set(this, on); state.lockOn = on; applySecure()
+        if (on) getSystemService(NotificationManager::class.java).cancelAll() // alerts already showing still have their text
+    }
+    fun lockNow() { state.locked = true; Notifier.onScreen = false; Notifier.inApp = null }
+    fun unlocked() { state.locked = false; Notifier.onScreen = true; Notifier.inApp = { a -> state.banner = a } }
+    /** The lock screen's unlock worked: what waited for it can happen now. */
+    fun justUnlocked() { AppLock.left(stillLocked = false); unlocked(); afterUnlock?.invoke(); afterUnlock = null }
+    private var afterUnlock: (() -> Unit)? = null
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -103,6 +133,7 @@ class MainActivity : ComponentActivity() {
         val filter = IntentFilter().apply { addAction(BluetoothAdapter.ACTION_STATE_CHANGED); addAction(LocationManager.PROVIDERS_CHANGED_ACTION) }
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(phoneSettings, filter, RECEIVER_NOT_EXPORTED) else registerReceiver(phoneSettings, filter) // system broadcasts only
         updatePhoneSettings()
+        applySecure()
         setContent { DarkProofApp(state, this) }
     }
 
@@ -119,8 +150,8 @@ class MainActivity : ComponentActivity() {
         if (i == null) return
         link(i)
         val group = i.getStringExtra(Actions.EXTRA_GROUP)
-        if (state.group != null) when (i.action) {
-            Actions.SAFE -> whenReady { checkIn(this, state, CheckIn.SAFE) }
+        if (state.group != null && i.component?.className == Actions.ALIAS) when (i.action) { // never from another app
+            Actions.SAFE -> { val send = { whenReady { checkIn(this, state, CheckIn.SAFE) } }; if (state.locked) afterUnlock = send else send() }
             Actions.HELP -> { showGroup(group); state.sheet = null; state.helpGroup = group; state.askHelp = true }
             Actions.CHAT -> { showGroup(group); state.sheet = null; state.everyone = false; state.tab = 1 }
         }
@@ -145,9 +176,12 @@ class MainActivity : ComponentActivity() {
         if (MeshEngine.router != null) f() else if (tries > 0) main.postDelayed({ whenReady(tries - 1, f) }, 250)
     }
 
+    override fun onStart() { super.onStart(); if (AppLock.due(this)) state.locked = true }
+    override fun onStop() { if (!isChangingConfigurations) AppLock.left(state.locked); super.onStop() }
+
     override fun onResume() {
-        super.onResume(); Notifier.onScreen = true
-        Notifier.inApp = { a -> state.banner = a }
+        super.onResume()
+        if (!state.locked) unlocked() // while locked, alerts go out as notifications, without their text
         updatePhoneSettings()
         if (state.group != null && !state.introPermissions) check() // back from Settings
     }

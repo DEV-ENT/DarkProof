@@ -14,6 +14,15 @@ import java.io.ByteArrayOutputStream
 object DebugTools {
     fun log(s: String) { Log.i("DarkProof", s) }
 
+    /** For tests that compare phones' codes: the start of its hash, never the code. */
+    fun noteCode(code: String?) { log("code now " + (code?.let { java.security.MessageDigest.getInstance("SHA-256").digest(it.toByteArray()).take(4).joinToString("") { b -> "%02x".format(b) } } ?: "none")) }
+
+    /** Moves the clock that decides when a key is due: --es ahead 8 (days). */
+    @Volatile var ahead = 0L
+
+    /** The mock relay in tools/mock-relay instead of the public ones: --es relays ws://127.0.0.1:7447 (--es relays "" clears it). */
+    fun relays(c: Context): List<String>? = c.getSharedPreferences("mesh", 0).getString("debugRelays", null)?.takeIf { it.isNotEmpty() }?.split(',')
+
     /** The iPhone's self-test questions (LocalAi.swift), timed: adb shell am start … --es aiSelfTest 1, then logcat -s DarkProof. */
     private fun aiSelfTest(c: Context) {
         val g = Groups.current(c) ?: return log("AI self-test: no group")
@@ -50,13 +59,24 @@ object DebugTools {
      * A message from another phone, through the real receive path (alerts, banners, people): --es fake help | ask |
      * askme | vouch | safe | text | other (to another saved group) | history (messages 1 and 2 days old, an old place).
      */
+    private val fakeKeys = HashMap<String, java.security.KeyPair>()
+    private val fakeEnc = HashMap<String, java.security.KeyPair>()
     private fun fake(c: Context, kind: String) {
         val g = Groups.current(c) ?: return
         val me = c.getSharedPreferences("mesh", 0).getString("name", "") ?: ""
         val now = System.currentTimeMillis()
-        fun put(code: String, text: String, ts: Long = now, from: String = "Marco", sender: String = "debug-marco") {
-            val cr = GroupCrypto(code); val id = Packet.newId(cr.mailbox)
-            MeshEngine.router?.receive("debug", Packet(id, ts, 16, cr.seal(id, ts, sender, from, text)))
+        // Each fake person has their own member key and introduces it first, like a real phone (spec "Introductions").
+        // introLater: the message first, its introduction 5 s later ("Not verified yet", then checked).
+        fun put(code: String, text: String, ts: Long = now, from: String = "Marco", @Suppress("UNUSED_PARAMETER") sender: String = "", introLater: Boolean = false) {
+            val cr = GroupCrypto(code); val pair = fakeKeys.getOrPut(code + "|" + from) { P256.newKeyPair() }
+            val pub = P256.compress(pair.public); val me = P256.memberId(pub)
+            val intro = cr.intros(); val iid = Packet.newId(intro.mailbox)
+            val enc = P256.uncompressed(fakeEnc.getOrPut(code + "|" + from) { P256.newKeyPair() }.public)
+            val introPacket = Packet(iid, ts - 1, 16, intro.seal(iid, ts - 1, me, from, "", extra = byteArrayOf(2) + pub + enc) { P256.sign(pair.private, it) })
+            if (!introLater) MeshEngine.router?.receive("debug", introPacket)
+            val id = Packet.newId(cr.mailbox)
+            MeshEngine.router?.receive("debug", Packet(id, ts, 16, cr.seal(id, ts, me, from, text) { P256.sign(pair.private, it) }))
+            if (introLater) main.postDelayed({ Thread { MeshEngine.router?.receive("debug", introPacket) }.start() }, 5_000)
         }
         when (kind) {
             "help" -> put(g.code, CheckIn.HELP.text(41, Spot(45.464, 9.189, 10), setOf(Need.INJURED, Need.WATER), 3))
@@ -65,6 +85,7 @@ object DebugTools {
             "askme" -> put(g.code, AreYouSafe(me).text)
             "vouch" -> put(g.code, Vouch("Grandma Rosa", CheckIn.HELP, setOf(Need.MEDICINE), 2, Spot(45.4662, 9.1931)).text)
             "text" -> put(g.code, "Water is back at the school gym")
+            "late" -> put(g.code, "Bridge on Via Roma is closed", from = "Lucia", introLater = true)
             "other" -> Groups.others(c).firstOrNull()?.let { put(it.code, "Hello from ${it.name}", from = "Sara", sender = "debug-sara") }
             "history" -> {
                 put(g.code, "Power is out in the whole street", now - 2 * 86_400_000L)
@@ -83,6 +104,12 @@ object DebugTools {
      * Simulator: adb forward tcp:7777 tcp:7777, then type 127.0.0.1:7777 in the iPhone's Wi-Fi network address field.
      */
     fun debugIntent(c: Context, i: Intent) {
+        i.getStringExtra("relays")?.let { c.getSharedPreferences("mesh", 0).edit().putString("debugRelays", it).commit() }
+        // --es dumpChat 1: what this phone shows, for the mock-relay tests (never the group code).
+        if (i.getStringExtra("dumpChat") != null) whenStarted {
+            MeshEngine.snapshotAll().forEach { m -> log("CHAT ${m.id} ts=${m.ts} verified=${m.verified} public=${m.public} from=${m.name}: ${m.text.take(80)}") }
+            log("CHAT end")
+        }
         // --es internet 0: no public relays (tests). Read by MeshEngine.start; relinks if already up.
         i.getStringExtra("internet")?.let { v ->
             c.getSharedPreferences("mesh", 0).edit().putBoolean("internet", v == "1").commit()
@@ -93,10 +120,24 @@ object DebugTools {
         i.getStringExtra("fake")?.let { k -> main.postDelayed({ whenStarted { Thread { fake(c, k) }.start() } }, delay) }
         i.getStringExtra("tor")?.let { Tor.setEnabled(c, it == "1"); if (MeshEngine.nostr != null) MeshEngine.setTor(it == "1") } // relink if already up
         i.getStringExtra("join")?.let { j ->
-            c.getSharedPreferences("mesh", 0).edit().putString("name", j.substringBefore('|')).putString("code", j.substringAfter('|')).apply()
+            Groups.setUp(c, j.substringBefore('|'), SavedGroup("Group", j.substringAfter('|')))
+            // --es found 1 with it: as if this phone created the group (v0.6: it makes the first epoch).
+            if (i.getStringExtra("found") != null) MeshEngine.found(c, j.substringAfter('|'))
         }
         log("debug intent: samples=${i.getStringExtra("samples")} started=${MeshEngine.router != null}")
         if (i.getStringExtra("aiSelfTest") != null) whenStarted { aiSelfTest(c) }
+        if (i.getStringExtra("codeHash") != null) noteCode(Groups.code(c))
+        // --es appLock 1: as if turned on in Settings, even without a screen lock. --es lockNow 1: locks at once.
+        i.getStringExtra("appLock")?.let { v -> AppLock.set(c, v == "1"); (c as? MainActivity)?.let { a -> runCatching { a.setAppLock(v == "1") } } } // state isn't there yet on a first start
+        if (i.getStringExtra("lockNow") != null) (c as? MainActivity)?.lockNow()
+        i.getStringExtra("ahead")?.let { ahead = it.toLong() * 86_400_000L }
+        if (i.getStringExtra("weeklyNow") != null) whenStarted { Thread { MeshEngine.weeklyCheck(); log("weekly check done") }.start() }
+        // --es makeAdmin Ben, --es removeMember Marco: by name, among the people this phone has heard from.
+        fun named(n: String) = Person.all(MeshEngine.snapshot(), MeshEngine.deviceId).firstOrNull { it.name == n }?.id
+        i.getStringExtra("makeAdmin")?.let { n -> whenStarted { named(n)?.let { id -> MeshEngine.makeAdmin(MeshEngine.currentCode, id) { log("make admin $n: $it") } } ?: log("make admin: nobody called $n") } }
+        i.getStringExtra("say")?.let { t -> whenStarted { Thread { MeshEngine.send(t); log("said") }.start() } } // to the group on screen only
+        i.getStringExtra("approve")?.let { n -> whenStarted { MeshEngine.joinRequests(MeshEngine.currentCode).firstOrNull { it.name == n }?.let { r -> MeshEngine.approveJoin(MeshEngine.currentCode, r.id) { log("approve $n: $it") } } ?: log("approve: nobody called $n is asking") } }
+        i.getStringExtra("removeMember")?.let { n -> whenStarted { named(n)?.let { id -> MeshEngine.remove(MeshEngine.currentCode, id) { log("remove $n: $it") } } ?: log("remove: nobody called $n") } }
         if (i.getStringExtra("dumpPhotos") != null) whenStarted { // writes every photo in the chat to the app's files folder
             MeshEngine.snapshot().filter { it.photo != null }.forEach { m -> java.io.File(c.getExternalFilesDir(null), "photo-${m.id}.jpg").writeBytes(m.photo!!) }
             log("dumped photos")

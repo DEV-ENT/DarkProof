@@ -4,6 +4,15 @@ import XCTest
 /// The same ids and signature as Android's NostrTest (ids checked against Python's json.dumps, the signature against
 /// @noble/curves).
 final class NostrTests: XCTestCase {
+    /// A date before 1970 from a hostile relay is refused: paging back from it would crash the app on every launch.
+    func testEventsDatedBefore1970AreRefused() throws {
+        let packet = Packet(id: "6a44000000000001", ts: 1, ttl: 1, cipher: Data(count: 40)).encode().base64EncodedString()
+        func event(_ t: String) -> String { #"["EVENT","s",{"id":"a","pubkey":"b","created_at":\#(t),"kind":\#(Nostr.kind),"tags":[],"content":"\#(packet)"}]"# }
+        XCTAssertNotNil(Nostr.received(event("1794000000")))
+        XCTAssertNil(Nostr.received(event("-1")))
+        XCTAssertNil(Nostr.received(event("-9223372036854775808")))
+    }
+
     func testEventIdEscapesLikeNip01() {
         XCTAssertEqual(Nostr.eventId(pubkey: String(repeating: "ab", count: 32), createdAt: 1_700_000_000, kind: 1,
                                      tags: [["t", "x"]], content: "a\"b\\c\nd\te\u{01}é🙂"),
@@ -16,16 +25,16 @@ final class NostrTests: XCTestCase {
         let e = Nostr.event(p, pubkey: "6dd447ac274cd77ed2bb1373b5571a181271583014de6a085437d709bc613bd5", now: 1_793_990_000) { m in
             signed = m; return Data(count: 64)
         }
-        XCTAssertEqual(e["content"] as? String, "sqjQAAAAAAABAAABobIi/YAQAQID")
+        XCTAssertEqual(e["content"] as? String, "s6jQAAAAAAABAAABobIi/YAQAQID")
         XCTAssertEqual(e["tags"] as? [[String]], [["t", "dp1-a8d0"], ["x", "a8d0000000000001"], ["expiration", "1794594800"]])
-        XCTAssertEqual(e["id"] as? String, "f1cfcc88f725896d6159d0035e17e1fca77ad130acc200a2cb798c550df4390a") // Android's EXPECTED_ID
+        XCTAssertEqual(e["id"] as? String, "60d8d1b5949f5e695a0914f7e6ffd6ef069cf7b9f3ad03cb936776b017875f20") // Android's EXPECTED_ID
         XCTAssertEqual(signed.map { Hex.encode($0) }, e["id"] as? String) // the signer gets the 32-byte id
 
         let sk = Hex.decode("c6701f511d184b55bcfb736a7fde240b37d9ae4f8f08eed3e8b5e4ec74416261")
         let real = Nostr.event(p, pubkey: Hex.encode(Schnorr.publicKey(sk)), now: 1_793_990_000) {
             Schnorr.sign(secret: sk, message: $0, aux: Data(repeating: 2, count: 32))
         }
-        XCTAssertEqual(real["sig"] as? String, "eefea03d7b56a59850db2ea11651cc3988def98b4c01b1f38c6c42226b64c45a895ba6ccba4e370ca70b0ee19f944b651cb703becee4b177ae5ab21e5c573335") // Android's EXPECTED_SIG
+        XCTAssertEqual(real["sig"] as? String, "eeba77276dbb66aaf7467f1cf9eb30fefaea63f67ccb9a4ad4e1b1db6caae86f8d8cbfa74487c77aaacaca420f790b606cadd0a05718399e86453663e8370b97") // Android's EXPECTED_SIG
 
         let wire = "[\"EVENT\",\"s\"," + String(decoding: try JSONSerialization.data(withJSONObject: e), as: UTF8.self) + "]"
         let r = try XCTUnwrap(Nostr.received(wire))
@@ -137,7 +146,7 @@ final class NostrTests: XCTestCase {
         var t: Int64 = 1_800_000_000_000
         let o = RelayOutbox(now: { t }, jitter: { 0 })
         o.offer(pkt(1, t - 1_000), mine: true)                 // fresh own: straight up
-        o.offer(pkt(2, t - 5 * 60_000), mine: true)            // older own: looked up first
+        o.offer(pkt(2, t - 50 * 60_000), mine: true)           // older own: looked up first
         o.offer(pkt(3, t - 8 * 24 * 3_600_000), mine: false)   // too old: never
         let (p1, own) = try XCTUnwrap(o.next(bridged: false))
         XCTAssertEqual(p1.id, pkt(1, 0).id); XCTAssertTrue(own); XCTAssertNil(o.next(bridged: true))

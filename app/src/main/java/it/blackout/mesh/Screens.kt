@@ -54,6 +54,8 @@ import java.util.Locale
 private sealed class ChatRow(val key: String) {
     class Day(val label: String, key: String) : ChatRow(key)
     class Msg(val m: Message, val firstOfRun: Boolean) : ChatRow(m.id)
+    /** "Marco joined" (v0.6): from the group's epochs, not a message. */
+    class Event(val text: String, key: String) : ChatRow(key)
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -68,13 +70,19 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
     // Receipts change no message, so the list above stays the same: delivery states are read again on every update.
     val tick = s.tick
     val deliveries = remember(tick, shown) { shown.filter { it.sender == MeshEngine.deviceId }.associate { it.id to MeshEngine.delivery(it) } }
-    val rows = remember(shown) {
+    val joined = remember(tick, everyone, g) { if (everyone) emptyList() else MeshEngine.groupLines(g.code) }
+    val rows = remember(shown, joined) {
         val out = ArrayList<ChatRow>(shown.size + 8); var day = -1
+        val events = joined.sortedBy { it.first }.toMutableList()
+        fun dayRow(ts: Long) { val d = dayOf(ts); if (d != day) { day = d; out += ChatRow.Day(dayLabel(ctx, ts), "day-$d") } }
+        fun eventsUpTo(ts: Long) { while (events.isNotEmpty() && events[0].first <= ts) { val e = events.removeAt(0); dayRow(e.first); out += ChatRow.Event(e.second, "event-${e.first}-${e.second}") } }
         shown.forEachIndexed { i, m ->
+            eventsUpTo(m.ts)
             val d = dayOf(m.ts)
-            if (d != day) { day = d; out += ChatRow.Day(dayLabel(ctx, m.ts), "day-$d") }
-            out += ChatRow.Msg(m, i == 0 || shown[i - 1].sender != m.sender || CheckIn.of(shown[i - 1].text) != null || dayOf(shown[i - 1].ts) != d)
+            dayRow(m.ts)
+            out += ChatRow.Msg(m, i == 0 || out.lastOrNull() is ChatRow.Event || shown[i - 1].sender != m.sender || CheckIn.of(shown[i - 1].text) != null || dayOf(shown[i - 1].ts) != d)
         }
+        eventsUpTo(Long.MAX_VALUE)
         out
     }
     val lastMine = remember(shown) { shown.lastOrNull { it.sender == MeshEngine.deviceId && CheckIn.of(it.text) != null } }
@@ -101,7 +109,31 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
         Column(Modifier.padding(horizontal = 20.dp).padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             ScreenTitle(g.name, if (phones == 1) "1 phone in range" else "$phones phones in range")
             PillSwitch(g.name, "Everyone", everyone) { s.everyone = it }
-            Txt(if (everyone) "Anyone with DarkProof can read these, nearby or online." else "Only people in ${g.name} can read these.", 14, color = Theme.dim)
+            Txt(if (everyone) "Anyone with DarkProof can read these, nearby or online." else "Only people in ${g.name} can read these. They disappear after one to two weeks.", 14, color = Theme.dim)
+            if (!everyone && remember(tick, g) { MeshEngine.removed(g.code) }) Card(padding = 16.dp) {
+                Txt("You were removed from ${g.name}", 16, FontWeight.SemiBold)
+                Txt("You can still read what's here, but you can't write or see anything new. To come back, ask for a new invite.", 14, color = Theme.dim)
+            } else if (!everyone && remember(tick, g) { MeshEngine.inviteClosed(g.code) }) Card(padding = 16.dp) {
+                Txt("This invite no longer works", 16, FontWeight.SemiBold)
+                Txt("The group has a new code. Ask someone in ${g.name} for a new invite.", 14, color = Theme.dim)
+            } else if (!everyone && remember(tick, g) { MeshEngine.rejoining(g.code) }) Card(padding = 16.dp) {
+                Txt("Rejoining ${g.name}…", 16, FontWeight.SemiBold)
+                Txt("You've been away for more than a week. A phone that's in the group needs to be in reach, nearby or online.", 14, color = Theme.dim)
+            } else if (!everyone && remember(tick, g) { MeshEngine.joining(g.code) }) Card(padding = 16.dp) {
+                Txt("Asking to join ${g.name}…", 16, FontWeight.SemiBold)
+                Txt("An admin of the group has to let you in, and their phone needs to be in reach, nearby or online. You can write here once they have.", 14, color = Theme.dim)
+            }
+            if (!everyone) remember(tick, g) { MeshEngine.joinRequests(g.code) }.forEach { r ->
+                Card(padding = 16.dp) {
+                    Txt("${r.name} wants to join ${g.name}", 16, FontWeight.SemiBold)
+                    Txt(Fingerprint.emojiLines(P256.emoji(r.pub)), 22, lineHeight = 30)
+                    Txt("Let them in only if you know it's them. Their phone shows these same emoji.", 14, color = Theme.dim)
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        PrimaryButton("Let in", Modifier.weight(1f)) { MeshEngine.approveJoin(g.code, r.id) { ok -> if (!ok) Toast.makeText(ctx, "Not everyone's keys have reached this phone yet. Try again when they're in reach.", Toast.LENGTH_LONG).show() } }
+                        SecondaryButton("Not now", Modifier.weight(1f)) { MeshEngine.declineJoin(g.code, r.id) }
+                    }
+                }
+            }
         }
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -114,6 +146,7 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
             items(rows, key = { it.key }) { r ->
                 when (r) {
                     is ChatRow.Day -> Txt(r.label, 13, FontWeight.SemiBold, Theme.dim, Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 4.dp).wrapContentWidth())
+                    is ChatRow.Event -> Txt(r.text, 14, FontWeight.Medium, Theme.dim, Modifier.fillMaxWidth().padding(vertical = 6.dp).wrapContentWidth())
                     is ChatRow.Msg -> MessageRow(r.m, r.firstOfRun, deliveries[r.m.id], s.name,
                         lastMine?.takeIf { it.ts > r.m.ts }?.let { CheckIn.of(it.text) }, open, { s.moderated++ }) { c ->
                         if (c == CheckIn.SAFE) checkIn(a, s, CheckIn.SAFE, group = r.m.group) else { s.helpGroup = r.m.group; s.askHelp = true }
@@ -121,7 +154,7 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
                 }
             }
         }
-        Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (everyone || !remember(tick, g) { MeshEngine.removed(g.code) || MeshEngine.joining(g.code) }) Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             if (!everyone) RoundIcon(R.drawable.ic_photo_camera, 52.dp, desc = "Send a photo") {
                 pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             }
@@ -263,8 +296,17 @@ private fun MessageRow(m: Message, firstOfRun: Boolean, delivery: Delivery?, myN
                 if (me) Status(delivery, time) else Txt(time, 13, color = Theme.dim, modifier = Modifier.padding(start = 14.dp, top = 3.dp))
             }
         }
+        if (!me) VerifyNote(m)
     }
     }
+}
+
+/** Under someone else's message: "Not verified yet" (their key hasn't come), or a new key for a checked person's name. */
+@Composable
+private fun VerifyNote(m: Message) {
+    val newKey = MeshEngine.newKeyFor(m.group, m.sender, m.name)
+    if (newKey) Txt("New key for ${m.name}: check their emoji", 13, FontWeight.SemiBold, Theme.help, Modifier.padding(start = 14.dp, top = 3.dp))
+    else if (!m.verified) Txt("Not verified yet", 13, color = Theme.faint, modifier = Modifier.padding(start = 14.dp, top = 3.dp))
 }
 
 /** Under a check-in with a position: "Find Anna" and its Plus Code (tap to copy). */
@@ -579,7 +621,7 @@ fun situation(g: SavedGroup, messages: List<Message>, me: Spot? = null): String 
     val lines = ArrayList<String>()
     val people = Person.all(messages, MeshEngine.deviceId)
     val phones = phonesInRange()
-    lines += "Group \"${g.name}\": ${people.size} other ${if (people.size == 1) "person" else "people"} have written; $phones phone(s) in range right now."
+    lines += "Group \"${ai(g.name)}\": ${people.size} other ${if (people.size == 1) "person" else "people"} have written; $phones phone(s) in range right now."
     for (p in people.take(15)) {
         val parts = ArrayList<String>()
         parts += when (p.checkIn) {
@@ -591,7 +633,7 @@ fun situation(g: SavedGroup, messages: List<Message>, me: Spot? = null): String 
             parts += if (me != null) "was ${Geo.meters(Geo.distance(me, sp))} ${Geo.compassWord(Geo.bearing(me, sp)).lowercase()} of you ${ago(p.spotTs)}"
             else "shared a position ${ago(p.spotTs)}"
         }
-        lines += "- ${p.name}: " + parts.joinToString(", ")
+        lines += "- ${ai(p.name)}: " + parts.joinToString(", ")
     }
     val mine = messages.lastOrNull { !it.public && it.sender == MeshEngine.deviceId && CheckIn.of(it.text) != null }
     lines += if (mine != null) "You (the person asking) last checked in as ${if (CheckIn.of(mine.text) == CheckIn.HELP) "needing help" else "safe"}, ${ago(mine.ts)}."
@@ -601,23 +643,28 @@ fun situation(g: SavedGroup, messages: List<Message>, me: Spot? = null): String 
     lines += if (places.isEmpty()) "Shared places: none yet." else "Shared places (nearest first):"
     for ((pl, by, ts) in places) {
         val d = if (pl.spot != null && me != null) ", ${Geo.meters(Geo.distance(me, pl.spot))} ${Geo.compassWord(Geo.bearing(me, pl.spot)).lowercase()}" else ""
-        lines += "- ${pl.kind.word}${if (pl.note.isEmpty()) "" else ": " + pl.note.take(120)} (by $by, ${ago(ts)}$d)"
+        lines += "- ${pl.kind.word}${if (pl.note.isEmpty()) "" else ": " + ai(pl.note, 120)} (by ${ai(by)}, ${ago(ts)}$d)"
     }
     val recent = messages.filter { !it.public && CheckIn.of(it.text) == null }.takeLast(8)
     if (recent.isNotEmpty()) {
         lines += "Latest group messages, oldest first:"
         for (m in recent) {
-            val who = if (m.sender == MeshEngine.deviceId) "You" else m.name
+            val who = if (m.sender == MeshEngine.deviceId) "You" else ai(m.name)
             val text = if (m.photo != null) "[photo] " + Photo.caption(m.text) else m.text
-            lines += "- $who, ${ago(m.ts)}: ${text.take(160)}"
+            lines += "- $who, ${ago(m.ts)}: ${ai(text, 160)}"
         }
     }
     return lines.joinToString("\n")
 }
 
+/** Text from other people, for the assistant: one line, short, and it can't close the <data> block around it. */
+private fun ai(s: String, max: Int = 40) = s.replace(Regex("\\s+"), " ").replace("<", "‹").replace(">", "›").trim().take(max)
+
 /** The assistant's instructions and the group's situation, like the iPhone. */
 fun aiSystem(g: SavedGroup, messages: List<Message>, me: Spot? = null) =
-    LocalAi.instructions + "\n\n" + LocalAi.situationIntro + "\n" + situation(g, messages, me).take(AiContext.MAX_SITUATION_CHARS)
+    LocalAi.instructions + "\n\n" + LocalAi.situationIntro + "\n<data>\n" + situation(g, messages, me).take(AiContext.MAX_SITUATION_CHARS) + "\n</data>"
+
+private const val CATCH_UP = "Catch me up on the last 6 hours"
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -631,19 +678,30 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
     val list = rememberLazyListState()
     LaunchedEffect(turns.size, turns.lastOrNull()?.text?.length) { if (turns.isNotEmpty()) list.scrollToItem(turns.size - 1) }
     fun send(q: String) { if (q.isNotBlank() && !LocalAi.busy) { LocalAi.ask(q.trim(), aiSystem(g, messages, Locator.lastKnown(ctx))); draft = "" } }
+    /** "Catch me up": the group's messages of the last 6 hours go with what the app knows; the chat shows the short question. */
+    fun catchUp() {
+        if (LocalAi.busy) return
+        val recent = messages.filter { !it.public && it.ts >= System.currentTimeMillis() - 6 * 3_600_000L }.takeLast(40)
+        if (recent.isEmpty()) { Toast.makeText(ctx, "Nothing from ${g.name} in the last 6 hours", Toast.LENGTH_LONG).show(); return }
+        val h = recent.joinToString("\n") { "${clock(ctx, it.ts)} ${if (it.sender == MeshEngine.deviceId) "You" else ai(it.name)}: ${ai(it.text, 300)}" }
+        val half = AiContext.MAX_SITUATION_CHARS / 2
+        LocalAi.ask(CATCH_UP, LocalAi.instructions + "\n\n" + LocalAi.situationIntro + "\n<data>\n" + situation(g, messages, Locator.lastKnown(ctx)).take(half) +
+            "\nAll group messages of the last 6 hours, oldest first:\n" + h.takeLast(half) + "\n</data>\nSay who is safe, who is asking for help and what is missing. Do not make anything up.")
+    }
+    var menu by remember { mutableStateOf(false) }
     val typing = WindowInsets.isImeVisible
     Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding().padding(bottom = if (typing) 0.dp else 84.dp)) {
-        Column(Modifier.padding(horizontal = 20.dp).padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.weight(1f)) { ScreenTitle("Ask", "Offline assistant on this phone") }
-                if (ready && turns.isNotEmpty() && !LocalAi.busy) GhostButton("New") { LocalAi.newConversation() }
-            }
-            if (ready) Row(Modifier.fillMaxWidth().clip(CircleShape).background(Theme.tile).clickable { choose = true }.padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically) {
-                Ic(R.drawable.ic_auto_awesome, Theme.text, 18.dp); Spacer(Modifier.width(8.dp))
-                Txt("${m!!.title} · " + (LocalAi.typicalSeconds(m)?.let { "about $it s per answer here" } ?: "speed shown after the first answer"),
-                    14, FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1)
-                Txt("Change", 14, FontWeight.SemiBold, Theme.dim)
+        Row(Modifier.padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.Top) {
+            Box(Modifier.weight(1f)) { ScreenTitle("Ask", "Works with no internet. It can be wrong: double-check anything important.") }
+            Spacer(Modifier.width(12.dp))
+            Box {
+                RoundIcon(R.drawable.ic_more_horiz, desc = "More: new conversation, AI model") { menu = true }
+                DropdownMenu(menu, { menu = false }, containerColor = Theme.card) {
+                    val canNew = ready && turns.isNotEmpty() && !LocalAi.busy
+                    DropdownMenuItem(text = { Txt("New conversation", 16, color = if (canNew) Theme.text else Theme.faint) }, enabled = canNew,
+                        onClick = { menu = false; LocalAi.newConversation() })
+                    DropdownMenuItem(text = { Txt("AI model: " + (m?.title ?: "none yet"), 16) }, onClick = { menu = false; choose = true })
+                }
             }
         }
         if (!ready) {
@@ -660,11 +718,9 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (turns.isEmpty()) item {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Txt("Ask anything: first aid, water, power, repairs, or what is happening in your group.", 15, color = Theme.dim)
-                        listOf("Who in my group needs help, and who has not checked in?", "How do I make water safe to drink?",
-                            "How do I stop heavy bleeding?", "How do I keep warm without power?").forEach { q ->
-                            Txt(q, 15, FontWeight.SemiBold, modifier = Modifier.clip(RoundedCornerShape(18.dp)).background(Theme.card)
-                                .clickable { send(q) }.padding(horizontal = 16.dp, vertical = 12.dp))
+                        listOf("Who in ${g.name} needs help?", "How do I treat a burn?", CATCH_UP, "How do I make water safe to drink?").forEach { q ->
+                            Txt(q, 16, FontWeight.SemiBold, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Theme.card)
+                                .clickable(role = Role.Button) { if (q == CATCH_UP) catchUp() else send(q) }.padding(horizontal = 18.dp, vertical = 14.dp))
                         }
                     }
                 }
@@ -678,7 +734,6 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
                             fontSize = 16.sp, lineHeight = 23.sp)
                     }
                 }
-                item { Txt("It works with no internet and can be wrong. Double-check anything important.", 13, color = Theme.faint, modifier = Modifier.padding(top = 4.dp)) }
             }
             Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 TextBox(draft, { draft = it.take(1000) }, "Ask anything", singleLine = false, keyboard = KeyboardOptions(KeyboardCapitalization.Sentences),

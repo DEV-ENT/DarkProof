@@ -4,12 +4,13 @@ import BlackoutCore
 
 struct RootView: View {
     @AppStorage("name") private var name = ""
-    @AppStorage("code") private var code = ""
+    @CurrentCode private var code
     @AppStorage("groupName") private var groupName = "My group"
     @ObservedObject private var mesh = Mesh.shared
     private var engine: Engine? { mesh.engine }
     @State private var invite: PendingInvite?   // from an invite link, before setup
     @State private var linkInvite: PendingInvite? // from an invite link, once in a group: asks before switching
+    @Environment(\.scenePhase) private var phase
 
     var body: some View {
         Group {
@@ -29,6 +30,8 @@ struct RootView: View {
             }
         }
         .tint(Theme.text)
+        .onAppear { if !code.isEmpty { AppLock.shared.phaseChanged(.active) } }
+        .onChange(of: phase) { AppLock.shared.phaseChanged($0) }
         .onOpenURL { url in
             guard let i = Invite.parse(url) else { return }
             if code.isEmpty { invite = PendingInvite(name: i.name, code: i.code); return }
@@ -121,7 +124,9 @@ struct SetupView: View {
             }
             Button("Create group") {
                 let g = clean(groupName, Invite.maxGroupName)
-                next(cleanName, g.isEmpty ? SavedGroups.defaultName(for: cleanName) : g, Invite.newCode(), true)
+                let code = Invite.newCode()
+                Engine.found(code) // its first epoch is made on this phone (v0.6)
+                next(cleanName, g.isEmpty ? SavedGroups.defaultName(for: cleanName) : g, code, true)
             }
             .buttonStyle(PrimaryButton()).disabled(cleanName.isEmpty)
         }
@@ -135,7 +140,7 @@ struct SetupView: View {
                 let g = clean(groupName, Invite.maxGroupName)
                 next(cleanName, g.isEmpty ? "Group" : g, cleanCode, false)
             }
-            .buttonStyle(PrimaryButton()).disabled(cleanName.isEmpty || cleanCode.count < Invite.minCodeLength)
+            .buttonStyle(PrimaryButton()).disabled(cleanName.isEmpty || !Invite.isGeneratedCode(cleanCode))
             if cleanName.isEmpty && !code.isEmpty {
                 Text("Enter your name.").font(.footnote).foregroundStyle(Theme.dim)
             }
@@ -233,7 +238,7 @@ struct MainView: View {
     @ObservedObject private var unread = Unread.shared
     @ObservedObject private var notifier = Notifier.shared
     @AppStorage("groupName") private var groupName = "My group"
-    @AppStorage("code") private var code = ""
+    @CurrentCode private var code
     @AppStorage("askedNotifications") private var askedNotifications = false
     @State private var asking = false
 
@@ -253,7 +258,7 @@ struct MainView: View {
         .sheet(item: $nav.sheet) { s in
             switch s {
             case .invite: InviteSheet(groupName: groupName, code: code)
-            case .settings: GroupSheet(engine: engine)
+            case .settings: SettingsSheet(engine: engine)
             case .radio: ConnectionsView(engine: engine)
             case .groups: GroupSwitcher(engine: engine)
             case .help: HelpSheet(engine: engine)
@@ -302,7 +307,7 @@ struct HomeView: View {
     @ObservedObject private var battery = BatteryMonitor.shared
     @ObservedObject private var unread = Unread.shared
     @AppStorage("groupName") private var groupName = "My group"
-    @AppStorage("code") private var code = ""
+    @CurrentCode private var code
     @State private var details = false
 
     var body: some View {
@@ -516,7 +521,7 @@ struct ChatView: View {
     @State private var newBelow = 0
     @ObservedObject private var loc = LocationService.shared
     @AppStorage("groupName") private var groupName = "My group"
-    @AppStorage("code") private var code = ""
+    @CurrentCode private var code
     @AppStorage("name") private var myName = ""
     @Environment(\.scenePhase) private var phase
 
@@ -562,8 +567,18 @@ struct ChatView: View {
                 ChannelSwitch(toPublic: $nav.chatEveryone, groupName: groupName,
                               groupNew: unread.count(code, in: engine.allMessages, me: engine.deviceId),
                               everyoneNew: unread.count(Unread.everyone, in: engine.allMessages, me: engine.deviceId))
-                Text(toPublic ? "Anyone with DarkProof can read these, nearby or online." : "Only people in \(groupName) can read these.")
+                Text(toPublic ? "Anyone with DarkProof can read these, nearby or online." : "Only people in \(groupName) can read these. They disappear after one to two weeks.")
                     .scaledFont(13).foregroundStyle(Theme.faint)
+                if !toPublic && engine.removed(code) {
+                    NoteCard(title: "You were removed from \(groupName)", text: "You can still read what's here, but you can't write or see anything new. To come back, ask for a new invite.")
+                } else if !toPublic && engine.inviteClosed(code) {
+                    NoteCard(title: "This invite no longer works", text: "The group has a new code. Ask someone in \(groupName) for a new invite.")
+                } else if !toPublic && engine.rejoining(code) {
+                    NoteCard(title: "Rejoining \(groupName)…", text: "You've been away for more than a week. A phone that's in the group needs to be in reach, nearby or online.")
+                } else if !toPublic && engine.joining(code) {
+                    NoteCard(title: "Asking to join \(groupName)…", text: "An admin of the group has to let you in, and their phone needs to be in reach, nearby or online. You can write here once they have.")
+                }
+                if !toPublic { ForEach(engine.joinRequests(code)) { r in JoinRequestCard(engine: engine, code: code, groupName: groupName, request: r) } }
             }
             .padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 8)
 
@@ -576,8 +591,10 @@ struct ChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 6) {
+                            let joins = toPublic ? [] : engine.groupLines(code)
                             ForEach(Array(list.enumerated()), id: \.element.id) { i, m in
                                 let prev = i > 0 ? list[i - 1] : nil
+                                ForEach(joins.filter { $0.ts > (prev?.ts ?? .min) && $0.ts <= m.ts }) { j in GroupLine(text: j.text) }
                                 if prev == nil || !ChatTime.sameDay(prev!.ts, m.ts) {
                                     Text(ChatTime.dayTitle(m.ts)).scaledFont(13, .semibold).foregroundStyle(Theme.dim)
                                         .padding(.horizontal, 12).padding(.vertical, 5).background(Theme.tile, in: Capsule())
@@ -585,6 +602,7 @@ struct ChatView: View {
                                 }
                                 row(m, prev: prev, first: i == 0)
                             }
+                            ForEach(joins.filter { $0.ts > (list.last?.ts ?? .min) }) { j in GroupLine(text: j.text) }
                             Color.clear.frame(height: 1).id("bottom")
                                 .onAppear { atBottom = true; newBelow = 0; markRead() }
                                 .onDisappear { atBottom = false }
@@ -623,7 +641,7 @@ struct ChatView: View {
                     .onChange(of: phase) { p in if p == .active { markRead() } }
                 }
             }
-            VStack(alignment: .leading, spacing: 6) {
+            if toPublic || !(engine.removed(code) || engine.joining(code)) { VStack(alignment: .leading, spacing: 6) {
                 if toPublic {
                     Label("To everyone: anyone with DarkProof can read it", systemImage: "megaphone.fill")
                         .scaledFont(13, .semibold).foregroundStyle(Theme.text).padding(.horizontal, 6)
@@ -645,7 +663,7 @@ struct ChatView: View {
                              isPublic: toPublic, send: send)
                 }
             }
-            .padding(.horizontal, 16).padding(.vertical, 10)
+            .padding(.horizontal, 16).padding(.vertical, 10) }
         }
         .background(Theme.bg.ignoresSafeArea())
         .sheet(item: $readers) { DeliveredSheet(readers: $0.readers) }
@@ -692,6 +710,7 @@ struct ChatView: View {
         let showReaders: () -> Void = {
             if case .delivered(let r) = delivery { readers = ReaderList(id: m.id, readers: r) }
         }
+        VStack(alignment: mine ? .trailing : .leading, spacing: 3) {
         Group {
             if m.isPublic, let place = Place.of(m.text) {
                 let shared = SharedPlace(id: m.id, place: place, by: mine ? "you" : m.name, ts: m.ts)
@@ -727,6 +746,8 @@ struct ChatView: View {
                     }
                 }
             }
+        }
+        if !mine { VerifyNote(engine: engine, message: m) }
         }
         .padding(.top, newRun && !first ? 10 : 0)
         .contextMenu { moderationMenu(m, mine: mine) } // hold: Block, Report on Everyone, Remove your place
@@ -839,6 +860,56 @@ struct Bubble: View {
 }
 
 /// Time and, for your own messages, where the message is: waiting, sent, or delivered to whom.
+/// "Marco joined" (v0.6): from the group's epochs, not a message.
+/// A note above the chat: asking to join, removed, an invite that no longer works.
+/// Someone asking to join: for an admin to let in or turn down (spec "Joining").
+struct JoinRequestCard: View {
+    @ObservedObject var engine: Engine
+    let code: String, groupName: String, request: JoinRequest
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("\(request.name) wants to join \(groupName)").scaledFont(16, .semibold).foregroundStyle(Theme.text)
+            Text(Fingerprint.emojiLines(MemberKey.emoji(request.pub))).scaledFont(22)
+            Text("Let them in only if you know it's them. Their phone shows these same emoji.").scaledFont(14).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button("Let in") { engine.approveJoin(code, request.id) { ok in if !ok { Nav.shared.toast("Not everyone's keys have reached this phone yet. Try again when they're in reach.") } } }.buttonStyle(PrimaryButton())
+                Button("Not now") { engine.declineJoin(code, request.id) }.buttonStyle(SecondaryButton())
+            }
+        }
+        .padding(16).frame(maxWidth: .infinity, alignment: .leading).background(Theme.tile, in: RoundedRectangle(cornerRadius: 16))
+    }
+}
+
+struct NoteCard: View {
+    let title: String, text: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).scaledFont(16, .semibold).foregroundStyle(Theme.text)
+            Text(text).scaledFont(14).foregroundStyle(Theme.dim).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+struct GroupLine: View {
+    let text: String
+    var body: some View { Text(text).scaledFont(14, .medium).foregroundStyle(Theme.dim).frame(maxWidth: .infinity).padding(.vertical, 6) }
+}
+
+/// Under someone else's message: "Not verified yet" (their key hasn't come), or a new key for a checked person's name.
+struct VerifyNote: View {
+    @ObservedObject var engine: Engine
+    let message: Message
+    var body: some View {
+        if engine.newKeyFor(message.group, message.sender, message.name) {
+            Text("New key for \(message.name): check their emoji").scaledFont(13, .semibold).foregroundStyle(Theme.help).padding(.leading, 14)
+        } else if !message.verified {
+            Text("Not verified yet").scaledFont(13).foregroundStyle(Theme.faint).padding(.leading, 14)
+        }
+    }
+}
+
 struct StatusLine: View {
     let time: String?
     let delivery: Delivery?

@@ -9,10 +9,16 @@ final class PacketStore {
     private let lock = NSLock() // appends and rewrites; reading needs no lock (a rewrite replaces the file atomically)
     private static let piece = 1 << 20
 
-    init() {
+    /// `file`: "history.bin" holds this phone's readable copies of messages whose keys are deleted (spec "Message keys").
+    init(file: String = "packets.bin") {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        url = dir.appendingPathComponent("packets.bin")
+        url = dir.appendingPathComponent(file)
+        // Protocol v0.5: older packets were sealed with v0.4 keys that no phone uses any more (and no longer decode).
+        if file == "packets.bin" && !UserDefaults.standard.bool(forKey: "storeV05") {
+            try? FileManager.default.removeItem(at: url)
+            UserDefaults.standard.set(true, forKey: "storeV05")
+        }
     }
 
     /// Calls `body` with every stored packet, in the order they were stored, reading 1 MB at a time. Any thread; may

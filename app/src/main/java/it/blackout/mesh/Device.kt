@@ -189,7 +189,12 @@ fun copyText(c: Context, label: String, text: String, sensitive: Boolean = false
     if (sensitive) clip.description.extras = PersistableBundle().apply {
         putBoolean(if (Build.VERSION.SDK_INT >= 33) ClipDescription.EXTRA_IS_SENSITIVE else "android.content.extra.IS_SENSITIVE", true)
     }
-    c.getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
+    val board = c.getSystemService(ClipboardManager::class.java)
+    board.setPrimaryClip(clip)
+    // A group code doesn't stay on the clipboard for other apps to find later.
+    if (sensitive) android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+        runCatching { if (board.primaryClip?.getItemAt(0)?.text?.toString() == text) { if (Build.VERSION.SDK_INT >= 28) board.clearPrimaryClip() else board.setPrimaryClip(ClipData.newPlainText("", "")) } }
+    }, 60_000)
     if (Build.VERSION.SDK_INT < 33) android.widget.Toast.makeText(c, done, android.widget.Toast.LENGTH_SHORT).show() // Android 13+ shows its own
 }
 
@@ -256,30 +261,68 @@ data class SavedGroup(val name: String, val code: String)
 
 object Groups {
     private fun prefs(c: Context) = c.getSharedPreferences("mesh", 0)
-    fun current(c: Context) = prefs(c).getString("code", null)?.let { SavedGroup(prefs(c).getString("groupName", null) ?: "Group", it) }
-    fun others(c: Context): List<SavedGroup> {
-        val cur = prefs(c).getString("code", null)
-        val a = runCatching { JSONArray(prefs(c).getString("groups", "[]")) }.getOrDefault(JSONArray())
-        return (0 until a.length()).map { a.getJSONObject(it) }.map { SavedGroup(it.optString("name", "Group"), it.optString("code")) }
-            .filter { it.code.isNotEmpty() && it.code != cur }
+
+    /** The group in use, the others, and the codes of groups made here that have no first epoch yet. */
+    private data class Saved(val code: String? = null, val name: String? = null, val others: List<SavedGroup> = emptyList(), val founded: Set<String> = emptySet())
+    private var cache: Saved? = null
+
+    private fun groupsFrom(a: JSONArray) = (0 until a.length()).map { a.getJSONObject(it) }.map { SavedGroup(it.optString("name", "Group"), it.optString("code")) }
+
+    /**
+     * Group codes are kept in the [Vault], encrypted with a key that never leaves the Keystore: a code is what lets
+     * someone ask to join. Read once, then from memory. Codes saved in plain preferences by older builds move here.
+     */
+    @Synchronized private fun saved(c: Context): Saved {
+        cache?.let { return it }
+        val p = prefs(c)
+        val s = Vault.get(c, "groups")?.let { raw -> runCatching { JSONObject(String(raw)).let { o ->
+            Saved(o.optString("code").ifEmpty { null }, o.optString("name").ifEmpty { null }, groupsFrom(o.getJSONArray("others")),
+                o.getJSONArray("founded").let { f -> (0 until f.length()).map(f::getString).toSet() })
+        } }.getOrNull() } ?: Saved(p.getString("code", null), p.getString("groupName", null),
+            runCatching { groupsFrom(JSONArray(p.getString("groups", "[]"))) }.getOrDefault(emptyList()), p.getStringSet("found", emptySet())!!.toSet())
+        cache = s
+        if (p.contains("code") || p.contains("groups") || p.contains("found")) {
+            write(c, s)
+            if (Vault.get(c, "groups") != null) p.edit().remove("code").remove("groupName").remove("groups").remove("found").apply()
+        }
+        return s
     }
-    private fun remember(c: Context, g: SavedGroup) {
-        val list = (listOf(g) + others(c).filter { it.code != g.code }).take(20)
-        prefs(c).edit().putString("groups", JSONArray(list.map { JSONObject().put("name", it.name).put("code", it.code) }).toString()).apply()
+
+    @Synchronized private fun write(c: Context, s: Saved) {
+        if (s.code != cache?.code) DebugTools.noteCode(s.code)
+        cache = s
+        Vault.put(c, "groups", JSONObject().put("code", s.code ?: "").put("name", s.name ?: "")
+            .put("others", JSONArray(s.others.map { JSONObject().put("name", it.name).put("code", it.code) }))
+            .put("founded", JSONArray(s.founded.toList())).toString().toByteArray())
     }
+
+    /** The code of the group in use, or null before setup. */
+    fun code(c: Context) = saved(c).code
+    fun current(c: Context) = saved(c).let { s -> s.code?.let { SavedGroup(s.name ?: "Group", it) } }
+    fun others(c: Context): List<SavedGroup> = saved(c).let { s -> s.others.filter { it.code.isNotEmpty() && it.code != s.code } }
+    @Synchronized private fun remember(c: Context, g: SavedGroup) = write(c, saved(c).copy(others = (listOf(g) + others(c).filter { it.code != g.code }).take(20)))
     /** The group in use, then the others. */
     fun all(c: Context): List<SavedGroup> = listOfNotNull(current(c)) + others(c)
     fun find(c: Context, code: String?): SavedGroup? = code?.let { k -> all(c).firstOrNull { it.code == k } }
     /** First setup: saves the name and group. The mesh service starts afterwards. */
-    fun setUp(c: Context, name: String, g: SavedGroup) {
-        prefs(c).edit().putString("name", name).putString("code", g.code).putString("groupName", g.name).apply()
+    @Synchronized fun setUp(c: Context, name: String, g: SavedGroup) {
+        prefs(c).edit().putString("name", name).apply()
+        write(c, saved(c).copy(code = g.code, name = g.name))
+    }
+    /** Someone was removed from a group: it now has a new code (spec "Removing and the code"). Its name stays. */
+    @Synchronized fun replaceCode(c: Context, old: String, new: String) = saved(c).let { s ->
+        write(c, s.copy(code = if (s.code == old) new else s.code, others = s.others.map { if (it.code == old) it.copy(code = new) else it }))
     }
     /** Shows another group's messages; this group's stay on the phone. */
-    fun switchTo(c: Context, g: SavedGroup) {
+    @Synchronized fun switchTo(c: Context, g: SavedGroup) {
         current(c)?.let { remember(c, it) }
-        prefs(c).edit().putString("code", g.code).putString("groupName", g.name).apply()
+        write(c, saved(c).copy(code = g.code, name = g.name))
         MeshEngine.switchGroup(g.code)
     }
+
+    /** Groups made on this phone, or saved before v0.6, that have no first epoch yet (spec "Making the first epoch"). */
+    fun founded(c: Context) = saved(c).founded
+    @Synchronized fun setFounded(c: Context, codes: Set<String>) = write(c, saved(c).copy(founded = codes))
 }
 
 /**
@@ -310,6 +353,36 @@ object Moderation {
     }
 
     fun visible(c: Context, m: Message) = m.sender !in blocked(c) && m.id !in hidden(c)
+}
+
+/**
+ * "Lock DarkProof" (Settings), off unless turned on: the app asks for the phone's fingerprint, face or PIN when it opens,
+ * and again after a minute away. While it is on, notifications don't show message text and screenshots are blocked.
+ * Asking for help never needs it: the lock screen has the button, and tiles and shortcuts keep working.
+ */
+object AppLock {
+    private const val GRACE_MS = 60_000L
+    private var leftAt = 0L // when the screen was last left; 0: not since the app started
+    private fun prefs(c: Context) = c.getSharedPreferences("mesh", 0)
+
+    fun enabled(c: Context) = prefs(c).getBoolean("appLock", false)
+    fun set(c: Context, on: Boolean) = prefs(c).edit().putBoolean("appLock", on).apply()
+    /** False if the phone has no screen lock: there would be nothing to ask for. */
+    fun available(c: Context) = c.getSystemService(android.app.KeyguardManager::class.java).isDeviceSecure
+    /** The screen went away. Still locked: it stays locked however the app is opened next, not only for a minute. */
+    fun left(stillLocked: Boolean) { leftAt = if (stillLocked) 0L else android.os.SystemClock.elapsedRealtime() }
+    fun due(c: Context) = enabled(c) && (leftAt == 0L || android.os.SystemClock.elapsedRealtime() - leftAt >= GRACE_MS)
+
+    /** Asks for the phone's own unlock, then runs [ok]. If the phone has no screen lock any more, nobody is shut out. */
+    fun ask(a: MainActivity, title: String, ok: () -> Unit) {
+        if (!available(a)) { ok(); return }
+        if (Build.VERSION.SDK_INT < 30) { a.confirmCredential(title, ok); return }
+        android.hardware.biometrics.BiometricPrompt.Builder(a).setTitle(title)
+            .setAllowedAuthenticators(android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG or android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+            .build().authenticate(android.os.CancellationSignal(), a.mainExecutor, object : android.hardware.biometrics.BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(r: android.hardware.biometrics.BiometricPrompt.AuthenticationResult) = ok()
+            })
+    }
 }
 
 /**
@@ -363,12 +436,15 @@ object Notifier {
         if (c.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED && Build.VERSION.SDK_INT >= 33) return
         // Help alerts and questions each get their own notification; the rest replace one per person.
         val id = if (a.urgent) m.id.hashCode() else m.sender.hashCode()
+        // With "Lock DarkProof" on, nothing about who or what shows on a locked or borrowed phone.
+        val hide = AppLock.enabled(c)
+        val body = if (!hide) a.body else if (a.ask) "Someone asks if you are safe. Open DarkProof." else if (a.urgent) "Someone needs help. Open DarkProof." else "New message"
         val n = android.app.Notification.Builder(c, if (a.urgent) HELP else MESSAGES)
-            .setSmallIcon(R.drawable.ic_notifications).setContentTitle(a.title).setContentText(a.body)
-            .setStyle(android.app.Notification.BigTextStyle().bigText(a.body))
+            .setSmallIcon(R.drawable.ic_notifications).setContentTitle(if (hide) "DarkProof" else a.title).setContentText(body)
+            .setStyle(android.app.Notification.BigTextStyle().bigText(body))
             .setContentIntent(open(c, id, m.group)).setAutoCancel(true).setGroup("group")
         if (a.ask) {
-            n.addAction(android.app.Notification.Action.Builder(null, "I'm safe", PendingIntent.getBroadcast(c, id,
+            if (!hide) n.addAction(android.app.Notification.Action.Builder(null, "I'm safe", PendingIntent.getBroadcast(c, id,
                 Intent(c, AnswerReceiver::class.java).putExtra(Actions.EXTRA_GROUP, m.group).putExtra(AnswerReceiver.NOTIFICATION, id),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)).build())
             n.addAction(android.app.Notification.Action.Builder(null, "I need help", PendingIntent.getActivity(c, id + 1,
@@ -400,6 +476,7 @@ object ReadMarks {
         val since = lastRead(c, code)
         return all.count { !it.public && it.group == code && it.ts > since && it.sender != MeshEngine.deviceId }
     }
+    fun rename(c: Context, old: String, new: String) { prefs(c).edit().putLong(key(new), lastRead(c, old)).remove(key(old)).apply() }
     private fun key(code: String) = code.hashCode().toString() // not the code itself
 }
 

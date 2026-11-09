@@ -47,8 +47,10 @@ class MeshCoreTest {
 
     @Test fun checkInsFitButLongMessagesDont() {
         val c = GroupCrypto("group-code")
-        fun packet(name: String, text: String): Packet { val id = Packet.newId(); return Packet(id, 1, 16, c.seal(id, 1, "7c0d995b-2c4", name, text)) }
-        assertTrue(MeshCore.fits(packet("Anna", CheckIn.SAFE.text(23, Spot(45.4642, 9.19, 12)))))
+        fun packet(name: String, text: String): Packet { val id = Packet.newId(); return Packet(id, 1, 16, c.seal(id, 1, "c482f374ea24d954", name, text)) }
+        // Signed (spec "Signatures"): a check-in fits with a short name and no position; with a position it doesn't.
+        assertTrue(MeshCore.fits(packet("Anna", CheckIn.SAFE.text(23, null))))
+        assertFalse(MeshCore.fits(packet("Anna", CheckIn.SAFE.text(23, Spot(45.4642, 9.19, 12)))))
         assertFalse(MeshCore.fits(packet("Anna", "x".repeat(120))))
         val q = LoraQueue(maxBytes = MeshCore.PAYLOAD_MAX, now = { 1L })
         q.offer(packet("Anna", "x".repeat(120))); assertNull(q.next())  // too long for MeshCore: never queued

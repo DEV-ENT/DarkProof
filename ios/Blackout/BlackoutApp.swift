@@ -4,6 +4,7 @@ import BlackoutCore
 @main
 struct BlackoutApp: App {
     init() {
+        Vault.wipeAfterReinstall() // before anything reads the Keychain
         OfflineMap.shared.setUp()
         Notifier.shared.setUp() // before launch ends, so tapping an alert that relaunched the app is handled
         #if DEBUG
@@ -11,17 +12,46 @@ struct BlackoutApp: App {
         if let i = args.firstIndex(of: "join"), args.indices.contains(i + 1), let bar = args[i + 1].firstIndex(of: "|") {
             // join "Name|code": the test group, like Android's --es join (group codes never go in logs)
             UserDefaults.standard.set(String(args[i + 1][..<bar]), forKey: "name")
-            UserDefaults.standard.set(String(args[i + 1][args[i + 1].index(after: bar)...]), forKey: "code")
+            GroupSecrets.shared.setCode(String(args[i + 1][args[i + 1].index(after: bar)...]))
         }
+        if let i = args.firstIndex(of: "ahead"), args.indices.contains(i + 1), let days = Int64(args[i + 1]) { Engine.ahead = days * 86_400_000 } // ahead 8
         for i in args.indices where args[i] == "set" && args.indices.contains(i + 2) { // set wifiNetwork 0 (repeatable)
             UserDefaults.standard.set(args[i + 2] == "1", forKey: args[i + 1])
+        }
+        if let i = args.firstIndex(of: "relays"), args.indices.contains(i + 1) { // relays ws://127.0.0.1:7447: tools/mock-relay
+            NostrLink.debugRelays = args[i + 1].split(separator: ",").map(String.init)
         }
         #endif
         Mesh.shared.startIfSetUp() // also when iOS relaunches the app in the background for Bluetooth
         #if DEBUG
+        if args.contains("dumpChat") { // for the mock-relay tests: what this phone shows, every 3 s (never the group code)
+            Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+                guard let e = Mesh.shared.engine else { return }
+                DebugLog.write("CHAT " + e.messages.map { "\($0.id):\($0.verified ? "v" : "u"):\($0.name):\($0.text.prefix(60))" }.joined(separator: " | "))
+            }
+        }
         if let i = args.firstIndex(of: "aiSelfTest") { LocalAi.selfTest(args.indices.contains(i + 1) ? args[i + 1] : nil) }
         if let i = args.firstIndex(of: "interopTest"), args.indices.contains(i + 1) { InteropTest.run(args[i + 1]) }
+        if let i = args.firstIndex(of: "unlockAfter"), args.indices.contains(i + 1), let s = Double(args[i + 1]) { // unlockAfter 10
+            DispatchQueue.main.asyncAfter(deadline: .now() + s) { AppLock.shared.unlockForTests() }
+        }
         if args.contains("samples") { InteropTest.samples(after: 8) } // no link: the messages go by whatever is up, e.g. relays
+        if let i = args.firstIndex(of: "say"), args.indices.contains(i + 1) { // say Hello: to the group on screen only
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) { Mesh.shared.engine?.send(args[i + 1]); DebugLog.write("said") }
+        }
+        if let i = args.firstIndex(of: "approve"), args.indices.contains(i + 1) { // approve Bea: lets them in, by name
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                guard let e = Mesh.shared.engine, let r = e.joinRequests(GroupSecrets.shared.current).first(where: { $0.name == args[i + 1] }) else { DebugLog.write("approve: nobody with that name is asking"); return }
+                e.approveJoin(GroupSecrets.shared.current, r.id) { DebugLog.write("approve \(args[i + 1]): \($0)") }
+            }
+        }
+        for (arg, change) in [("makeAdmin", Engine.makeAdmin), ("removeMember", Engine.remove)] as [(String, (Engine) -> (String?, String, @escaping (Bool) -> Void) -> Void)] {
+            guard let i = args.firstIndex(of: arg), args.indices.contains(i + 1) else { continue } // makeAdmin Ben, removeMember Marco: by name
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                guard let e = Mesh.shared.engine, let p = Person.all(in: e.messages, me: e.deviceId).first(where: { $0.name == args[i + 1] }) else { DebugLog.write("\(arg): nobody with that name"); return }
+                change(e)(GroupSecrets.shared.current, p.id) { DebugLog.write("\(arg) \(args[i + 1]): \($0)") }
+            }
+        }
         #endif
     }
 

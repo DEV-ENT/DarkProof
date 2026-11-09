@@ -5,6 +5,13 @@ private let m1 = "00000000000000a1"
 
 /// Same scenarios as the LoRa tests in the Android CoreTest, plus a frame written out by hand from the protobuf spec.
 final class MeshtasticTests: XCTestCase {
+    /// A length that doesn't fit an Int, or would run past the end: refused, not a crash (a hostile radio).
+    func testHugeLengthsDoNotCrash() {
+        for tail in [[UInt8](repeating: 0xFF, count: 9) + [0x01], [UInt8](repeating: 0xFF, count: 8) + [0x7F]] {
+            XCTAssertNil(Meshtastic.fieldBytes(Data([0x0A] + tail), 1))
+        }
+    }
+
     func testToRadioBytesMatchHandEncodedProtobuf() {
         // ToRadio{ packet(1): MeshPacket{ to(2,fixed32)=0xFFFFFFFF, decoded(4)=Data{ portnum(1)=256, payload(2)=AA BB },
         //          id(6,fixed32)=0x01020304, hop_limit(9)=3 } }
@@ -39,9 +46,9 @@ final class MeshtasticTests: XCTestCase {
 
     func testLoraMessageFitsAtLimit() throws {
         let c = GroupCrypto(code: "group-code"), id = Packet.newId()
-        let p = Packet(id: id, ts: 1, ttl: 16, cipher: try c.seal(id: id, ts: 1, sender: "abcdef012345", name: "Massimiliano Rossi", text: String(repeating: "x", count: 140)))
+        let p = Packet(id: id, ts: 1, ttl: 16, cipher: try c.seal(id: id, ts: 1, sender: "c482f374ea24d954", name: "Massimiliano Rossi", text: String(repeating: "x", count: 80)))
         XCTAssertTrue(Meshtastic.fits(p), "\(p.encode().count)")
-        let q = Packet(id: id, ts: 1, ttl: 16, cipher: try c.seal(id: id, ts: 1, sender: "abcdef012345", name: "Massimiliano Rossi", text: String(repeating: "x", count: 400)))
+        let q = Packet(id: id, ts: 1, ttl: 16, cipher: try c.seal(id: id, ts: 1, sender: "c482f374ea24d954", name: "Massimiliano Rossi", text: String(repeating: "x", count: 140)))
         XCTAssertFalse(Meshtastic.fits(q))
     }
 

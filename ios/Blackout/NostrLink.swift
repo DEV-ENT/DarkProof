@@ -5,14 +5,113 @@ import BlackoutCore
 /// One peer for forwarding: the router gives it every packet and it hands the router what arrives for this phone's
 /// mailboxes. Packets written on this phone go up first. Anyone else's (this phone bridging its neighbourhood) go up
 /// only if no relay has them yet, and slowly, so the same packet isn't posted by every phone that holds it and relays
-/// don't throttle us (RelayOutbox). Each relay link catches up one mailbox at a time (CatchUp), then gets new events
-/// from one live subscription. All state is touched only on `q`.
-final class NostrLink: NSObject, URLSessionWebSocketDelegate {
+/// don't throttle us (RelayOutbox). Each group has its own connections, key and subscription (RelayScope), so one
+/// connection never shows that two groups share a phone. Packets this phone only passes on go out with the Everyone
+/// channel's. Scope links are touched only on `q`.
+final class NostrLink {
     static let peer = "nostr"
     /// Free public relays that stored a 22 KB event of this kind from a new key (tested 2026-11-06).
     static let relays = ["wss://nos.lol", "wss://relay.damus.io", "wss://relay.primal.net", "wss://nostr.mom", "wss://nostr.oxtr.dev", "wss://relay.ditto.pub"]
     /// Through Tor: nos.lol and nostr.mom don't answer Tor exits (tested 2026-11-06), so two others take their place.
     static let torRelays = ["wss://relay.damus.io", "wss://relay.primal.net", "wss://nostr.oxtr.dev", "wss://relay.ditto.pub", "wss://relay.nostr.net", "wss://nostr.data.haus"]
+    #if DEBUG
+    /// Launch arguments `relays ws://127.0.0.1:7447`: the mock relay in tools/mock-relay instead of the public ones.
+    static var debugRelays: [String]?
+    #endif
+
+    /// One group's mailboxes; `id` is empty for the Everyone channel.
+    struct Scope { let id: String; let mailboxes: [UInt16] }
+
+    private let q = DispatchQueue(label: "nostr.scopes")
+    private let router: MeshRouter
+    private let scopes: () -> [Scope]
+    private let onRelays: (String) -> Void
+    private let onStatus: (String?) -> Void
+    private let boxLock = NSLock()
+    private var boxes: [String: [UInt16]] = [:]   // guarded by boxLock: links read it on their own queues
+    private var links: [String: RelayScope] = [:] // scope id -> its links
+    private var running = false
+    private var viaTor: Bool
+    private var saver = false
+    private var linksUp = 0                       // scopes with at least one relay linked
+
+    init(router: MeshRouter, viaTor: Bool, scopes: @escaping () -> [Scope], onRelays: @escaping (String) -> Void,
+         onStatus: @escaping (String?) -> Void) {
+        self.router = router; self.viaTor = Self.useTor(viaTor); self.scopes = scopes; self.onRelays = onRelays; self.onStatus = onStatus
+    }
+
+    /// The mock relay of debug builds is on this computer: Tor couldn't reach it.
+    private static func useTor(_ on: Bool) -> Bool {
+        #if DEBUG
+        if debugRelays != nil { return false }
+        #endif
+        return on
+    }
+
+    var isUp: Bool { q.sync { linksUp > 0 } }
+    var connected: Int { q.sync { links.values.map(\.connected).max() ?? 0 } }
+    var total: Int { Self.relays.count } // the Tor list is as long
+    /// With "Connect through Tor": true while traffic is known to leave through Tor, false while waiting. Nil without.
+    var throughTor: Bool? { q.sync { links[""]?.throughTor } }
+
+    func start() { q.async { self.running = true; self.sync() } }
+
+    func stop() {
+        q.async {
+            self.running = false
+            self.links.values.forEach { $0.stop() }
+            self.links = [:]
+        }
+    }
+
+    func setSaver(_ on: Bool) { q.async { self.saver = on; self.links.values.forEach { $0.setSaver(on) } } }
+    func setTor(_ on: Bool) { q.async { self.viaTor = Self.useTor(on); self.links.values.forEach { $0.setTor(Self.useTor(on)) } } }
+
+    /// The groups or their keys changed: new groups get their own links, and every link asks for its current mailboxes. Any thread.
+    func resubscribe() { q.async { self.sync(); self.links.values.forEach { $0.resubscribe() } } }
+
+    /// Called by the router: a packet goes up on the links of the group it belongs to, or else with the Everyone channel's.
+    /// This phone's own wait a moment, at random, so the time a packet reaches a relay says less about when it was written.
+    func send(_ p: Packet, mine: Bool) {
+        q.asyncAfter(deadline: .now() + (mine ? Double.random(in: 0..<8) : 0)) {
+            let box = Packet.mailbox(of: p.id)
+            let id = self.boxLock.withLock { self.boxes.first { !$0.key.isEmpty && $0.value.contains(box) }?.key } ?? ""
+            (self.links[id] ?? self.links[""])?.send(p, mine: mine)
+        }
+    }
+
+    private func sync() {
+        guard running else { return }
+        var now: [Scope] = []
+        for s in scopes() where !now.contains(where: { $0.id == s.id }) { now.append(s) }
+        boxLock.withLock { boxes = Dictionary(uniqueKeysWithValues: now.map { ($0.id, $0.mailboxes) }) }
+        for id in links.keys where !now.contains(where: { $0.id == id }) { links.removeValue(forKey: id)?.stop() }
+        for s in now where links[s.id] == nil {
+            let id = s.id
+            let link = RelayScope(scope: id, router: router, viaTor: viaTor,
+                                  mailboxes: { [weak self] in self.map { me in me.boxLock.withLock { me.boxes[id] ?? [] } } ?? [] },
+                                  onUp: { [weak self] on in self?.scopeUp(on) }, onRelays: onRelays,
+                                  onStatus: id.isEmpty ? onStatus : { _ in })
+            link.setSaver(saver)
+            links[id] = link
+            link.start()
+        }
+    }
+
+    /// The router sees one peer, up while any scope has a relay.
+    private func scopeUp(_ on: Bool) {
+        q.async {
+            self.linksUp += on ? 1 : -1
+            if on && self.linksUp == 1 { self.router.peerUp(Self.peer) }
+            if !on && self.linksUp == 0 { self.router.peerDown(Self.peer) }
+        }
+    }
+}
+
+/// One group's links to the relays (or the Everyone channel's, when `scope` is empty): its own sockets, key and
+/// subscription. All state is touched only on `q`.
+final class RelayScope: NSObject, URLSessionWebSocketDelegate {
+    private static let startSpread = 8.0    // groups link at different moments, so their connections don't line up
     private static let tick = 1.5           // at most one own packet per tick
     private static let bridgeEvery = 3      // and one bridged packet every 3 ticks
     private static let checkEvery = 10.0    // how often to ask relays which bridged packets they have
@@ -23,8 +122,12 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
 
     private let q = DispatchQueue(label: "nostr")
     private let router: MeshRouter
-    private let key = NostrKey() // a new throwaway key every start: relays can't link sessions
+    private let scope: String
+    private let saved: String    // the Everyone links keep the names older builds used
+    private let key = NostrKey() // a new throwaway key every start and for each group: relays can't link them by key
+    private let torUser = (0..<8).map { _ in String(format: "%02x", UInt8.random(in: .min ... .max)) }.joined() // its own Tor circuits
     private let mailboxes: () -> [UInt16]
+    private let onUp: (Bool) -> Void
     private let onStatus: (String?) -> Void
     private var session: URLSession!       // direct
     private var torSession: URLSession?    // through the app's own Tor (InAppTor), once it has a circuit
@@ -32,9 +135,10 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
     private var open = Set<String>()
     private var backoff: [String: Double] = [:]
     private var resting: [String: Date] = [:]                     // relay -> post again after
-    private let outbox = RelayOutbox(sent: UserDefaults.standard.stringArray(forKey: "relaySent") ?? [])
-    private let since = RelaySince(UserDefaults.standard.string(forKey: "relaySince") ?? "")
+    private let outbox: RelayOutbox
+    private let since: RelaySince
     private var catchUps: [String: CatchUp] = [:]                  // relay -> its catch-up
+    private var paces: [String: RelayPace] = [:]                   // relay -> what it sent this minute
     private var events: [String: (id: String, author: String)] = [:] // packet id -> event, for reports
     private var running = false
     private var up = false
@@ -49,9 +153,13 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
 
     private let onRelays: (String) -> Void // a packet went up to the relays, or they had it already
 
-    init(router: MeshRouter, viaTor: Bool, mailboxes: @escaping () -> [UInt16], onRelays: @escaping (String) -> Void,
-         onStatus: @escaping (String?) -> Void) {
-        self.router = router; self.viaTor = viaTor; self.mailboxes = mailboxes; self.onRelays = onRelays; self.onStatus = onStatus
+    init(scope: String, router: MeshRouter, viaTor: Bool, mailboxes: @escaping () -> [UInt16], onUp: @escaping (Bool) -> Void,
+         onRelays: @escaping (String) -> Void, onStatus: @escaping (String?) -> Void) {
+        self.scope = scope; self.router = router; self.viaTor = viaTor; self.mailboxes = mailboxes
+        self.onUp = onUp; self.onRelays = onRelays; self.onStatus = onStatus
+        saved = scope.isEmpty ? "" : ".\(scope)"
+        outbox = RelayOutbox(sent: UserDefaults.standard.stringArray(forKey: "relaySent\(saved)") ?? [])
+        since = RelaySince(UserDefaults.standard.string(forKey: "relaySince\(saved)") ?? "")
         torOK = viaTor ? false : nil
         super.init()
         let config = URLSessionConfiguration.default
@@ -61,8 +169,11 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
 
     var isUp: Bool { q.sync { up } }
     var connected: Int { q.sync { open.count } }
-    var total: Int { Self.relays.count } // the Tor list is as long
-    private var relays: [String] { viaTor ? Self.torRelays : Self.relays }
+    #if DEBUG
+    private var relays: [String] { NostrLink.debugRelays ?? (viaTor ? NostrLink.torRelays : NostrLink.relays) }
+    #else
+    private var relays: [String] { viaTor ? NostrLink.torRelays : NostrLink.relays }
+    #endif
     /// With "Connect through Tor": true while traffic is known to leave through Tor, false while waiting. Nil without.
     var throughTor: Bool? { q.sync { torOK } }
 
@@ -98,7 +209,10 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
     private func startNow() {
         guard !running else { return }
         running = true
-        relays.forEach(connect)
+        q.asyncAfter(deadline: .now() + (scope.isEmpty ? 0 : Double.random(in: 0..<Self.startSpread))) { [weak self] in
+            guard let self, self.running else { return }
+            self.relays.forEach(self.connect)
+        }
         timers = makeTimers()
         report()
     }
@@ -108,12 +222,12 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
         timers.forEach { $0.cancel() }; timers = []
         tasks.values.forEach { $0.cancel(with: .goingAway, reason: nil) }
         tasks = [:]; open = []; catchUps = [:]
-        if up { up = false; router.peerDown(Self.peer) }
+        if up { up = false; onUp(false) }
         save()
         report()
     }
 
-    private func every(_ s: Double, _ f: @escaping (NostrLink) -> Void) -> DispatchSourceTimer {
+    private func every(_ s: Double, _ f: @escaping (RelayScope) -> Void) -> DispatchSourceTimer {
         let t = DispatchSource.makeTimerSource(queue: q)
         t.schedule(deadline: .now() + s, repeating: s)
         t.setEventHandler { [weak self] in if let self { f(self) } }
@@ -147,7 +261,7 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
     /// the relays if so, else tries again soon.
     private func checkTor() {
         guard running, !torChecking else { return }
-        guard let conf = InAppTor.shared.sessionConfiguration() else { // Tor is still starting
+        guard let conf = InAppTor.shared.sessionConfiguration(user: torUser) else { // Tor is still starting
             q.asyncAfter(deadline: .now() + 2) { [weak self] in self?.checkTor() }
             return
         }
@@ -165,6 +279,10 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
                 self.torChecking = false
                 guard self.running, self.viaTor else { return }
                 let ok = data.map(TorCheck.isTor) ?? false
+                #if DEBUG
+                let exit = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["IP"] as? String
+                DebugLog.write("tor check \(self.scope.isEmpty ? "everyone" : String(self.scope.prefix(6))): \(exit ?? "?")")
+                #endif
                 self.torOK = ok
                 if ok { self.relays.forEach(self.connect) }
                 else { self.q.asyncAfter(deadline: .now() + 5) { [weak self] in self?.checkTor() } } // Tor may still be starting
@@ -190,13 +308,18 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
         q.async {
             guard let url = self.tasks.first(where: { $0.value === t })?.key else { return }
             self.open.insert(url); self.backoff[url] = nil
+            #if DEBUG
+            DebugLog.write("relay open \(url.replacingOccurrences(of: "wss://", with: "")) \(self.scope.isEmpty ? "everyone" : String(self.scope.prefix(6)))")
+            #endif
             let boxes = self.mailboxes()
             t.send(.string(Nostr.live(self.live, mailboxes: boxes))) { _ in }
-            let cu = CatchUp(relay: url, since: self.since)
+            let pace = self.paces[url] ?? RelayPace()
+            self.paces[url] = pace
+            let cu = CatchUp(relay: url, since: self.since, pace: pace)
             cu.add(boxes)
             self.catchUps[url] = cu
             if let r = cu.next(now: Self.nowS()) { t.send(.string(r.text)) { _ in } }
-            if !self.up { self.up = true; self.router.peerUp(Self.peer) } // the router then offers every stored packet
+            if !self.up { self.up = true; self.onUp(true) } // the router then offers every stored packet
             self.report()
         }
     }
@@ -231,19 +354,20 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
             if let r = catchUps[url]?.end(e.subId, complete: e.complete, now: Self.nowS()) { tasks[url]?.send(.string(r.text)) { _ in } } // older page or next mailbox
             return
         }
+        if catchUps[url]?.allow(now: Self.nowS()) == false { return }
         guard let r = Nostr.received(text) else { return }
         events[r.packet.id] = (r.eventId, r.pubkey)
         if events.count > 2_000 { events.removeAll() }
         if r.subId == live { catchUps[url]?.live(Packet.mailbox(of: r.packet.id), createdAt: r.createdAt, now: Self.nowS()) }
         else { catchUps[url]?.event(r.subId, createdAt: r.createdAt) }
         if let id = outbox.fromRelay(r.packet) { onRelays(id) }
-        router.receive(from: Self.peer, r.packet) // also answers to the #x lookups: the router ignores packets it already has
+        router.receive(from: NostrLink.peer, r.packet) // also answers to the #x lookups: the router ignores packets it already has
     }
 
     private func lost(_ url: String, _ t: URLSessionWebSocketTask) {
         guard tasks[url] === t else { return }
         tasks[url] = nil; open.remove(url); catchUps[url] = nil
-        if open.isEmpty && up { up = false; router.peerDown(Self.peer) }
+        if open.isEmpty && up { up = false; onUp(false) }
         if open.isEmpty && torOK == true { torOK = false } // Tor may have lost its circuits: check again before linking
         report()
         guard running else { return }
@@ -270,7 +394,7 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func post(_ p: Packet, fromOwn: Bool, to relays: Set<String>) {
-        let e = Nostr.event(p, pubkey: key.pubkey, sign: key.sign)
+        let e = Nostr.event(p, pubkey: key.pubkey, now: Nostr.blurred(Self.nowS()), sign: key.sign)
         let msg = Nostr.publish(e)
         for url in relays { tasks[url]?.send(.string(msg)) { _ in } }
         outbox.posted(eventId: e["id"] as? String ?? "", p, fromOwn: fromOwn, relays: relays)
@@ -278,8 +402,8 @@ final class NostrLink: NSObject, URLSessionWebSocketDelegate {
 
     /// The sent list and the catch-up starts, when they changed.
     private func save() {
-        if outbox.changed { UserDefaults.standard.set(outbox.sentList(), forKey: "relaySent") }
-        if since.changed { UserDefaults.standard.set(since.save(), forKey: "relaySince") }
+        if outbox.changed { UserDefaults.standard.set(outbox.sentList(), forKey: "relaySent\(saved)") }
+        if since.changed { UserDefaults.standard.set(since.save(), forKey: "relaySince\(saved)") }
     }
 
     /// Asks the relays which of the newest unchecked bridged packets they have; the rest get posted. Also ends stuck
