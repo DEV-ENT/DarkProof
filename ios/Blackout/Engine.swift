@@ -465,6 +465,13 @@ final class Engine: ObservableObject {
         guard let cur = k.ring.currentOrNil, !k.removed, cur.made < made, !k.ring.tooSoon(k.me, made: Self.clock()) else { return }
         makeRekey(k, add: [], answers: nil)
     }
+    /// The admins an invite to `code`'s group names (spec "Invites"), first listed first, or nil until its keys are loaded.
+    func invitePins(_ code: String) -> String? {
+        guard let k = held(code) else { return nil }
+        let pubs = (k.ring.currentOrNil?.admins ?? []).compactMap { $0 == k.me ? k.pub : k.checker($0)?.pub }
+        return pubs.prefix(Invite.maxPins).map(Invite.pin).joined()
+    }
+
     func isAdmin(_ code: String?, _ id: String) -> Bool { held(code).map { $0.ring.currentOrNil?.admins.contains(memberId($0, id)) ?? false } ?? false }
     func inGroup(_ code: String?, _ id: String) -> Bool { held(code).map { $0.members.contains(memberId($0, id)) } ?? false }
 
@@ -511,8 +518,12 @@ final class Engine: ObservableObject {
     private func acceptRekey(_ k: Keys, _ o: GroupCrypto.Opened, _ r: Rekey, _ packetId: String, _ door: Door) -> Bool {
         let maker = o.message.sender
         guard signed(o, r) else { return false }
+        let pinned = Invite.allows(GroupSecrets.shared.pins(k.code), maker: r.maker) // only read while this phone has no epoch
+        #if DEBUG
+        if !pinned && !k.joined { DebugLog.write("new key from someone this invite doesn't name: ignored") }
+        #endif
         if r.removal && k.rejoining && maker != k.me { k.closed = true } // the group may have moved on while this phone was away
-        switch k.ring.take(r, maker: maker, me: k.me, door: door.code, oldDoor: door !== k.door, removedAt: k.removedAt, open: { k.encs.open($0, info: Rekey.info(door.id), aad: Rekey.aad(packetId, k.me)) }) {
+        switch k.ring.take(r, maker: maker, me: k.me, door: door.code, oldDoor: door !== k.door, removedAt: k.removedAt, pinned: pinned, open: { k.encs.open($0, info: Rekey.info(door.id), aad: Rekey.aad(packetId, k.me)) }) {
         case .ignored:
             return false
         case .closed:

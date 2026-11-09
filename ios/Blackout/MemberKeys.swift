@@ -203,7 +203,7 @@ final class EncKeys: @unchecked Sendable { // guarded by lock
 /// backups. Read once, then from memory; codes saved by older builds move here. Any thread.
 final class GroupSecrets: ObservableObject, @unchecked Sendable { // guarded by lock
     static let shared = GroupSecrets()
-    private struct Saved: Codable { var code = ""; var groups: [SavedGroups.Entry] = []; var found: [String] = [] }
+    private struct Saved: Codable { var code = ""; var groups: [SavedGroups.Entry] = []; var found: [String] = []; var pins: [String: String]? } // optional: saved data from older builds has none
     private static let item = "groups"
     private let lock = NSLock()
     private var saved = Saved()
@@ -247,6 +247,16 @@ final class GroupSecrets: ObservableObject, @unchecked Sendable { // guarded by 
     var groups: [SavedGroups.Entry] { read(\.groups) }
     /// Groups made on this phone, or saved before v0.6, that have no first epoch yet (spec "Making the first epoch").
     var found: [String] { read(\.found) }
+    /// The admins the invite for `code` named ("" if none): only they can let this phone in (spec "Invites").
+    func pins(_ code: String) -> String { read { $0.pins?[code] ?? "" } }
+    func setPins(_ code: String, _ pins: String) {
+        change { s in
+            var m = s.pins ?? [:]
+            m[code] = pins
+            if m.count > 20, let other = m.keys.first(where: { $0 != code }) { m[other] = nil }
+            s.pins = m
+        }
+    }
 
     func setCode(_ c: String) {
         change { $0.code = c }

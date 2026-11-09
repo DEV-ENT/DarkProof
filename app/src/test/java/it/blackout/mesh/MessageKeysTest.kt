@@ -88,6 +88,20 @@ class MessageKeysTest {
         assertNotNull(e.open(forged)); assertNotNull(e.messageKeys!!.key(1, 3))
     }
 
+    @Test fun aMemberCantUseUpSomeoneElsesKey() {
+        // Ben seals under Anna's position and number and signs as himself: the signature would check, so it must not open.
+        val e = epoch(); val g = epoch().group
+        val c = g.sealWith(epoch().messageKeys!!.key(0, 7)!!, 0, 7, id, ts, ben, "Ben", "not Anna") { TestKeys.sign(it) }
+        assertNull(e.open(Packet(id, g.hideTime(ts, c), 16, c)))
+        assertNotNull(e.messageKeys!!.key(0, 7))
+    }
+
+    @Test fun aBoardMessageCountsAsThePhonesOwn() {
+        val g = epoch().group
+        val c = g.sealWith(epoch().messageKeys!!.key(1, 2)!!, 1, 2, id, ts, "web-$ben", "Visitor", "hello") { TestKeys.sign(it) }
+        assertNotNull(epoch().open(Packet(id, g.hideTime(ts, c), 16, c))?.leaf)
+    }
+
     @Test fun theEpochSecretIsntKept() { val e = epoch(); assertTrue(!e.secret.contentEquals(secret)); assertArrayEquals(MessageKeys.outer(secret), e.secret) }
 
     @Test fun aKeyKeptForReadingStillOpens() { val e = epoch().forReadingOnly(); assertNotNull(e.open(sealedBy(epoch(), 1))) }

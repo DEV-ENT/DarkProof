@@ -124,6 +124,10 @@ object DebugTools {
             // --es found 1 with it: as if this phone created the group (v0.6: it makes the first epoch).
             if (i.getStringExtra("found") != null) MeshEngine.found(c, j.substringAfter('|'))
         }
+        i.getStringExtra("joinLink")?.let { j -> // Name|darkproof://join?…: like join, through the code that reads an invite
+            Groups.readInvite(c, j.substringAfter('|'))?.let { (_, code) -> Groups.setUp(c, j.substringBefore('|'), SavedGroup("Group", code)) }
+        }
+        if (i.getStringExtra("logPins") != null) whenStarted { log("pins ${Groups.code(c)?.let(MeshEngine::invitePins) ?: "none"}") } // key hashes, not the group code
         log("debug intent: samples=${i.getStringExtra("samples")} started=${MeshEngine.router != null}")
         if (i.getStringExtra("aiSelfTest") != null) whenStarted { aiSelfTest(c) }
         if (i.getStringExtra("codeHash") != null) noteCode(Groups.code(c))

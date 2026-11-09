@@ -76,6 +76,20 @@ final class MessageKeysTests: XCTestCase {
         XCTAssertNotNil(e.open(forged)); XCTAssertNotNil(e.messageKeys?.key(1, 3))
     }
 
+    func testMemberCantUseUpSomeoneElsesKey() throws {
+        // Ben seals under Anna's position and number and signs as himself: the signature would check, so it must not open.
+        let e = epoch(), g = epoch().group
+        let c = try g.seal(messageKey: try XCTUnwrap(epoch().messageKeys?.key(0, 7)), index: 0, counter: 7, id: id, ts: ts, sender: ben, name: "Ben", text: "not Anna") { try MemberKey.sign(TestKeys.key, $0) }
+        XCTAssertNil(e.open(Packet(id: id, ts: g.hideTime(ts, c), ttl: 16, cipher: c)))
+        XCTAssertNotNil(e.messageKeys?.key(0, 7))
+    }
+
+    func testBoardMessageCountsAsThePhonesOwn() throws {
+        let g = epoch().group
+        let c = try g.seal(messageKey: try XCTUnwrap(epoch().messageKeys?.key(1, 2)), index: 1, counter: 2, id: id, ts: ts, sender: "web-\(ben)", name: "Visitor", text: "hello") { try MemberKey.sign(TestKeys.key, $0) }
+        XCTAssertNotNil(epoch().open(Packet(id: id, ts: g.hideTime(ts, c), ttl: 16, cipher: c))?.leaf)
+    }
+
     func testTheEpochSecretIsntKept() { let e = epoch(); XCTAssertNotEqual(e.secret, secret); XCTAssertEqual(e.secret, MessageKeys.outer(secret)) }
 
     func testAKeyKeptForReadingStillOpens() throws {

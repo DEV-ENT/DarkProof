@@ -387,18 +387,21 @@ object Invite {
     /** Generated codes: 16 of these, in four groups of four joined by "-". */
     const val SYMBOLS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     const val WEB_PREFIX = "https://darkproof.app/join#"
+    /** An invite names at most this many admins: the ones listed first. */
+    const val MAX_PINS = 5
+    private const val PIN_CHARS = 32
 
     /** The app link: opens DarkProof where it is installed (all versions), does nothing elsewhere. */
-    fun url(name: String, code: String) = "darkproof://join?" + items(name, code)
+    fun url(name: String, code: String, pins: String = "") = "darkproof://join?" + items(name, code, pins)
 
     /**
      * The web link, for QR codes and sharing: opens DarkProof where it is installed (once darkproof.app serves the
      * app-link files), else darkproof.app/join, which offers the app link and the downloads. The code stays in the
      * #fragment, which browsers never send to a server.
      */
-    fun webUrl(name: String, code: String) = WEB_PREFIX + items(name, code)
+    fun webUrl(name: String, code: String, pins: String = "") = WEB_PREFIX + items(name, code, pins)
 
-    private fun items(name: String, code: String) = "name=${enc(name)}&code=${enc(code)}"
+    private fun items(name: String, code: String, pins: String) = "name=${enc(name)}&code=${enc(code)}" + if (pins.isEmpty()) "" else "&admins=$pins"
     private val APP_LINK = Regex("^(?i:darkproof)://(?i:join)\\?(.*)$")
     private val WEB_LINK = Regex("^(?i:https?)://(?i:(?:www\\.)?darkproof\\.app)/(?i:join)(?:/|\\.html)?(?:\\?[^#]*)?#(.*)$")
     private val GENERATED = Regex("^[A-HJ-NP-Z2-9]{4}(-[A-HJ-NP-Z2-9]{4}){3}$")
@@ -407,6 +410,14 @@ object Invite {
 
     /** Group name and code in an invite link (either form), or null if it is not one. */
     fun parse(link: String): Pair<String, String>? {
+        val q = query(link) ?: return null
+        val code = q["code"]?.trim()?.takeIf { it.length in MIN_CODE_LENGTH..200 } ?: return null
+        val name = q["name"]?.trim().orEmpty().ifEmpty { "Group" }.take(MAX_GROUP_NAME)
+        return name to code
+    }
+
+    /** The items of an invite link, the first of each name counting; null if it isn't a link of either form. */
+    private fun query(link: String): Map<String, String>? {
         // A shared message has words around the link.
         val s = link.trim().split(Regex("\\s+")).firstOrNull { it.startsWith("darkproof://", true) || it.contains("darkproof.app/join", true) } ?: link.trim()
         val items = (APP_LINK.find(s) ?: WEB_LINK.find(s))?.groupValues?.get(1) ?: return null
@@ -414,10 +425,18 @@ object Invite {
         for (kv in items.split("&")) {
             val i = kv.indexOf('='); if (i >= 0) q.putIfAbsent(dec(kv.substring(0, i)), dec(kv.substring(i + 1)))
         }
-        val code = q["code"]?.trim()?.takeIf { it.length in MIN_CODE_LENGTH..200 } ?: return null
-        val name = q["name"]?.trim().orEmpty().ifEmpty { "Group" }.take(MAX_GROUP_NAME)
-        return name to code
+        return q
     }
+
+    /** The admins an invite link names: their [pin]s run together, or "" if it names nobody or not in this form. */
+    fun pins(link: String): String = query(link)?.get("admins")
+        ?.takeIf { p -> p.isNotEmpty() && p.length % PIN_CHARS == 0 && p.length <= MAX_PINS * PIN_CHARS && p.all { it in "0123456789abcdef" } }.orEmpty()
+
+    /** An admin's pin: the first 16 bytes of SHA-256 of their 33-byte public key, in hex. */
+    fun pin(pub: ByteArray): String = java.security.MessageDigest.getInstance("SHA-256").digest(pub).take(16).joinToString("") { "%02x".format(it) }
+
+    /** Whether a phone joining with [pins] may take a new key made by [maker]. With no pins (a typed code) there is nothing to check against. */
+    fun allows(pins: String, maker: ByteArray) = pins.isEmpty() || pin(maker) in pins.chunked(PIN_CHARS)
 
     /**
      * The group code someone typed or pasted, cleaned up: the code of an invite link; a generated code typed in lower

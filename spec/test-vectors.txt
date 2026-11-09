@@ -107,6 +107,47 @@ code: our secret+code=1&2 ünïcode#x
 url: darkproof://join?name=Zo%C3%AB%27s%20%F0%9F%8F%A0&code=our%20secret%2Bcode%3D1%262%20%C3%BCn%C3%AFcode%23x
 web: https://darkproof.app/join#name=Zo%C3%AB%27s%20%F0%9F%8F%A0&code=our%20secret%2Bcode%3D1%262%20%C3%BCn%C3%AFcode%23x
 
+# Admins in an invite (spec/FORMAT.md, "Invites"): pin(pub) is the first 16 bytes of SHA-256(pub), in hex.
+kind: invite-pin
+pub: 021111111111111111111111111111111111111111111111111111111111111111
+pin: e1577700e127f1ce6e20a4efc2d96a98
+
+kind: invite-pin
+pub: 022222222222222222222222222222222222222222222222222222222222222222
+pin: 45dbfe0dd7b69ba886b9c865f2ccfe6c
+
+# url(name, code, pins) and webUrl(name, code, pins) give exactly these; pins(link) of each gives the pins back, and parse() the name and code.
+kind: invite-pinned
+name: Family
+code: K7QF-2M9X-PA4T-W8RJ
+pins: e1577700e127f1ce6e20a4efc2d96a9845dbfe0dd7b69ba886b9c865f2ccfe6c
+url: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=e1577700e127f1ce6e20a4efc2d96a9845dbfe0dd7b69ba886b9c865f2ccfe6c
+web: https://darkproof.app/join#name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=e1577700e127f1ce6e20a4efc2d96a9845dbfe0dd7b69ba886b9c865f2ccfe6c
+
+# pins(link): no pins line means "": none there, or not in the right form (length, capitals, not hex, more than 5). The first admins item counts.
+kind: invite-pins
+link: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ
+
+kind: invite-pins
+link: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=e1577700e127f1ce6e20a4efc2d96a9
+
+kind: invite-pins
+link: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=E1577700E127F1CE6E20A4EFC2D96A98
+
+kind: invite-pins
+link: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+
+kind: invite-pins
+link: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=e1577700e127f1ce6e20a4efc2d96a9845dbfe0dd7b69ba886b9c865f2ccfe6ca1d0a4860f3fa4d52de1a6edb36c31a4195743edab68807f4dc1b150f859e4f540752aa3f7da8f92b4becd7f5965897598d213f18bb513b96f5ab3a05d188425
+
+kind: invite-pins
+link: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=e1577700e127f1ce6e20a4efc2d96a9845dbfe0dd7b69ba886b9c865f2ccfe6ca1d0a4860f3fa4d52de1a6edb36c31a4195743edab68807f4dc1b150f859e4f540752aa3f7da8f92b4becd7f59658975
+pins: e1577700e127f1ce6e20a4efc2d96a9845dbfe0dd7b69ba886b9c865f2ccfe6ca1d0a4860f3fa4d52de1a6edb36c31a4195743edab68807f4dc1b150f859e4f540752aa3f7da8f92b4becd7f59658975
+
+kind: invite-pins
+link: darkproof://join?name=Family&code=K7QF-2M9X-PA4T-W8RJ&admins=e1577700e127f1ce6e20a4efc2d96a98&admins=45dbfe0dd7b69ba886b9c865f2ccfe6c
+pins: e1577700e127f1ce6e20a4efc2d96a98
+
 # parse(link): name and code, or not an invite when they are missing.
 kind: invite-parse
 link: darkproof://join?name=Casa%20di%20Nonna&code=abc+def%20ghi

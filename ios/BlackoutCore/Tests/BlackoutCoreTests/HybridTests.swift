@@ -119,6 +119,23 @@ final class HybridTests: XCTestCase {
         if case .closed = Keyring().take(notIn, maker: anna, me: ben, door: "door", oldDoor: false, removedAt: nil, now: now, open: { _ in nil }) {} else { XCTFail("not closed") }
     }
 
+    func testPhoneJoiningFromAnInviteTakesKeysOnlyFromTheAdminsItNames() {
+        let key = Rekey(epoch: 1, made: now, maker: Data(count: 33), admins: [anna], answers: nil, parts: [(ben, Data(count: 1))], members: [anna, ben])
+        XCTAssertTrue(isIgnored(Keyring().take(key, maker: anna, me: ben, door: "door", oldDoor: false, removedAt: nil, now: now, pinned: false, open: { _ in Data(repeating: 6, count: 32) })))
+        if case .added = Keyring().take(key, maker: anna, me: ben, door: "door", oldDoor: false, removedAt: nil, now: now, pinned: true, open: { _ in Data(repeating: 6, count: 32) }) {} else { XCTFail("not added") }
+    }
+
+    func testSomeoneTheInviteDoesntNameCantCloseIt() {
+        let notIn = Rekey(epoch: 6, made: now, maker: Data(count: 33), admins: [anna], answers: "3333333333333333", parts: [(anna, Data(count: 1))], removal: true, members: [anna])
+        XCTAssertTrue(isIgnored(Keyring().take(notIn, maker: anna, me: ben, door: "door", oldDoor: false, removedAt: nil, now: now, pinned: false, open: { _ in nil })))
+    }
+
+    func testTheInvitesAdminsMatterOnlyWhileJoining() {
+        let r = Keyring(); r.add(.init(number: 5, made: now - 200 * 3_600_000, secret: Data(repeating: 5, count: 32), members: [anna, ben], admins: [anna]))
+        let mine = Rekey(epoch: 6, made: now, maker: Data(count: 33), admins: [anna], answers: nil, parts: [(ben, Data(count: 1))], members: [anna, ben])
+        if case .added = r.take(mine, maker: anna, me: ben, door: "door", oldDoor: false, removedAt: nil, now: now, pinned: false, open: { _ in Data(repeating: 6, count: 32) }) {} else { XCTFail("not added") }
+    }
+
     func testLargestNewKeyFitsInItsPackets() throws {
         let members = (0..<100).map { String(format: "%016x", $0) }, box = Data(count: MlKem.cipherSize + Hpke.encSize + 32 + 19 + 16)
         let packets = Rekey.split(members).map { some in

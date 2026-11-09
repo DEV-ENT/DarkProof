@@ -35,6 +35,8 @@ public final class Keyring: @unchecked Sendable { // guarded by lock
         /// A packet of this epoch: with its own message key if it has one, else with the epoch's key.
         public func open(_ p: Packet) -> GroupCrypto.Opened? {
             if let keys = messageKeys, let h = group.header(p), let mk = keys.key(h.index, h.counter), var o = group.open(messageKey: mk, index: h.index, counter: h.counter, p) {
+                let sender = o.message.sender.hasPrefix("web-") ? String(o.message.sender.dropFirst(4)) : o.message.sender
+                guard keys.members.indices.contains(h.index), keys.members[h.index] == sender else { return nil } // sealed under someone else's position: it must not use up their key
                 o.leaf = Leaf(epoch: self, index: h.index, counter: h.counter)
                 return o
             }
@@ -167,13 +169,14 @@ public final class Keyring: @unchecked Sendable { // guarded by lock
 
     /// The whole decision about rekey `r` (spec "New key"), the same on both apps so that phones given the same rekeys
     /// in any order agree. `door`: the code it came through; `oldDoor`: the group has moved on from that code. `me`: this
-    /// phone's member id. `removedAt`: the removal that removed this phone. `open` opens this phone's sealed part.
+    /// phone's member id. `removedAt`: the removal that removed this phone. `pinned`: its maker is one the invite named, or
+    /// the invite named nobody. `open` opens this phone's sealed part.
     public func take(_ r: Rekey, maker: String, me: String, door: String, oldDoor: Bool, removedAt: (number: Int64, rank: Int)?,
-                     now: Int64 = Int64(Date().timeIntervalSince1970 * 1000), open: (Data) -> Data?) -> Taken {
+                     now: Int64 = Int64(Date().timeIntervalSince1970 * 1000), pinned: Bool = true, open: (Data) -> Data?) -> Taken {
         let seniority = rank(r, maker: maker), mine = r.parts.first { $0.id == me }
         if mine == nil && r.members.contains(me) { return .ignored } // this phone's part is in another packet of the same key
         if let at = removedAt, !(r.removal && r.epoch == at.number && seniority < at.rank && mine != nil) { return .ignored }
-        guard let admins = admit(r, maker: maker, oldDoor: oldDoor ? door : nil, now: now) else { return .ignored }
+        guard let admins = admit(r, maker: maker, oldDoor: oldDoor ? door : nil, now: now, pinned: pinned) else { return .ignored }
         let cur = currentOrNil
         if r.removal, r.answers == me, let cur, r.epoch >= cur.number, !outranked(r, maker: maker) { return .removed(number: r.epoch, rank: seniority) } // a later rejoin has a higher epoch
         guard let mine else { return r.removal && cur == nil ? .closed : .ignored }
@@ -222,7 +225,8 @@ public final class Keyring: @unchecked Sendable { // guarded by lock
 
     /// The admins rekey `r` gives its epoch on this phone, or nil if it must be ignored (spec "New key"). `maker` is
     /// its checked signer; `oldDoor`: the code it came through if the group has moved on from it, else nil.
-    /// - A phone still joining takes the first one that includes it: it has nothing better to trust than the code.
+    /// - A phone still joining takes the first one that includes it, from an admin its invite named (`pinned`). With a typed
+    ///   code it has nothing better to trust than the code.
     /// - Only admins of the epoch before it may leave people out, change the admins or remove someone. A removal needs
     ///   that epoch here: picking a higher number can't put it ahead of a removal that outranks it.
     /// - Through an old door only a rival removal counts, numbered the same as the removal this phone followed out of it,
@@ -231,10 +235,10 @@ public final class Keyring: @unchecked Sendable { // guarded by lock
     ///   has been a member, or anyone with an old code could fill the phone with keys.
     /// - At most one per member per hour, except admins' and rekeys that let someone new in.
     /// - Numbers and times that make no sense, and groups over `maxMembers`, are refused.
-    public func admit(_ r: Rekey, maker: String, oldDoor: String?, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> [String]? {
+    public func admit(_ r: Rekey, maker: String, oldDoor: String?, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000), pinned: Bool = true) -> [String]? {
         guard (1...Self.maxEpoch).contains(r.epoch), r.made >= 0, r.made <= now + Self.maxAheadMs, r.members.count <= Self.maxMembers else { return nil }
         return lock.withLock {
-            guard let cur = pick() else { return oldDoor == nil ? r.admins : nil }
+            guard let cur = pick() else { return oldDoor == nil && pinned ? r.admins : nil }
             if r.epoch > cur.number + Self.maxJump { return nil }
             let earlier = list.filter { $0.number == r.epoch - 1 }.sorted(by: Self.first)
             if r.removal && earlier.isEmpty { return nil }

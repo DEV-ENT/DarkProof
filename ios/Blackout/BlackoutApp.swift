@@ -14,6 +14,12 @@ struct BlackoutApp: App {
             UserDefaults.standard.set(String(args[i + 1][..<bar]), forKey: "name")
             GroupSecrets.shared.setCode(String(args[i + 1][args[i + 1].index(after: bar)...]))
         }
+        if let i = args.firstIndex(of: "joinLink"), args.indices.contains(i + 1), let bar = args[i + 1].firstIndex(of: "|"),
+           let invite = InviteLinks.read(String(args[i + 1][args[i + 1].index(after: bar)...])) { // joinLink "Name|darkproof://join?…": like join, through the code that reads an invite
+            UserDefaults.standard.set(String(args[i + 1][..<bar]), forKey: "name")
+            GroupSecrets.shared.setCode(invite.code)
+        }
+        if args.contains("found"), let c = GroupSecrets.shared.current { Engine.found(c) } // with join: as if this phone created the group
         if let i = args.firstIndex(of: "ahead"), args.indices.contains(i + 1), let days = Int64(args[i + 1]) { Engine.ahead = days * 86_400_000 } // ahead 8
         for i in args.indices where args[i] == "set" && args.indices.contains(i + 2) { // set wifiNetwork 0 (repeatable)
             UserDefaults.standard.set(args[i + 2] == "1", forKey: args[i + 1])
@@ -34,6 +40,9 @@ struct BlackoutApp: App {
         if let i = args.firstIndex(of: "interopTest"), args.indices.contains(i + 1) { InteropTest.run(args[i + 1]) }
         if let i = args.firstIndex(of: "unlockAfter"), args.indices.contains(i + 1), let s = Double(args[i + 1]) { // unlockAfter 10
             DispatchQueue.main.asyncAfter(deadline: .now() + s) { AppLock.shared.unlockForTests() }
+        }
+        if args.contains("logPins") { // key hashes, not the group code
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { DebugLog.write("pins " + (GroupSecrets.shared.current.flatMap { Mesh.shared.engine?.invitePins($0) } ?? "none")) }
         }
         if args.contains("samples") { InteropTest.samples(after: 8) } // no link: the messages go by whatever is up, e.g. relays
         if let i = args.firstIndex(of: "say"), args.indices.contains(i + 1) { // say Hello: to the group on screen only

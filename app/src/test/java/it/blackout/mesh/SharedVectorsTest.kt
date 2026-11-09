@@ -54,6 +54,25 @@ class SharedVectorsTest {
         assertEquals(v["link"], expected, Invite.parse(v["link"]!!))
     }
 
+    @Test fun inviteAdmins() {
+        assertEquals(7, of("invite-pins").size)
+        of("invite-pin").forEach { v -> assertEquals(v["pin"], Invite.pin(unhex(v["pub"]!!))) }
+        of("invite-pinned").forEach { v ->
+            val name = v["name"]!!; val code = v["code"]!!; val pins = v["pins"]!!
+            assertEquals(v["url"], Invite.url(name, code, pins))
+            assertEquals(v["web"], Invite.webUrl(name, code, pins))
+            for (link in listOf(v["url"]!!, v["web"]!!)) { assertEquals(name to code, Invite.parse(link)); assertEquals(pins, Invite.pins(link)) }
+        }
+        of("invite-pins").forEach { v -> assertEquals(v["link"], v["pins"].orEmpty(), Invite.pins(v["link"]!!)) }
+    }
+
+    @Test fun inviteAllows() {
+        val (a, b) = of("invite-pin").map { unhex(it["pub"]!!) }
+        assertTrue("no pins: nothing to check against", Invite.allows("", a))
+        assertTrue(Invite.allows(Invite.pin(a) + Invite.pin(b), b))
+        assertFalse(Invite.allows(Invite.pin(a), b))
+    }
+
     @Test fun fingerprints() {
         of("fingerprint").forEach { v ->
             val idx = Fingerprint.forCode(v["code"]!!)

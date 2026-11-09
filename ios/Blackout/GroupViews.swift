@@ -9,8 +9,16 @@ enum InviteLinks {
     static let useWebLinks = false
     static let download = "https://darkproof.app"
 
-    static func link(name: String, code: String) -> URL {
-        useWebLinks ? Invite.webUrl(name: name, code: code) : Invite.url(name: name, code: code)
+    static func link(name: String, code: String, pins: String) -> URL {
+        useWebLinks ? Invite.webUrl(name: name, code: code, pins: pins) : Invite.url(name: name, code: code, pins: pins)
+    }
+
+    /// The group name and code in invite `link`, or nil if it isn't one. Keeps the admins it names for when this phone joins.
+    static func read(_ link: String) -> (name: String, code: String)? {
+        guard let i = Invite.parse(link) else { return nil }
+        let pins = Invite.pins(link)
+        if !pins.isEmpty { GroupSecrets.shared.setPins(i.code, pins) }
+        return i
     }
 }
 
@@ -103,7 +111,8 @@ struct InviteSheet: View {
     let code: String
     @State private var showCode = false
     @AppStorage("didInvite") private var didInvite = false
-    private var url: URL { InviteLinks.link(name: groupName, code: code) }
+    @State private var pins: String? // nil until the group's keys are loaded: a group just created can get here first
+    private var url: URL { InviteLinks.link(name: groupName, code: code, pins: pins ?? "") }
 
     var body: some View {
         SheetPage(title: "Invite") {
@@ -114,7 +123,7 @@ struct InviteSheet: View {
                     Text("Your friend points their phone camera at this code, or scans it in DarkProof.")
                         .scaledFont(15).foregroundStyle(Theme.dim).multilineTextAlignment(.center)
                 }
-                if let qr = Invite.qr(url) {
+                if pins != nil, let qr = Invite.qr(url) {
                     Image(uiImage: qr).interpolation(.none).resizable().scaledToFit()
                         .padding(20)
                         .background(Color.white, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
@@ -126,6 +135,7 @@ struct InviteSheet: View {
                     Label("Send invite", systemImage: "square.and.arrow.up")
                 }
                 .buttonStyle(PrimaryButton())
+                .disabled(pins == nil)
                 .simultaneousGesture(TapGesture().onEnded { didInvite = true })
                 Text("AirDrop works without internet.").font(.footnote).foregroundStyle(Theme.dim)
             }
@@ -144,6 +154,13 @@ struct InviteSheet: View {
                 Label("Anyone with this QR or code can read the group. Share it only with people you trust.", systemImage: "lock.fill")
                     .font(.footnote).foregroundStyle(Theme.dim)
             }
+        }
+        .task(id: code) {
+            for _ in 0..<40 {
+                if let p = Mesh.shared.engine?.invitePins(code) { pins = p; return }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            pins = ""
         }
         .task { // showing the QR for a few seconds counts as inviting (for the Get ready list)
             try? await Task.sleep(nanoseconds: 4_000_000_000)
@@ -174,7 +191,7 @@ struct QRScannerSheet: View {
                     .padding(32)
                 } else {
                     QRCamera(onCode: { s in
-                        if let i = Invite.parse(s) {
+                        if let i = InviteLinks.read(s) {
                             UINotificationFeedbackGenerator().notificationOccurred(.success)
                             found(i.name, i.code); dismiss()
                         } else { notInvite = true }
@@ -303,7 +320,7 @@ struct CodeEntry: View {
             }
         }
         .onChange(of: code) { new in
-            guard let i = Invite.parse(new) else { return } // a pasted invite link: keep its code, offer its name
+            guard let i = InviteLinks.read(new) else { return } // a pasted invite link: keep its code, offer its name
             code = i.code; fromLink = i.name
             if groupName.trimmingCharacters(in: .whitespaces).isEmpty { groupName = i.name }
         }

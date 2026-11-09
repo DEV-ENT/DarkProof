@@ -58,6 +58,28 @@ final class SharedVectorsTests: XCTestCase {
         }
     }
 
+    func testInviteAdmins() {
+        XCTAssertEqual(of("invite-pins").count, 7)
+        for v in of("invite-pin") { XCTAssertEqual(Invite.pin(Hex.decode(v["pub"]!)), v["pin"]) }
+        for v in of("invite-pinned") {
+            let name = v["name"]!, code = v["code"]!, pins = v["pins"]!
+            XCTAssertEqual(Invite.url(name: name, code: code, pins: pins).absoluteString, v["url"])
+            XCTAssertEqual(Invite.webUrl(name: name, code: code, pins: pins).absoluteString, v["web"])
+            for link in [v["url"]!, v["web"]!] {
+                XCTAssertEqual(Invite.parse(link)?.name, name); XCTAssertEqual(Invite.parse(link)?.code, code)
+                XCTAssertEqual(Invite.pins(link), pins)
+            }
+        }
+        for v in of("invite-pins") { XCTAssertEqual(Invite.pins(v["link"]!), v["pins"] ?? "", v["link"]!) }
+    }
+
+    func testInviteAllows() {
+        let keys = of("invite-pin").map { Hex.decode($0["pub"]!) }, a = keys[0], b = keys[1]
+        XCTAssertTrue(Invite.allows("", maker: a), "no pins: nothing to check against")
+        XCTAssertTrue(Invite.allows(Invite.pin(a) + Invite.pin(b), maker: b))
+        XCTAssertFalse(Invite.allows(Invite.pin(a), maker: b))
+    }
+
     func testFingerprints() {
         for v in of("fingerprint") {
             let idx = Fingerprint.forCode(v["code"]!)

@@ -266,7 +266,10 @@ class Keyring {
         /** A packet of this epoch: with its own message key if it has one, else (receipts' sealing, older packets) with the epoch's key. */
         fun open(p: Packet): GroupCrypto.Opened? {
             val keys = messageKeys
-            if (keys != null) group.header(p)?.let { (i, n) -> keys.key(i, n)?.let { mk -> group.openWith(mk, i, n, p)?.let { o -> o.leaf = Leaf(this, i, n); return o } } }
+            if (keys != null) group.header(p)?.let { (i, n) -> keys.key(i, n)?.let { mk -> group.openWith(mk, i, n, p)?.let { o ->
+                if (keys.members.getOrNull(i) != o.message.sender.removePrefix("web-")) return null // sealed under someone else's position: it must not use up their key
+                o.leaf = Leaf(this, i, n); return o
+            } } }
             return group.openSigned(p)
         }
 
@@ -331,14 +334,15 @@ class Keyring {
     /**
      * The whole decision about rekey [r] (spec "New key"), the same on both apps so that phones given the same rekeys
      * in any order agree. [door]: the code it came through; [oldDoor]: the group has moved on from that code. [me]: this
-     * phone's member id. [removedAt]: the removal that removed this phone. [open] opens this phone's sealed part.
+     * phone's member id. [removedAt]: the removal that removed this phone. [pinned]: its maker is one the invite named, or
+     * the invite named nobody. [open] opens this phone's sealed part.
      */
     @Synchronized fun take(r: Rekey, maker: String, me: String, door: String, oldDoor: Boolean, removedAt: Pair<Long, Int>?,
-                           now: Long = System.currentTimeMillis(), open: (ByteArray) -> ByteArray?): Taken {
+                           now: Long = System.currentTimeMillis(), pinned: Boolean = true, open: (ByteArray) -> ByteArray?): Taken {
         val seniority = rank(r, maker); val mine = r.parts.firstOrNull { it.first == me }
         if (mine == null && me in r.members) return Taken.Ignored // this phone's part is in another packet of the same key
         if (removedAt != null && !(r.removal && r.epoch == removedAt.first && seniority < removedAt.second && mine != null)) return Taken.Ignored
-        val admins = admit(r, maker, if (oldDoor) door else null, now) ?: return Taken.Ignored
+        val admins = admit(r, maker, if (oldDoor) door else null, now, pinned) ?: return Taken.Ignored
         val cur = currentOrNull()
         if (r.removal && r.answers == me && cur != null && r.epoch >= cur.number && !outranked(r, maker)) return Taken.Removed(r.epoch, seniority) // a later rejoin has a higher epoch
         if (mine == null) return if (r.removal && cur == null) Taken.Closed else Taken.Ignored
@@ -372,7 +376,8 @@ class Keyring {
     /**
      * The admins rekey [r] gives its epoch on this phone, or null if it must be ignored (spec "New key"). [maker] is
      * its checked signer; [oldDoor]: the code it came through if the group has moved on from it, else null.
-     * - A phone still joining takes the first one that includes it: it has nothing better to trust than the code.
+     * - A phone still joining takes the first one that includes it, from an admin its invite named ([pinned]). With a typed
+     *   code it has nothing better to trust than the code.
      * - Only admins of the epoch before it may let someone in, leave people out, change the admins or remove someone. A removal needs
      *   that epoch here: picking a higher number can't put it ahead of a removal that outranks it.
      * - Through an old door only a rival removal counts, numbered the same as the removal this phone followed out of it,
@@ -382,9 +387,9 @@ class Keyring {
      * - At most one per member per hour, except admins'.
      * - Numbers and times that make no sense, and groups over [MAX_MEMBERS], are refused.
      */
-    @Synchronized fun admit(r: Rekey, maker: String, oldDoor: String?, now: Long = System.currentTimeMillis()): List<String>? {
+    @Synchronized fun admit(r: Rekey, maker: String, oldDoor: String?, now: Long = System.currentTimeMillis(), pinned: Boolean = true): List<String>? {
         if (r.epoch !in 1..MAX_EPOCH || r.made < 0 || r.made > now + MAX_AHEAD_MS || r.members.size > MAX_MEMBERS) return null
-        val cur = currentOrNull() ?: return if (oldDoor == null) r.admins else null
+        val cur = currentOrNull() ?: return if (oldDoor == null && pinned) r.admins else null
         if (r.epoch > cur.number + MAX_JUMP) return null
         val earlier = list.filter { it.number == r.epoch - 1 }.sortedWith(order)
         if (r.removal && earlier.isEmpty()) return null

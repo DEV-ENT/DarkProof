@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 
 /// Group invites, so nobody has to type a code: a link carrying the group's name and code, shown as a QR code or
 /// sent by AirDrop (spec/FORMAT.md, "Invites"). Two forms with the same items: darkproof://join?name=<name>&code=<code>,
@@ -11,20 +12,31 @@ public enum Invite {
     /// Generated codes: 16 of these, in four groups of four joined by "-".
     public static let symbols = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     public static let webPrefix = "https://darkproof.app/join#"
+    /// An invite names at most this many admins: the ones listed first.
+    public static let maxPins = 5
+    private static let pinChars = 32
 
     /// The app link: opens DarkProof where it is installed (all versions), does nothing elsewhere.
-    public static func url(name: String, code: String) -> URL { URL(string: "darkproof://join?" + items(name, code))! }
+    public static func url(name: String, code: String, pins: String = "") -> URL { URL(string: "darkproof://join?" + items(name, code, pins))! }
 
     /// The web link, for QR codes and sharing: opens DarkProof where it is installed (once darkproof.app serves the
     /// app-link files), else darkproof.app/join, which offers the app link and the downloads. The code stays in the
     /// #fragment, which browsers never send to a server.
-    public static func webUrl(name: String, code: String) -> URL { URL(string: webPrefix + items(name, code))! }
+    public static func webUrl(name: String, code: String, pins: String = "") -> URL { URL(string: webPrefix + items(name, code, pins))! }
 
     /// The group name and code in an invite link (either form), or nil if it is not one.
     public static func parse(_ url: URL) -> (name: String, code: String)? { parse(url.absoluteString) }
 
     /// The group name and code in an invite link (either form), or nil if it is not one.
     public static func parse(_ link: String) -> (name: String, code: String)? {
+        guard let q = query(link) else { return nil }
+        guard let code = q["code"]?.trimmingCharacters(in: .whitespacesAndNewlines), code.count >= minCodeLength, code.count <= 200 else { return nil }
+        let name = q["name"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (String((name.isEmpty ? "Group" : name).prefix(maxGroupName)), code)
+    }
+
+    /// The items of an invite link, the first of each name counting; nil if it isn't a link of either form.
+    private static func query(_ link: String) -> [String: String]? {
         // A shared message has words around the link.
         let whole = link.trimmingCharacters(in: .whitespacesAndNewlines)
         let s = whole.split(whereSeparator: \.isWhitespace).map(String.init).first { $0.lowercased().hasPrefix("darkproof://") || $0.lowercased().contains("darkproof.app/join") } ?? whole
@@ -35,9 +47,24 @@ public enum Invite {
             let k = dec(kv[..<i])
             if q[k] == nil { q[k] = dec(kv[kv.index(after: i)...]) }
         }
-        guard let code = q["code"]?.trimmingCharacters(in: .whitespacesAndNewlines), code.count >= minCodeLength, code.count <= 200 else { return nil }
-        let name = q["name"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return (String((name.isEmpty ? "Group" : name).prefix(maxGroupName)), code)
+        return q
+    }
+
+    /// The admins an invite link names: their pins run together, or "" if it names nobody or not in this form.
+    public static func pins(_ link: String) -> String {
+        guard let p = query(link)?["admins"], !p.isEmpty, p.utf8.count % pinChars == 0, p.utf8.count <= maxPins * pinChars,
+              p.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }) else { return "" }
+        return p
+    }
+
+    /// An admin's pin: the first 16 bytes of SHA-256 of their 33-byte public key, in hex.
+    public static func pin(_ pub: Data) -> String { Hex.encode(Data(SHA256.hash(data: pub).prefix(16))) }
+
+    /// Whether a phone joining with `pins` may take a new key made by `maker`. With no pins (a typed code) there is nothing to check against.
+    public static func allows(_ pins: String, maker: Data) -> Bool {
+        if pins.isEmpty { return true }
+        let mine = pin(maker), p = Array(pins)
+        return stride(from: 0, to: p.count, by: pinChars).contains { String(p[$0..<Swift.min($0 + pinChars, p.count)]) == mine }
     }
 
     /// The group code someone typed or pasted, cleaned up: the code of an invite link; a generated code typed in lower
@@ -80,7 +107,7 @@ public enum Invite {
     }
 
     /// Percent-encodes everything but RFC 3986 unreserved characters (the same bytes as Android).
-    private static func items(_ name: String, _ code: String) -> String { "name=\(enc(name))&code=\(enc(code))" }
+    private static func items(_ name: String, _ code: String, _ pins: String) -> String { "name=\(enc(name))&code=\(enc(code))" + (pins.isEmpty ? "" : "&admins=\(pins)") }
     private static func enc(_ s: String) -> String {
         var out = ""
         for b in s.utf8 {

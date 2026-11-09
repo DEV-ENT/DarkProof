@@ -161,7 +161,7 @@ class MainActivity : ComponentActivity() {
 
     /** darkproof://join?name=…&code=… or https://darkproof.app/join#… opened from a QR code or a shared link. */
     private fun link(i: Intent) {
-        val g = i.data?.toString()?.let(Invite::parse) ?: return
+        val g = i.data?.toString()?.let { Groups.readInvite(this, it) } ?: return
         if (g.second != state.group?.code) state.invite = SavedGroup(g.first, g.second)
     }
 

@@ -121,6 +121,23 @@ class HybridTest {
         assertSame(Keyring.Taken.Closed, Keyring().take(notIn, anna, ben, "door", false, null, now) { null })
     }
 
+    @Test fun aPhoneJoiningFromAnInviteTakesKeysOnlyFromTheAdminsItNames() {
+        val key = Rekey(1, now, ByteArray(33), listOf(anna), null, listOf(ben to ByteArray(1)), members = listOf(anna, ben))
+        assertSame(Keyring.Taken.Ignored, Keyring().take(key, anna, ben, "door", false, null, now, pinned = false) { ByteArray(32) { 6 } })
+        assertTrue(Keyring().take(key, anna, ben, "door", false, null, now, pinned = true) { ByteArray(32) { 6 } } is Keyring.Taken.Added)
+    }
+
+    @Test fun someoneTheInviteDoesntNameCantCloseIt() {
+        val notIn = Rekey(6, now, ByteArray(33), listOf(anna), "3333333333333333", listOf(anna to ByteArray(1)), removal = true, members = listOf(anna))
+        assertSame(Keyring.Taken.Ignored, Keyring().take(notIn, anna, ben, "door", false, null, now, pinned = false) { null })
+    }
+
+    @Test fun theInvitesAdminsMatterOnlyWhileJoining() {
+        val r = Keyring().also { it.add(Keyring.Epoch(5, now - 200 * 3_600_000L, ByteArray(32) { 5 }, listOf(anna, ben), listOf(anna))) }
+        val mine = Rekey(6, now, ByteArray(33), listOf(anna), null, listOf(ben to ByteArray(1)), members = listOf(anna, ben))
+        assertTrue(r.take(mine, anna, ben, "door", false, null, now, pinned = false) { ByteArray(32) { 6 } } is Keyring.Taken.Added)
+    }
+
     @Test fun theLargestNewKeyFitsInItsPackets() {
         val members = (0 until 100).map { "%016x".format(it) }; val box = ByteArray(MlKem.CIPHER_SIZE + Hpke.ENC_SIZE + 32 + 19 + 16)
         val packets = Rekey.split(members).map { some -> Rekey(7, 1, ByteArray(33), members, "%016x".format(200), some.map { it to box }, removal = true, members = members) }

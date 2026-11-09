@@ -262,8 +262,9 @@ data class SavedGroup(val name: String, val code: String)
 object Groups {
     private fun prefs(c: Context) = c.getSharedPreferences("mesh", 0)
 
-    /** The group in use, the others, and the codes of groups made here that have no first epoch yet. */
-    private data class Saved(val code: String? = null, val name: String? = null, val others: List<SavedGroup> = emptyList(), val founded: Set<String> = emptySet())
+    /** The group in use, the others, the codes of groups made here that have no first epoch yet, and the admins invites named, by code. */
+    private data class Saved(val code: String? = null, val name: String? = null, val others: List<SavedGroup> = emptyList(), val founded: Set<String> = emptySet(),
+                             val pins: Map<String, String> = emptyMap())
     private var cache: Saved? = null
 
     private fun groupsFrom(a: JSONArray) = (0 until a.length()).map { a.getJSONObject(it) }.map { SavedGroup(it.optString("name", "Group"), it.optString("code")) }
@@ -277,7 +278,8 @@ object Groups {
         val p = prefs(c)
         val s = Vault.get(c, "groups")?.let { raw -> runCatching { JSONObject(String(raw)).let { o ->
             Saved(o.optString("code").ifEmpty { null }, o.optString("name").ifEmpty { null }, groupsFrom(o.getJSONArray("others")),
-                o.getJSONArray("founded").let { f -> (0 until f.length()).map(f::getString).toSet() })
+                o.getJSONArray("founded").let { f -> (0 until f.length()).map(f::getString).toSet() },
+                o.optJSONObject("pins")?.let { m -> m.keys().asSequence().associateWith { m.getString(it) } }.orEmpty())
         } }.getOrNull() } ?: Saved(p.getString("code", null), p.getString("groupName", null),
             runCatching { groupsFrom(JSONArray(p.getString("groups", "[]"))) }.getOrDefault(emptyList()), p.getStringSet("found", emptySet())!!.toSet())
         cache = s
@@ -293,7 +295,7 @@ object Groups {
         cache = s
         Vault.put(c, "groups", JSONObject().put("code", s.code ?: "").put("name", s.name ?: "")
             .put("others", JSONArray(s.others.map { JSONObject().put("name", it.name).put("code", it.code) }))
-            .put("founded", JSONArray(s.founded.toList())).toString().toByteArray())
+            .put("founded", JSONArray(s.founded.toList())).put("pins", JSONObject(s.pins)).toString().toByteArray())
     }
 
     /** The code of the group in use, or null before setup. */
@@ -323,6 +325,13 @@ object Groups {
     /** Groups made on this phone, or saved before v0.6, that have no first epoch yet (spec "Making the first epoch"). */
     fun founded(c: Context) = saved(c).founded
     @Synchronized fun setFounded(c: Context, codes: Set<String>) = write(c, saved(c).copy(founded = codes))
+
+    /** The admins the invite for [code] named ("" if none): only they can let this phone in (spec "Invites"). */
+    fun pins(c: Context, code: String) = saved(c).pins[code].orEmpty()
+    @Synchronized fun setPins(c: Context, code: String, pins: String) = saved(c).let { s -> write(c, s.copy(pins = (s.pins - code + (code to pins)).toList().takeLast(20).toMap())) }
+
+    /** The group name and code in invite [link], or null if it isn't one. Keeps the admins it names for when this phone joins. */
+    fun readInvite(c: Context, link: String): Pair<String, String>? = Invite.parse(link)?.also { (_, code) -> Invite.pins(link).takeIf { it.isNotEmpty() }?.let { setPins(c, code, it) } }
 }
 
 /**

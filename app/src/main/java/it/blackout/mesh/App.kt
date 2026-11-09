@@ -41,7 +41,7 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
  * Links / Universal Links files, so invites also work for people who don't have the app yet (Invite.webUrl).
  */
 const val INVITE_WEB_LINKS = false
-fun inviteLink(g: SavedGroup) = if (INVITE_WEB_LINKS) Invite.webUrl(g.name, g.code) else Invite.url(g.name, g.code)
+fun inviteLink(g: SavedGroup, pins: String) = if (INVITE_WEB_LINKS) Invite.webUrl(g.name, g.code, pins) else Invite.url(g.name, g.code, pins)
 
 @Composable
 fun DarkProofApp(s: AppState, a: MainActivity) {
@@ -147,7 +147,7 @@ fun SetupFlow(invite: SavedGroup?, askName: Boolean, modifier: Modifier = Modifi
                         scanInvite(ctx) { (n, c) -> code = c; groupName = n }
                     }
                     // A pasted invite link works too: its code is used and its name filled in.
-                    InputField("Group code", code, { v -> Invite.parse(v)?.let { (n, c) -> code = c; if (groupName.isBlank() || groupName == "Group") groupName = n } ?: run { code = v.take(64) } },
+                    InputField("Group code", code, { v -> Groups.readInvite(ctx, v)?.let { (n, c) -> code = c; if (groupName.isBlank() || groupName == "Group") groupName = n } ?: run { code = v.take(64) } },
                         "XXXX-XXXX-XXXX-XXXX", keyboard = KeyboardOptions(KeyboardCapitalization.Characters, keyboardType = androidx.compose.ui.text.input.KeyboardType.Password))
                     InputField("Group name (you can leave it)", groupName, { groupName = it.take(Invite.MAX_GROUP_NAME) }, "Family", keyboard = KeyboardOptions(KeyboardCapitalization.Words))
                 }
@@ -173,7 +173,7 @@ fun scanInvite(c: Context, got: (Pair<String, String>) -> Unit) {
     runCatching {
         GmsBarcodeScanning.getClient(c, opts).startScan()
             .addOnSuccessListener { b ->
-                val invite = b.rawValue?.let(Invite::parse)
+                val invite = b.rawValue?.let { Groups.readInvite(c, it) }
                 if (invite != null) got(invite) else Toast.makeText(c, "This QR code isn't a DarkProof invite.", Toast.LENGTH_LONG).show()
             }
             .addOnFailureListener { Toast.makeText(c, "The scanner isn't ready on this phone. Point the camera app at the code, or type it.", Toast.LENGTH_LONG).show() }
@@ -560,16 +560,21 @@ private fun ActionTile(label: String, @DrawableRes icon: Int, color: Color, sign
 
 @Composable
 private fun InviteSheet(g: SavedGroup, a: MainActivity, close: () -> Unit) {
-    val link = remember(g) { inviteLink(g) }
+    // The group's keys load in the background: a group just created can get here before they're ready.
+    val pins by produceState<String?>(null, g.code) {
+        repeat(40) { MeshEngine.invitePins(g.code)?.let { value = it; return@produceState }; kotlinx.coroutines.delay(250) }
+        value = ""
+    }
+    val link = remember(g, pins) { inviteLink(g, pins.orEmpty()) }
     val qr = remember(link) { qrBitmap(link).asImageBitmap() }
     var showCode by rememberSaveable { mutableStateOf(false) }
     SheetPage("Invite", close) {
         Txt("Invite to ${g.name}", 20, FontWeight.Bold)
         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-            Image(qr, "Invite QR code", Modifier.size(260.dp).clip(RoundedCornerShape(24.dp)).background(Color.White).padding(14.dp))
+            if (pins != null) Image(qr, "Invite QR code", Modifier.size(260.dp).clip(RoundedCornerShape(24.dp)).background(Color.White).padding(14.dp))
         }
         Txt("Your friend points their phone camera at this code, or scans it in DarkProof.", 15, color = Theme.dim)
-        PrimaryButton("Share invite link", icon = R.drawable.ic_share) {
+        PrimaryButton("Share invite link", enabled = pins != null, icon = R.drawable.ic_share) {
             a.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain")
                 .putExtra(Intent.EXTRA_TEXT, "Join my group ${g.name} on DarkProof: $link\n\nDon't have DarkProof? https://darkproof.app"), "Invite"))
         }

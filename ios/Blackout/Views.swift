@@ -33,7 +33,7 @@ struct RootView: View {
         .onAppear { if !code.isEmpty { AppLock.shared.phaseChanged(.active) } }
         .onChange(of: phase) { AppLock.shared.phaseChanged($0) }
         .onOpenURL { url in
-            guard let i = Invite.parse(url) else { return }
+            guard let i = InviteLinks.read(url.absoluteString) else { return }
             if code.isEmpty { invite = PendingInvite(name: i.name, code: i.code); return }
             if i.code == code { Nav.shared.toast("You're already in \(groupName)"); return }
             linkInvite = PendingInvite(name: i.name, code: i.code) // already in a group: ask first

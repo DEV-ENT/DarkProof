@@ -356,6 +356,12 @@ object MeshEngine {
     /** True while this phone has the code of [code]'s group but no epoch yet: it is asking to join. */
     fun joining(code: String?): Boolean = code != null && synchronized(keyCache) { keyCache[code] }?.let { !it.isPublic && !it.joined } ?: false
 
+    /** The admins an invite to [code]'s group names (spec "Invites"), first listed first, or null until its keys are loaded. */
+    fun invitePins(code: String): String? = held(code)?.let { k ->
+        k.ring.currentOrNull()?.admins.orEmpty().mapNotNull { id -> if (id == k.me) k.pub else synchronized(k.known) { k.known[id]?.pub } }
+            .take(Invite.MAX_PINS).joinToString("") { Invite.pin(it) }
+    }
+
     /** True if this phone was removed from [code]'s group. */
     fun removed(code: String?): Boolean = held(code)?.removed ?: false
 
@@ -406,9 +412,11 @@ object MeshEngine {
     private fun acceptRekey(x: Seen.NewKey): Boolean {
         val k = x.k; val r = x.r; val maker = x.o.message.sender
         if (!signed(x)) return false
+        val pinned = Invite.allows(Groups.pins(app ?: return false, k.code), r.maker) // only read while this phone has no epoch
+        if (!pinned && !k.joined) DebugTools.log("new key from someone this invite doesn't name: ignored")
         if (r.removal && k.rejoining && maker != k.me) k.closed = true // the group may have moved on while this phone was away
         val prefs = app?.getSharedPreferences("mesh", 0)
-        return when (val t = k.ring.take(r, maker, k.me, x.door.code, x.door !== k.door, k.removedAt) { box -> k.encs.open(box, Rekey.info(x.door.id), Rekey.aad(x.packetId, k.me)) }) {
+        return when (val t = k.ring.take(r, maker, k.me, x.door.code, x.door !== k.door, k.removedAt, pinned = pinned) { box -> k.encs.open(box, Rekey.info(x.door.id), Rekey.aad(x.packetId, k.me)) }) {
             Keyring.Taken.Ignored -> false
             Keyring.Taken.Closed -> { k.closed = true; false }
             is Keyring.Taken.Removed -> {

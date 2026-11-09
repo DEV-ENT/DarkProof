@@ -193,8 +193,9 @@ epoch if there is none:
 
 - **Refused outright:** a number below 1 or above 2^53, more than 1000 above the current epoch, a date below 0 or more
   than 10 minutes ahead, or more than 100 members.
-- **A phone with no epoch** accepts the first one that includes it. A removal that doesn't include it means its code no
-  longer works.
+- **A phone with no epoch** accepts the first one that includes it. If the invite it joined with names admins, the
+  maker has to be one of them; if not, the first key it sees has to be trusted (see "Invites"). A removal that doesn't
+  include it means its code no longer works, under the same condition.
 - **Only admins of the epoch before** may let someone in, leave a member out or make a removal. Anyone else's new key has
   exactly the same members as the epoch before, and its maker has to be one of them. A removal needs the epoch before it to
   be held. A removal may not include the person it removes.
@@ -258,6 +259,8 @@ Each group message has its own key, which a phone deletes once the message has b
   the epoch's member list (1 byte) and the message number (2 bytes), XORed with the first 3 bytes of HMAC-SHA256(outer key,
   the ASCII bytes of `darkproof-header-v1` ‖ IV). Associated data: `<id hex>|<ts decimal>` followed by the unmasked header.
   Plaintext and signature as in "Encryption".
+- **Whose number:** a packet opens only if the position in its header is the sender's own place in the member list (a `web-`
+  in front of the id doesn't count), so a member can't seal a packet under someone else's number and sign it as themselves.
 - **Deleting:** a leaf is deleted once the signature has checked, never before, so a member who forges a packet under someone
   else's number can't destroy that number's key. Deleting replaces the node above it with its other branches, so nothing kept
   can derive a deleted leaf. A sender deletes the leaf as soon as it has sealed the message.
@@ -306,20 +309,27 @@ app restarts, and can't tell who it belongs to.
 An invite link carries a group's name and code so nobody has to type the code:
 
 ```
-darkproof://join?name=<group name>&code=<group code>
+darkproof://join?name=<group name>&code=<group code>&admins=<pins>
 ```
 
 - Both values are URL-encoded query items. `code` has at least 8 characters. `name` is only a label shown on screen; it is not used for encryption, and a missing name means "Group".
 - Apps show the link as a QR code and can send it any way the phone can share a link, such as AirDrop.
 - New groups get a random code of 16 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, in four groups of four joined by `-` (80 bits of entropy).
-- Anyone with the link can read the group, exactly like anyone who knows the code.
+- Anyone with the link can ask to join, exactly like anyone who knows the code.
+- **`admins`** names who can let the joining phone in: for each of the group's first 5 admins whose key the inviting phone
+  knows, the first 16 bytes of SHA-256 of their 33-byte public key, in lower-case hex, run together. A phone that joined with
+  such a link ignores new keys from anyone else while it has no epoch, so someone who knows the code can't pose as the group.
+  Once it has an epoch the usual rules apply. An `admins` item that isn't in this form counts as none.
+- A typed code, or a link without `admins`, can't name anyone: that phone trusts the first new key that includes it.
+- An admin appointed after the invite was made isn't named in it. A phone joining with that invite waits until a named
+  admin lets it in or makes a new key.
 
 ### Web links
 
 The same invite as a web address, so it also works for people who don't have the app yet:
 
 ```
-https://darkproof.app/join#name=<group name>&code=<group code>
+https://darkproof.app/join#name=<group name>&code=<group code>&admins=<pins>
 ```
 
 - After `#` come the same items as in the `darkproof://` link, encoded the same way: every byte that is not a letter,
@@ -824,7 +834,8 @@ Both sides reach the same decision. Either side may close the other link.
 - `0xB3`, 2026-11-09: padding, a link per group, generated codes only, 16 person emoji, weekly encryption keys, ML-KEM
   and new keys split over packets. New keys are types `0x06` and `0x07`; phones on an earlier build can't read them.
   Later the same day: ML-KEM required (iOS 26 or later), joining needs an admin, Tor on by default with a circuit per group,
-  blurred times, and a key per message.
+  blurred times, and a key per message. Then: a packet's position has to be its sender's own, and invites name the admins
+  who can let a phone in.
 
 ## Apple peer-to-peer (iPhone to iPhone)
 

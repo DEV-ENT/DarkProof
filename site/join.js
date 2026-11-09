@@ -15,7 +15,7 @@ function readInvite(fragment) {
   var code = (items.code || "").trim();
   if (code.length < 8) return null;
   var name = (items.name || "").trim() || "Group";
-  return { name: name.slice(0, 24), code: code };
+  return { name: name.slice(0, 24), code: code, admins: items.admins || "" };
 }
 
 function dec(s) {
@@ -39,7 +39,7 @@ function show() {
   if (!invite) { document.getElementById("title").textContent = "Join the group"; return; }
   document.getElementById("title").textContent = "Join “" + invite.name + "”";
   document.title = "Join " + invite.name + " on DarkProof";
-  document.getElementById("open").href = "darkproof://join?name=" + enc(invite.name) + "&code=" + enc(invite.code);
+  document.getElementById("open").href = "darkproof://join?name=" + enc(invite.name) + "&code=" + enc(invite.code) + (invite.admins ? "&admins=" + enc(invite.admins) : "");
 }
 
 document.addEventListener("DOMContentLoaded", function () {
