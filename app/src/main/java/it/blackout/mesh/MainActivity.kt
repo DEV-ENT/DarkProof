@@ -38,6 +38,7 @@ class AppState(a: ComponentActivity) {
     var group by mutableStateOf(Groups.current(a))
     var locked by mutableStateOf(AppLock.due(a)) // "Lock DarkProof" is asking
     var lockOn by mutableStateOf(AppLock.enabled(a))
+    var waitingSafe by mutableStateOf(false) // the "I'm safe" shortcut waits for the unlock (MainActivity.justUnlocked)
     var name by mutableStateOf(prefs.getString("name", "") ?: "")
     var invite by mutableStateOf<SavedGroup?>(null)          // an invite link that was opened
     var shareLocation by mutableStateOf(prefs.getBoolean("shareLocation", false))
@@ -110,9 +111,21 @@ class MainActivity : ComponentActivity() {
     }
     fun lockNow() { state.locked = true; Notifier.onScreen = false; Notifier.inApp = null }
     fun unlocked() { state.locked = false; Notifier.onScreen = true; Notifier.inApp = { a -> state.banner = a } }
-    /** The lock screen's unlock worked: what waited for it can happen now. */
-    fun justUnlocked() { AppLock.left(stillLocked = false); unlocked(); afterUnlock?.invoke(); afterUnlock = null }
+    /**
+     * The lock screen's unlock worked: what waited for it can happen now, if it hasn't waited too long ([WaitingSafe]):
+     * someone else could have tapped the shortcut and left it for the owner's next unlock.
+     */
+    fun justUnlocked() {
+        AppLock.left(stillLocked = false); unlocked()
+        val f = afterUnlock; afterUnlock = null; state.waitingSafe = false
+        if (f == null) return
+        if (WaitingSafe.stillWanted(afterUnlockAt, android.os.SystemClock.elapsedRealtime())) f()
+        else Toast.makeText(this, "“I'm safe” wasn't sent: it waited too long for the unlock. Send it again if you still want to.", Toast.LENGTH_LONG).show()
+    }
     private var afterUnlock: (() -> Unit)? = null
+    private var afterUnlockAt = 0L
+    /** The lock screen's "Don't send". */
+    fun dropWaiting() { afterUnlock = null; state.waitingSafe = false }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -151,7 +164,8 @@ class MainActivity : ComponentActivity() {
         link(i)
         val group = i.getStringExtra(Actions.EXTRA_GROUP)
         if (state.group != null && i.component?.className == Actions.ALIAS) when (i.action) { // never from another app
-            Actions.SAFE -> { val send = { whenReady { checkIn(this, state, CheckIn.SAFE) } }; if (state.locked) afterUnlock = send else send() }
+            Actions.SAFE -> { val send = { whenReady { checkIn(this, state, CheckIn.SAFE) } }
+                if (state.locked) { afterUnlock = send; afterUnlockAt = android.os.SystemClock.elapsedRealtime(); state.waitingSafe = true } else send() }
             Actions.HELP -> { showGroup(group); state.sheet = null; state.helpGroup = group; state.askHelp = true }
             Actions.CHAT -> { showGroup(group); state.sheet = null; state.everyone = false; state.tab = 1 }
         }

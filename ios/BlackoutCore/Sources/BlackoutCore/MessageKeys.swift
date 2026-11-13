@@ -144,4 +144,17 @@ public enum History {
         let m = Message(id: id, ts: Int64(bitPattern: ts), sender: sender, name: name, text: msg, photo: photo)
         return Saved(group: group, epoch: epoch, opened: GroupCrypto.Opened(message: m, signature: sig, digest: digest, extra: extra.isEmpty ? nil : extra), index: index, counter: counter)
     }
+
+    /// True if copy `s` goes with the epochs in `gone`, which this phone has just deleted from its group: the copy goes
+    /// when the epoch is deleted (spec "This phone's copy"), at once and not at the next read of the store. A copy kept
+    /// before epochs had an id names its epoch by hash: it goes only if no epoch still `held` has that hash or id, since
+    /// it would still be shown with that one. Same rule as Android's History.goesWith.
+    public static func goes(_ s: Saved, with gone: [Keyring.Epoch], held: [Keyring.Epoch]) -> Bool {
+        gone.contains { $0.id == s.epoch } || (gone.contains { $0.hash == s.epoch } && !held.contains { $0.id == s.epoch || $0.hash == s.epoch })
+    }
+
+    /// The largest copy a store of copies must read back: `seal` adds about 258 bytes (nonce, tag, lengths, the group id
+    /// and the 64-character epoch id) to the fields of a packet of up to `Packet.maxCipher` bytes, so the copy of a legal
+    /// message can be longer than any packet. 1 KiB of room covers that.
+    public static let maxSealed = Packet.maxCipher + 1_024
 }

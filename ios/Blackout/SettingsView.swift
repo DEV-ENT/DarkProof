@@ -10,11 +10,14 @@ import BlackoutCore
 /// blank screen. Asking for help never needs it: the lock screen has the button, and shortcuts keep working. Main thread.
 final class AppLock: ObservableObject {
     static let shared = AppLock()
-    private static let graceSeconds: TimeInterval = 60
     @Published private(set) var enabled = UserDefaults.standard.bool(forKey: "appLock")
     private(set) var isLocked = false
-    private var unlockedOnce = false, leftAt: Date?
+    // When the app was left: on a clock nobody can set, which keeps counting while the phone sleeps. The phone's date
+    // and time can be set back in Settings, which made the time away negative and skipped the lock.
+    private var unlockedOnce = false, leftAt: ContinuousClock.Instant?
     private var window: UIWindow? // above everything, sheets included
+    private var covered: [UIWindow] = [] // the app's own windows, out of VoiceOver's and touch's reach while locked
+    private weak var keyBefore: UIWindow? // made key again on unlocking
     private var context: LAContext?
 
     /// False if the phone has no passcode: there would be nothing to ask for.
@@ -57,11 +60,12 @@ final class AppLock: ObservableObject {
         switch phase {
         case .active:
             if isLocked { return }
-            if !unlockedOnce || leftAt.map({ Date().timeIntervalSince($0) >= Self.graceSeconds }) == true { lock() } else { hide() }
+            let away = leftAt.map { Self.seconds(ContinuousClock.now - $0) }
+            if LockGrace.asksAgain(unlockedOnce: unlockedOnce, awaySeconds: away) { lock() } else { hide() }
         case .inactive:
             if !isLocked { show(AnyView(LockCover())) }
         case .background:
-            leftAt = Date()
+            leftAt = ContinuousClock.now
             if !isLocked { show(AnyView(LockCover())) }
         @unknown default: break
         }
@@ -71,6 +75,21 @@ final class AppLock: ObservableObject {
         isLocked = true
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) // the keyboard would stay on top
         show(AnyView(LockView()))
+        // The app stays loaded under the lock: VoiceOver, Voice Control, Speak Screen and a keyboard reach only the lock.
+        guard let w = window else { return }
+        w.rootViewController?.view.accessibilityViewIsModal = true
+        if let k = w.windowScene?.keyWindow, k !== w { keyBefore = k }
+        w.makeKey()
+        for other in w.windowScene?.windows ?? [] where other !== w && !covered.contains(where: { $0 === other }) {
+            other.accessibilityElementsHidden = true
+            other.isUserInteractionEnabled = false
+            covered.append(other)
+        }
+        UIAccessibility.post(notification: .screenChanged, argument: w.rootViewController?.view)
+    }
+
+    private static func seconds(_ d: Duration) -> Double {
+        Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18
     }
 
     private func show(_ v: AnyView) {
@@ -82,7 +101,13 @@ final class AppLock: ObservableObject {
         window = w
     }
 
-    private func hide() { window?.isHidden = true; window = nil }
+    private func hide() {
+        window?.isHidden = true; window = nil
+        for w in covered { w.accessibilityElementsHidden = false; w.isUserInteractionEnabled = true }
+        covered = []
+        if let k = keyBefore, !k.isHidden { k.makeKey() }
+        keyBefore = nil
+    }
 }
 
 /// In the app switcher, and while something else is in front.

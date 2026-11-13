@@ -54,7 +54,7 @@ fun DarkProofApp(s: AppState, a: MainActivity) {
                     if (created) s.sheet = Sheet.Invite
                 }
             } else if (s.locked) {
-                LockScreen(a)
+                LockScreen(a, s.waitingSafe)
             } else if (s.introPermissions) {
                 PermissionIntro(a)
             } else {
@@ -73,7 +73,7 @@ fun DarkProofApp(s: AppState, a: MainActivity) {
 
 /** "Lock DarkProof": nothing of the app shows here, but asking for help doesn't need unlocking. */
 @Composable
-private fun LockScreen(a: MainActivity) {
+private fun LockScreen(a: MainActivity, waitingSafe: Boolean) {
     var ask by remember { mutableStateOf(false) }
     var sent by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(24.dp),
@@ -84,6 +84,10 @@ private fun LockScreen(a: MainActivity) {
         PrimaryButton("Unlock") { AppLock.ask(a, "Unlock DarkProof") { a.justUnlocked() } }
         DangerButton("I need help") { ask = true }
         if (sent) Txt("Sent to your group.", 16, FontWeight.SemiBold, Theme.safe)
+        if (waitingSafe) { // from the shortcut: shown, so an unlock never sends it unseen
+            Txt("“I'm safe” goes to your group when you unlock, if you do within 2 minutes.", 16, color = Theme.dim)
+            GhostButton("Don't send it") { a.dropWaiting() }
+        }
     }
     if (ask) Confirm("Send “I need help”?", "Your group gets it right away. You don't need to unlock.", "Send", danger = true,
         onYes = { ask = false; QuickCheckIn.send(a, CheckIn.HELP); sent = true }, onNo = { ask = false })

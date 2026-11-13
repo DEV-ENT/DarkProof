@@ -60,9 +60,10 @@ public struct Packet: Equatable, Sendable {
         return Hex.encode(Data((0..<8).map { _ in UInt8.random(in: .min ... .max, using: &g) }))
     }
 
-    public static func decode(_ raw: Data) -> Packet? {
+    /// `limit`: the largest cipher taken. Only a store of this phone's own copies (`History.maxSealed`) takes more than a packet.
+    public static func decode(_ raw: Data, limit: Int = maxCipher) -> Packet? {
         let b = [UInt8](raw)
-        guard b.count > headerSize, b.count <= headerSize + maxCipher, b[0] == marker else { return nil }
+        guard b.count > headerSize, b.count <= headerSize + limit, b[0] == marker else { return nil }
         let ttl = Int(b[17])
         guard ttl <= maxTtl else { return nil }
         let ts = b[9..<17].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }

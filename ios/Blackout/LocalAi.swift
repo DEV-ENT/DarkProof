@@ -161,7 +161,7 @@ final class LocalAi: NSObject, ObservableObject, URLSessionDownloadDelegate {
             ?? Self.catalog.first { s[$0.id] == .ready }?.id ?? Self.catalog[0].id
         super.init()
         states = s
-        if let d = try? Data(contentsOf: Self.conversationURL), let c = try? JSONDecoder().decode([Turn].self, from: d) { conversation = c }
+        if let d = try? Data(contentsOf: Self.conversationURL), let c = try? JSONDecoder().decode([Turn].self, from: d) { conversation = c; Self.keepOffBackups() } // a file an earlier version saved too
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { [weak self] _ in
             self?.stopRequested = true
         }
@@ -378,7 +378,13 @@ final class LocalAi: NSObject, ObservableObject, URLSessionDownloadDelegate {
     }
 
     private func save() {
-        if let d = try? JSONEncoder().encode(Array(conversation.suffix(100))) { try? d.write(to: Self.conversationURL, options: .atomic) }
+        if let d = try? JSONEncoder().encode(Array(conversation.suffix(100))) { try? d.write(to: Self.conversationURL, options: .atomic); Self.keepOffBackups() }
+    }
+
+    /// The conversation stays on this phone (PRIVACY.md): it is left out of iCloud and computer backups. Set after every
+    /// write, as an atomic write replaces the file.
+    private static func keepOffBackups() {
+        var u = conversationURL, v = URLResourceValues(); v.isExcludedFromBackup = true; try? u.setResourceValues(v)
     }
 
     #if DEBUG

@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import CoreBluetooth
 import UIKit
+import UserNotifications
 import BlackoutCore
 
 /// Owns the one Engine. It starts as soon as the app process starts, if a group is set up, so it also runs when iOS
@@ -156,6 +157,7 @@ final class Engine: ObservableObject {
     private let keyLock = NSLock()
     private let knownLock = NSLock()
     private var knownDirty: [String: Keys] = [:] // group id -> keys whose saved key list is behind memory; knownLock
+    private var knownUnread: Set<String> = [] // group ids whose key-list file is there but couldn't be read (phone not unlocked yet): never written over; knownLock
     private let rescanLock = NSLock(), rescanFlag = Flag() // new keys arriving together: one reading of the store
     private final class Flag { var on = false }
     private var keyCache: [String: Keys] = [:] // code -> keys: each derivation takes 32 MiB of scrypt, so only once
@@ -342,14 +344,26 @@ final class Engine: ObservableObject {
     // MARK: - Member keys (spec/FORMAT.md, "Signatures", "Introductions")
 
     /// The public keys saved for `k`'s group: member id -> ["s": seen ms, "p": signing key hex, "e": encryption key hex, "a": when it was introduced, "q": ML-KEM key hex, "n": name].
+    /// The list is kept in a file left out of backups ("known.<group id>.plist"): UserDefaults goes into them, and the
+    /// list holds names. A list an earlier version kept in UserDefaults is read from there and moved at the next save.
     private func loadKnown(_ k: Keys) {
-        let saved = UserDefaults.standard.dictionary(forKey: "known.\(k.id)") as? [String: [String: String]] ?? [:]
+        let url = Self.knownURL(k.id), d = UserDefaults.standard
+        let file = (try? Data(contentsOf: url)).flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) } as? [String: [String: String]]
+        if file == nil && FileManager.default.fileExists(atPath: url.path) { knownLock.withLock { _ = knownUnread.insert(k.id) } }
+        if file != nil { d.removeObject(forKey: "known.\(k.id)") } // moved already
+        let old = file == nil ? d.dictionary(forKey: "known.\(k.id)") as? [String: [String: String]] : nil
+        let saved = file ?? old ?? [:]
         var out: [String: Known] = [:]
         for (id, v) in saved {
             guard let p = v["p"], let c = MemberKey.Checker(Self.unhex(p)) else { continue }
             out[id] = Known(checker: c, enc: v["e"].map(Self.unhex), name: v["n"] ?? "", encAt: Int64(v["a"] ?? "") ?? 0, pq: v["q"].map(Self.unhex), seen: Int64(v["s"] ?? "") ?? 0)
         }
         k.lock.withLock { k.known = out }
+        if old != nil { saveKnownSoon(k) } // into the file, out of UserDefaults
+    }
+
+    private static func knownURL(_ id: String) -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("known.\(id).plist")
     }
 
     /// A member's public keys from a checked introduction: kept (the 500 most recently changed per group stay), and saved
@@ -397,7 +411,13 @@ final class Engine: ObservableObject {
                 if !w.name.isEmpty { v["n"] = w.name }
                 saved[id] = v
             }
-            UserDefaults.standard.set(saved, forKey: "known.\(k.id)")
+            guard !knownLock.withLock({ knownUnread.contains(k.id) }) else { continue } // the file there would be lost
+            let url = Self.knownURL(k.id)
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard let data = try? PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0),
+                  (try? data.write(to: url, options: .atomic)) != nil else { continue } // UserDefaults keeps it meanwhile
+            var u = url, v = URLResourceValues(); v.isExcludedFromBackup = true; try? u.setResourceValues(v)
+            UserDefaults.standard.removeObject(forKey: "known.\(k.id)")
         }
     }
 
@@ -622,7 +642,7 @@ final class Engine: ObservableObject {
         case .leftOut(let number, let rank):
             // The others may have taken this key and be writing with it; this phone can't. It asks its way back with a key of its own.
             #if DEBUG
-            DebugLog.write("epoch \(number) from \(o.message.name) lists this phone, but its part doesn't open")
+            DebugLog.write("epoch \(number) lists this phone, but its part doesn't open")
             #endif
             if (k.leftOut?.number ?? 0) < number { k.leftOut = (number, rank, 0) } // read again from the store: the count stays
             work.asyncAfter(deadline: .now() + .milliseconds(Int.random(in: 0..<3_000))) { self.answerLeftOut(k) }
@@ -636,7 +656,7 @@ final class Engine: ObservableObject {
             k.removedAt = (number, rank); k.removedBy = by
             UserDefaults.standard.set("\(number):\(rank):\(by)", forKey: "removedAt.\(k.id)")
             #if DEBUG
-            DebugLog.write("removed from a group by \(o.message.name)")
+            DebugLog.write("removed from a group")
             #endif
             DispatchQueue.main.async { self.refresh() }
             return false
@@ -647,7 +667,7 @@ final class Engine: ObservableObject {
             if k.ring.current === e && maker != k.me { setRejoining(k, 0) }
             DispatchQueue.main.async { if let held = self.waitingToJoin.removeValue(forKey: k.id) { for w in held { self.send(w.text, photo: w.photo, group: k.code) } } }
             #if DEBUG
-            DebugLog.write("epoch \(r.epoch) from \(o.message.name): \(r.members.count) member(s)\(r.removal ? ", after a removal" : "")")
+            DebugLog.write("epoch \(r.epoch): \(r.members.count) member(s)\(r.removal ? ", after a removal" : "")")
             #endif
             return true
         }
@@ -681,6 +701,7 @@ final class Engine: ObservableObject {
         keyLock.withLock { keyCache.removeValue(forKey: old.code); keyCache[code] = k }
         Vault.put("door.\(k.id)", Data(code.utf8)) // where the group is now: its old codes lead here (`keys`)
         SavedGroups.replaceCode(old.code, code)
+        GroupTag.moved(from: old.code, to: code) // alerts already showing still answer this group
         let d = UserDefaults.standard
         d.removeObject(forKey: "introAt.\(k.id)") // introduce ourselves through the new door
         #if DEBUG
@@ -770,7 +791,7 @@ final class Engine: ObservableObject {
                 guard let enc, let pq, let pk = try? P256.KeyAgreement.PublicKey(x963Representation: enc),
                       let box = try? Hybrid.seal(plain, to: pk, pq: pq, info: Rekey.info(door.id), aad: Rekey.aad(pid, m)) else {
                     #if DEBUG
-                    DebugLog.write("rekey: no encryption key for \(m) yet")
+                    DebugLog.write("rekey: no encryption key for a member yet")
                     #endif
                     return false
                 }
@@ -795,7 +816,7 @@ final class Engine: ObservableObject {
         if code != nil { introIfDue(k) }
         nostr.resubscribe()
         #if DEBUG
-        DebugLog.write("epoch \(rk.epoch) made: \(members.count) member(s) in \(packets.count) packet(s)" + (answers.map { ", answering \($0)" } ?? "") + (remove.map { ", removing \($0)" } ?? ""))
+        DebugLog.write("epoch \(rk.epoch) made: \(members.count) member(s) in \(packets.count) packet(s)" + (answers == nil ? "" : ", answering a join") + (remove == nil ? "" : ", removing a member"))
         #endif
         DispatchQueue.main.async { self.refresh() }
         return true
@@ -1090,9 +1111,22 @@ final class Engine: ObservableObject {
     /// and the door's own small room). Same rules as the Android app (MeshEngine.compact).
     private func compact() {
         let now = Self.nowMs()
-        for k in keyLock.withLock({ Array(keyCache.values) }) where !k.ring.expire(now: now).isEmpty { // keys replaced more than 7 days ago go (v0.6), from the Keychain too
+        var expired: [String: (gone: [Keyring.Epoch], held: [Keyring.Epoch])] = [:] // group id -> the epochs deleted now, and those still held
+        for k in keyLock.withLock({ Array(keyCache.values) }) {
+            // A removed phone still deletes its replaced encryption keys on time (spec "Changing keys"); it only stops introducing itself.
+            if k.removed && !k.isPublic { _ = k.encs.rotateIfDue(now: Self.clock()) }
+            let gone = k.ring.expire(now: now)
+            guard !gone.isEmpty else { continue } // keys replaced more than 7 days ago go (v0.6), from the Keychain too
             saveRing(k)
             k.setDoors(k.door, old: k.oldDoors.filter { d in k.ring.all.contains { $0.via == d.code } })
+            expired[k.id] = (gone, k.ring.all)
+        }
+        let stale = copies(of: expired)
+        // Nor is an alert kept past a week, whatever happens to its message (Android: a timeout from the message's date).
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { ns in
+            let old = ns.filter { Date().timeIntervalSince($0.date) > 7 * 86_400 }.map(\.request.identifier)
+            if !old.isEmpty { center.removeDeliveredNotifications(withIdentifiers: old) }
         }
         // Over the Everyone channel's cap, not simply the oldest go: one sender can't push everyone else's messages and
         // places out (StoreCap.everyone). Who sent what is read before the store lock is taken: the main thread may be
@@ -1106,6 +1140,7 @@ final class Engine: ObservableObject {
             guard allKeys else { return [] }
             let cut = Self.nowMs() - Self.week
             var drop = Set(index.values.filter { ($0.kind == .unreadable || $0.kind == .door) && $0.ts < cut }.map(\.id))
+            drop.formUnion(stale) // the messages of an epoch deleted now: their packets no longer open either
             let pub = index.values.filter { $0.kind == .isPublic }
             if many, pub.count > Self.maxPublic {
                 // A Public packet that isn't a message is an introduction; this phone's own are the ones it wrote.
@@ -1123,6 +1158,8 @@ final class Engine: ObservableObject {
         guard !drop.isEmpty else { return }
         store.remove(drop); more.remove(drop)
         history.remove(Set(drop.map(Self.copyId)))
+        // An alert is posted under its message's id: it must not keep showing the text of a message that is gone.
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: Array(drop))
         #if DEBUG
         DebugLog.write("store: removed \(drop.count) packets")
         #endif
@@ -1415,6 +1452,23 @@ final class Engine: ObservableObject {
         return .msg(m, k, o, true)
     }
 
+    /// The names of the packets whose copies in "history.bin" go with the epochs `compact` just deleted (`History.goes`):
+    /// group id -> the epochs deleted, and those still held. A copy is sealed under its packet's name, and kept under
+    /// `copyId` of it: a name longer than that is found in the index. On `work`.
+    private func copies(of expired: [String: (gone: [Keyring.Epoch], held: [Keyring.Epoch])]) -> Set<String> {
+        guard !expired.isEmpty else { return [] }
+        let long = storeLock.withLock { Dictionary(index.keys.filter { $0.count > 16 }.map { (Self.copyId($0), $0) }, uniquingKeysWith: { a, _ in a }) }
+        var out = Set<String>()
+        history.forEach { p in
+            for name in [p.id, long[p.id]].compactMap({ $0 }) {
+                guard let s = History.open(key: Self.historyKey, id: name, blob: p.cipher) else { continue }
+                if let e = expired[s.group], History.goes(s, with: e.gone, held: e.held) { out.insert(name) }
+                break
+            }
+        }
+        return out
+    }
+
     /// Each held epoch's message keys, in the Keychain: they are saved after every message whose key was deleted.
     private func saveMessageKeys(_ k: Keys) {
         k.moveLock.withLock {
@@ -1433,6 +1487,7 @@ final class Engine: ObservableObject {
     private func sealOne(_ k: Keys, _ cr: GroupCrypto, isPublic: Bool, id: String, ts: Int64, text: String, photo: Data?) -> Data? {
         if !isPublic, let e = k.ring.currentOrNil, let keys = e.messageKeys, let i = keys.index(k.me), let n = keys.takeNext(), let mk = keys.key(i, n) {
             guard let c = try? cr.seal(messageKey: mk, index: i, counter: n, id: id, ts: ts, sender: k.me, name: name, text: text, photo: photo, sign: { try k.sign($0) }) else { return nil }
+            guard c.count <= Packet.maxCipher else { keys.forget(i, n); saveMessageKeys(k); return nil } // longer than any phone takes, and than the store reads back
             if var o = cr.open(messageKey: mk, index: i, counter: n, Packet(id: id, ts: ts, ttl: 0, cipher: c), at: ts) {
                 o.leaf = Leaf(epoch: e, index: i, counter: n)
                 remember(id, k, o)
@@ -1441,7 +1496,8 @@ final class Engine: ObservableObject {
             saveMessageKeys(k)
             return c
         }
-        return try? cr.seal(id: id, ts: ts, sender: k.me, name: name, text: text, photo: isPublic ? nil : photo, sign: { try k.sign($0) })
+        return (try? cr.seal(id: id, ts: ts, sender: k.me, name: name, text: text, photo: isPublic ? nil : photo, sign: { try k.sign($0) }))
+            .flatMap { $0.count <= Packet.maxCipher ? $0 : nil }
     }
 
     /// A valid introduction: the 4th field is 0x02 and a public key whose hash starts with the sender's id, and it signed it.
@@ -1475,7 +1531,7 @@ final class Engine: ObservableObject {
             keep(p, k.isPublic ? .isPublic : doorKind(k, id, signed: true)) // through a group's door: the group's own only from someone in it
             let fresh = learn(k, id, c, enc: enc, encAt: ts, pq: pq, name: who)
             #if DEBUG
-            if fresh { DebugLog.write("introduction \(p.id): key of \(id) (\(who))") }
+            if fresh { DebugLog.write("introduction \(p.id): a new member key") }
             #endif
             // Not in the current epoch: a request to join. It waits for an admin here to let them in.
             // At most one alert a minute in a group: the requests themselves are in the chat (`joinRequests`).
@@ -1652,14 +1708,25 @@ enum DebugLog {
         nc.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: nil) { _ in write("phone unlocked") }
     }
 
+    /// The log is kept to about 2 MB: past 1 MB it becomes "debug.old.log", replacing the one before. Neither goes in a backup.
+    private static let maxBytes: UInt64 = 1 << 20
+    private static let old = url.deletingLastPathComponent().appendingPathComponent("debug.old.log")
+
     static func write(_ s: String) {
         let line = Data("\(Int64(Date().timeIntervalSince1970 * 1000)) \(s)\n".utf8)
         lock.lock(); defer { lock.unlock() }
         if let h = try? FileHandle(forWritingTo: url) {
-            defer { try? h.close() }
-            _ = try? h.seekToEnd(); try? h.write(contentsOf: line)
+            let end = (try? h.seekToEnd()) ?? 0
+            try? h.write(contentsOf: line)
+            try? h.close()
+            if end + UInt64(line.count) > maxBytes {
+                try? FileManager.default.removeItem(at: old)
+                try? FileManager.default.moveItem(at: url, to: old)
+                var u = old, v = URLResourceValues(); v.isExcludedFromBackup = true; try? u.setResourceValues(v) // a log an earlier version began
+            }
         } else {
             try? line.write(to: url)
+            var u = url, v = URLResourceValues(); v.isExcludedFromBackup = true; try? u.setResourceValues(v)
         }
     }
 }

@@ -16,6 +16,18 @@ object Cut {
         if (s.length <= max) s else s.take(max.coerceAtLeast(0)).let { if (it.isNotEmpty() && it.last().isHighSurrogate()) it.dropLast(1) else it }
 }
 
+/** How long a message alert stays (spec "Alerts"). */
+object AlertLife {
+    const val WEEK_MS = 7 * 24 * 3_600_000L
+
+    /**
+     * The timeout of an alert for a message dated [ts], posted at [now]: it goes a week after the message's date, before
+     * the phone can delete the message itself, so its text doesn't outlive the message. A minute at least, for a message
+     * that arrives that late; a week at most, for one dated ahead.
+     */
+    fun timeout(ts: Long, now: Long): Long = (ts + WEEK_MS - now).coerceIn(60_000L, WEEK_MS)
+}
+
 /**
  * Keys for the rows of a list. A lazy list ends the app when two of its rows have the same key, so a key that was given
  * out before comes back with "#2", "#3"…: the same rows in the same order always get the same keys. One per list;

@@ -470,7 +470,7 @@ object MeshEngine {
             Keyring.Taken.Ignored -> false
             is Keyring.Taken.LeftOut -> {
                 // The others may have taken this key and be writing with it; this phone can't. It asks its way back with a key of its own.
-                DebugTools.log("epoch ${t.number} from ${x.o.message.name} lists this phone, but its part doesn't open")
+                DebugTools.log("epoch ${t.number} lists this phone, but its part doesn't open")
                 if ((k.leftOut?.number ?: 0L) < t.number) k.leftOut = LeftOut(t.number, t.rank, 0) // read again from the store: the count stays
                 main.postDelayed({ io.execute { answerLeftOut(k) } }, rnd.nextInt(3_000).toLong())
                 false
@@ -478,7 +478,7 @@ object MeshEngine {
             Keyring.Taken.Closed -> { k.closed = true; prefs?.edit()?.putBoolean("closed.${k.id}", true)?.apply(); false } // saved: the keyring takes no key through this code from now on
             is Keyring.Taken.Removed -> {
                 k.removedAt = t.number to t.rank; k.removedBy = t.by; prefs?.edit()?.putString("removedAt.${k.id}", "${t.number}:${t.rank}:${t.by}")?.apply()
-                DebugTools.log("removed from a group by ${x.o.message.name}")
+                DebugTools.log("removed from a group")
                 false
             }
             is Keyring.Taken.Added -> {
@@ -487,7 +487,7 @@ object MeshEngine {
                 saveRing(k)
                 if (k.ring.current() === t.epoch && maker != k.me) setRejoining(k, 0)
                 synchronized(waiting) { waiting.remove(k.id) }?.let { held -> io.execute { held.forEach { post(false, it.from, it.text, false, it.photo, k.code) } } }
-                DebugTools.log("epoch ${r.epoch} from ${x.o.message.name}: ${r.members.size} member(s)${if (r.removal) ", after a removal" else ""}")
+                DebugTools.log("epoch ${r.epoch}: ${r.members.size} member(s)${if (r.removal) ", after a removal" else ""}")
                 true
             }
         }.also { if (k.ring.partsToSave()) saveParts(k) } // a part opened for an epoch this phone holds already: not opened again either
@@ -637,7 +637,7 @@ object MeshEngine {
                 val to = (if (m == k.me) k.encPub else known?.enc)?.let(P256::fromUncompressed)
                 val pq = if (m == k.me) k.encs.currentPq() else known?.pq
                 val box = if (to != null && pq != null) Hybrid.seal(plain, to, pq, Rekey.info(door.id), Rekey.aad(pid, m)) else null
-                m to (box ?: run { DebugTools.log("rekey: no encryption key for $m yet"); return false })
+                m to (box ?: run { DebugTools.log("rekey: no encryption key for a member yet"); return false })
             }
             val one = Rekey(cur.number + 1, now, k.pub, list, remove ?: answers, parts, remove != null, members).also { rk = it }
             door.rekeys.packet(pid, now, door.rekeys.seal(pid, now, k.me, name, "", extra = one.encode(), pad = Pad.FULL) { k.sign(it) }) // always the largest size: its length would count the members
@@ -653,7 +653,7 @@ object MeshEngine {
         }
         if (code != null) introIfDue(k)
         nostr?.resubscribe() // the new epoch's mailbox
-        DebugTools.log("epoch ${made.epoch} made: ${members.size} member(s) in ${packets.size} packet(s)" + (answers?.let { ", answering $it" } ?: "") + (remove?.let { ", removing $it" } ?: ""))
+        DebugTools.log("epoch ${made.epoch} made: ${members.size} member(s) in ${packets.size} packet(s)" + (if (answers != null) ", answering a join" else "") + (if (remove != null) ", removing a member" else ""))
         notifyUi()
         return true
     }
@@ -698,7 +698,7 @@ object MeshEngine {
             if (i < 0 || messages[i].verified) continue
             if (ok) { messages[i] = messages[i].copy(verified = true); w.o.leaf?.forget(); saveMessageKeys(w.k) } else { messages.removeAt(i); messageIds.remove(row); shownAs.remove(w.o.mark); index[row]?.let { x -> index[x.id] = StoreCap.Entry(x.id, x.ts, x.size, StoreCap.Kind.UNREADABLE) } }
         }
-        DebugTools.log("key of $id: checked ${waited.size} waiting packet(s)")
+        DebugTools.log("a member's key: checked ${waited.size} waiting packet(s)")
     }
 
     /**
@@ -766,6 +766,19 @@ object MeshEngine {
     fun groupId(code: String?): String? {
         if (code == null) return null
         return synchronized(keyCache) { keyCache[code] ?: keyCache.values.firstOrNull { k -> k.oldDoors.any { it.code == code } } }?.id
+    }
+
+    /**
+     * The code the group of [code] has now, if [code] is one it has moved on from ([moveDoor] notes where it went), or
+     * null. Through the saved notes, not only the cache, so it also works right after a restart. Slow the first time
+     * (derives the door): call in the background.
+     */
+    fun movedCode(code: String): String? {
+        val c = app ?: return null
+        synchronized(keyCache) { keyCache.values.firstOrNull { k -> k.oldDoors.any { it.code == code } } }?.let { return it.door.code }
+        val door = Door(code).id
+        val id = Vault.get(c, "origin.$door")?.let { String(it) } ?: door
+        return Vault.get(c, "door.$id")?.let { String(it) }?.takeIf { it != code }
     }
 
     /** This phone's public key in [code]'s group (Person emoji: "your emoji"), or null if its keys aren't ready. */
@@ -912,13 +925,19 @@ object MeshEngine {
     private fun compact() {
         if (!allKeys) return
         val now = System.currentTimeMillis()
+        val expired = HashMap<String, Pair<List<Keyring.Epoch>, List<Keyring.Epoch>>>() // group id -> the epochs deleted now, and those still held
         synchronized(keyCache) { keyCache.values.toList() }.forEach { k -> // keys replaced more than 7 days ago go (v0.6), from the vault too
-            if (k.ring.expire(now).isNotEmpty()) { saveRing(k); k.oldDoors = k.oldDoors.filter { d -> k.ring.all().any { it.via == d.code } } }
+            // A removed phone still deletes its replaced encryption keys on time (spec "Changing keys"); it only stops introducing itself.
+            if (k.removed && !k.isPublic) k.encs.rotateIfDue(clock())
+            val gone = k.ring.expire(now)
+            if (gone.isNotEmpty()) { saveRing(k); k.oldDoors = k.oldDoors.filter { d -> k.ring.all().any { it.via == d.code } }; expired[k.id] = gone to k.ring.all() }
         }
+        val stale = copiesOf(expired)
         val gone = synchronized(messages) {
             val cut = System.currentTimeMillis() - WEEK
             val drop = LinkedHashSet<String>()
             index.values.filter { (it.kind == StoreCap.Kind.UNREADABLE || it.kind == StoreCap.Kind.DOOR) && it.ts < cut }.mapTo(drop) { it.id }
+            drop += stale // the messages of an epoch deleted now: their packets no longer open either
             val pub = index.values.filter { it.kind == StoreCap.Kind.PUBLIC }
             if (pub.size > MAX_PUBLIC) {
                 // Not simply the oldest: one sender can't push everyone else's messages and places out (StoreCap.everyone).
@@ -937,11 +956,32 @@ object MeshEngine {
                 for (id in drop) index.remove(id)?.let { indexBytes -= it.size; if (it.kind == StoreCap.Kind.DOOR) { doorCount--; doorBytes -= it.size } }
                 messages.removeAll { it.id in drop }; messageIds.removeAll(drop); shownAs.values.removeAll(drop)
                 unchecked.forget(drop); deliveries.forget(drop) // nothing waits for, or confirms, a message that is gone
+                app?.let { Notifier.forget(it, drop) } // nor does an alert show its text
             }
             drop.size
         }
         compacting = false
         if (gone > 0) { DebugTools.log("store: removed $gone packets"); notifyUi() }
+    }
+
+    /**
+     * The ids of the copies in table h that go with the epochs [compact] just deleted ([History.goesWith]): group id ->
+     * the epochs deleted, and those still held. Background thread.
+     */
+    private fun copiesOf(expired: Map<String, Pair<List<Keyring.Epoch>, List<Keyring.Epoch>>>): List<String> {
+        if (expired.isEmpty()) return emptyList()
+        val d = db ?: return emptyList(); val key = historyKey ?: return emptyList()
+        val out = ArrayList<String>()
+        runCatching {
+            d.rawQuery("SELECT id,data FROM h", null).use { q ->
+                while (q.moveToNext()) {
+                    val id = q.getString(0); val s = History.open(key, id, q.getBlob(1)) ?: continue
+                    val (gone, held) = expired[s.group] ?: continue
+                    if (History.goesWith(s, gone, held)) out += id
+                }
+            }
+        }
+        return out
     }
 
     /** The store grew well past its cap while running: trim it in the background. */
@@ -1033,7 +1073,7 @@ object MeshEngine {
                 is Seen.Intro -> {
                     save(p, if (x.k.isPublic) StoreCap.Kind.PUBLIC else doorKind(x.k, x.id, true)) // through a group's door: the group's own only from someone in it
                     val fresh = learn(x.k, x.id, x.pub, x.key, x.enc, x.name, x.ts, x.pq)
-                    if (fresh) DebugTools.log("introduction ${p.id}: key of ${x.id} (${x.name})")
+                    if (fresh) DebugTools.log("introduction ${p.id}: a new member key")
                     resolve(x.k, x.id)
                     // Not in the current epoch: a request to join. It waits for an admin here to let them in.
                     val k = x.k
@@ -1077,7 +1117,7 @@ object MeshEngine {
                         // It waits for its sender's key only as the message shown under its id: another packet with that id, checked later, must not mark or remove this row.
                         if (ok == null) unchecked.message(x.o.key, x.k, x.o.message.sender, m.id, fresh, Pending(x.k, x.o, null))
                         if (fresh && !m.public && m.sender == deviceId) deliveries.sent(x.k.id, m.id) // written here before the store was lost: its receipts count again
-                        DebugTools.log("received ${p.id} ${if (m.public) "public" else "group"} from ${m.name} photo=${m.photo?.size ?: 0} verified=${m.verified}")
+                        DebugTools.log("received ${p.id} ${if (m.public) "public" else "group"} photo=${m.photo?.size ?: 0} verified=${m.verified}")
                         // Not for a message already shown: another packet under its id, sealed again by a member, alerts and confirms nothing.
                         if (fresh && !m.public && m.sender != deviceId) { incoming = m; receiptKey = x.k }
                         if (x.k.rejoining && m.sender != deviceId && m.ts >= x.k.rejoiningSince) setRejoining(x.k, 0) // someone wrote in a key this phone has: it's back
@@ -1090,7 +1130,7 @@ object MeshEngine {
                         true -> {
                             deliveries.add(x.k.id, x.r)
                             val confirmed = Receipt.ids(x.r.text); val mineNow = synchronized(ids) { confirmed.count { it in mine } }
-                            DebugTools.log("receipt ${p.id} from ${x.r.name} confirms ${confirmed.size} message(s), $mineNow of mine")
+                            DebugTools.log("receipt ${p.id} confirms ${confirmed.size} message(s), $mineNow of mine")
                         }
                         null -> unchecked.receipt(x.o.key, x.k, x.o.message.sender, Pending(x.k, x.o, x.r))
                         false -> DebugTools.log("dropped receipt ${p.id}: signature doesn't check")

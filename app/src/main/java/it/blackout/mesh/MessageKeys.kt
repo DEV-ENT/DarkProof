@@ -131,4 +131,13 @@ object History {
             Saved(group, epoch, GroupCrypto.Opened(Message(id, ts, sender, name, text, photo = photo), signature, digest, extra), index, counter)
         }
     }.getOrNull()
+
+    /**
+     * True if copy [s] goes with the epochs in [gone], which this phone has just deleted from its group: the copy goes
+     * when the epoch is deleted (spec "This phone's copy"), at once and not at the next read of the store. A copy kept
+     * before epochs had an id names its epoch by hash: it goes only if no epoch still [held] has that hash or id, since
+     * it would still be shown with that one.
+     */
+    fun goesWith(s: Saved, gone: List<Keyring.Epoch>, held: List<Keyring.Epoch>): Boolean =
+        gone.any { it.id == s.epoch } || (gone.any { it.hash == s.epoch } && held.none { it.id == s.epoch || it.hash == s.epoch })
 }

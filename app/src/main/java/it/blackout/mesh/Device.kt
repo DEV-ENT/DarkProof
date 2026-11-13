@@ -487,6 +487,7 @@ object Notifier {
             .setSmallIcon(R.drawable.ic_notifications).setContentTitle(if (hide) "DarkProof" else a.title).setContentText(body)
             .setStyle(android.app.Notification.BigTextStyle().bigText(body))
             .setContentIntent(open(c, id, m.group)).setAutoCancel(true).setGroup("group")
+        n.setTimeoutAfter(AlertLife.timeout(m.ts, System.currentTimeMillis())) // its text must not outlive the message
         if (a.ask) {
             if (!hide) n.addAction(android.app.Notification.Action.Builder(null, "I'm safe", PendingIntent.getBroadcast(c, id,
                 Intent(c, AnswerReceiver::class.java).putExtra(Actions.EXTRA_GROUP, m.group).putExtra(AnswerReceiver.NOTIFICATION, id),
@@ -496,6 +497,15 @@ object Notifier {
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)).build())
         }
         c.getSystemService(NotificationManager::class.java).notify(id, n.build())
+        synchronized(posted) { posted[id] = m.id }
+    }
+
+    private val posted = HashMap<Int, String>() // notification id -> the message it shows now, while the app runs
+
+    /** The messages [ids] were deleted: their alerts go too, as they show their text ([AlertLife] covers the rest). */
+    fun forget(c: Context, ids: Collection<String>) {
+        val gone = synchronized(posted) { posted.filterValues { it in ids }.keys.toList().onEach { posted.remove(it) } }
+        if (gone.isNotEmpty()) c.getSystemService(NotificationManager::class.java)?.let { nm -> gone.forEach(nm::cancel) }
     }
 
     /** Opens DarkProof on [group]'s chat. */

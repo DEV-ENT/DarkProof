@@ -32,7 +32,11 @@ object Actions {
 object QuickCheckIn {
     fun ready(c: Context) = Groups.code(c) != null
 
-    /** Sends [check] to [group] (the group in use if null); [done] runs on a background thread with false if there is no group. */
+    /**
+     * Sends [check] to [group] (the group in use if null), under its new code if a removal gave it one ([AnswerGroup]);
+     * [done] runs on a background thread with false if there is no group, or if [group] isn't saved here any more:
+     * then nothing is sent, not to another group, and a toast says so.
+     */
     fun send(c: Context, check: CheckIn, group: String? = null, done: (Boolean) -> Unit = {}) {
         val app = c.applicationContext
         val prefs = app.getSharedPreferences("mesh", 0)
@@ -40,8 +44,15 @@ object QuickCheckIn {
         if (name == null || code == null) { done(false); return }
         Thread {
             MeshEngine.start(app, name, code) // does nothing if it runs already
+            val to = AnswerGroup.of(group, { Groups.find(app, it) != null }, MeshEngine::movedCode) as? AnswerTo.Group
+            if (to == null) {
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    Toast.makeText(app, "Not sent: the group that asked isn't on this phone any more. Open DarkProof to answer.", Toast.LENGTH_LONG).show()
+                }
+                done(false); return@Thread
+            }
             val spot = if (prefs.getBoolean("shareLocation", false)) runCatching { Locator.lastKnown(app) }.getOrNull() else null
-            MeshEngine.send(check.text(batteryPercent(app), spot), group = group?.takeIf { Groups.find(app, it) != null })
+            MeshEngine.send(check.text(batteryPercent(app), spot), group = to.code)
             MeshService.start(app) // passes it on, also if the user stopped DarkProof before
             done(true)
         }.start()
@@ -54,6 +65,11 @@ class AnswerReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         val pending = goAsync()
         val id = i.getIntExtra(NOTIFICATION, 0)
+        // Not offered while "Lock DarkProof" is on ([Notifier]); one from before it was turned on isn't sent either.
+        if (AppLock.enabled(c)) {
+            Toast.makeText(c, "Open DarkProof and unlock it to say you're safe.", Toast.LENGTH_LONG).show()
+            pending.finish(); return
+        }
         QuickCheckIn.send(c, CheckIn.SAFE, i.getStringExtra(Actions.EXTRA_GROUP)) { ok ->
             if (ok) c.getSystemService(NotificationManager::class.java).cancel(id)
             pending.finish()

@@ -165,6 +165,8 @@ Used to give a new epoch secret to one member only (see "New keys").
 - **Changing keys:** a phone makes a new encryption key and ML-KEM key for a group when its current one is 7 days old, and
   introduces itself at once. It keeps a replaced key for 14 days, so new keys sealed to it can still be opened, then
   deletes it. Someone who later takes the phone can open recorded new keys only from about the last three weeks.
+  A phone that was removed from the group keeps to this schedule (checked every hour), so its keys go on time too;
+  it only stops introducing itself, and its new keys are never sent.
 
 ## Doors and epochs
 
@@ -315,7 +317,8 @@ epoch if there is none:
 - A code the group has moved on from isn't a second group. On a phone that has the group saved under its new code,
   joining with the old code (an old invite) or writing to it leads to that group, and the old code isn't saved: only
   one set of keys reads and writes a group's epochs.
-- The removed phone stops writing to the group and introducing itself. It can be told by mistake by a removal that
+- The removed phone stops writing to the group and introducing itself, and still deletes its replaced encryption keys
+  on time ("Changing keys"). It can be told by mistake by a removal that
   loses; a more senior removal that includes it undoes that: one with the same number, or one with a lower number
   whose maker comes before the maker of the removal that removed it, in the admin list of the epoch before the lower
   one. A phone named by a removal that wins this way from a lower number is removed.
@@ -399,6 +402,13 @@ Each group message has its own key, which a phone deletes once the message has b
   the real one off the screen. This holds on the Public channel too.
 - **This phone's copy:** the app can no longer re-read a message from its packet, so it keeps a copy sealed with a key that stays
   on the phone. The copy goes when the packet goes or when the epoch is deleted, so history lasts as long as before.
+  When the epoch is deleted, the copies sealed under it, their packets (which no longer open) and their messages on
+  screen go at once, not at the next read of the store. A copy can be up to about 1 KiB longer than the largest packet
+  (it adds the group and epoch ids, lengths, nonce and tag); a phone's store of copies reads back copies up to 1 KiB
+  over `maxCipher`, and a phone never seals a packet of its own over `maxCipher`.
+- **Alerts:** an alert shows a message's text, so it must not outlive the message. When a phone deletes a message, its
+  alert goes too (iPhone: alerts are posted under the message id; Android: while the app runs). An alert also goes
+  by itself: on Android a week after the message's date (a minute at least), on iPhone a week after it was posted.
 - **What this protects:** someone who records traffic and later takes a phone's keys can't open a message that phone has already
   handled, except through the copies on the phone, which last one to two weeks. A message the phone hasn't received yet can
   still be opened with those keys. As in Signal's groups, a thief who keeps the keys can follow later messages of that
@@ -619,6 +629,9 @@ A group message that asks everyone, or one person, to check in:
   two forms.
 - It is for everyone, or for the members whose name has the same key as in "Reports about others". Apps offer them
   one-tap answers, which are ordinary check-ins (`✅ I'm safe`, `🆘 I need help`).
+- A one-tap answer goes to the group that asked. If a removal has given that group a new code since the request
+  arrived, it goes to the group under its new code (see "Removals and the code"). If the phone no longer has that
+  group, the answer isn't sent, and never goes to the group in use instead.
 - Vectors: `kind: ask`.
 
 ## Photos

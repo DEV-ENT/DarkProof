@@ -80,6 +80,23 @@ enum GroupTag {
         let all = SavedGroups.all().map(\.code) + [GroupSecrets.shared.code]
         return all.first { !$0.isEmpty && of($0) == tag }
     }
+
+    private static let movesKey = "movedTags"
+
+    /// A removal gave the group of `old` the code `new`: alerts made before it still lead to that group. Only tags are
+    /// kept, like in the alerts themselves.
+    static func moved(from old: String, to new: String) {
+        let d = UserDefaults.standard
+        d.set(AnswerGroup.noting(from: of(old), to: of(new), in: d.stringArray(forKey: movesKey) ?? []), forKey: movesKey)
+    }
+
+    /// Where a one-tap answer under the alert tagged `tag` goes: that group under the code it has now, the group in
+    /// use if the alert named none, or nowhere if the group isn't saved here any more (`AnswerGroup`).
+    static func answer(for tag: String?) -> AnswerGroup.To {
+        var saved: [String: String] = [:]
+        for c in SavedGroups.all().map(\.code) + [GroupSecrets.shared.code] where !c.isEmpty { saved[of(c)] = c }
+        return AnswerGroup.of(tag: tag, saved: saved, moves: UserDefaults.standard.stringArray(forKey: movesKey) ?? [])
+    }
 }
 
 /// What has been read: the newest message time seen per group (by its tag, so no code is saved here) and "everyone" for

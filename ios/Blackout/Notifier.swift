@@ -15,11 +15,20 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     private var task = UIBackgroundTaskIdentifier.invalid
     private let center = UNUserNotificationCenter.current()
 
-    /// The answers under "Are you safe?". With "Lock DarkProof" on, "I'm safe" needs the phone unlocked: whoever holds it can't say it for you.
+    /// The answers under "Are you safe?". With "Lock DarkProof" on there is no "I'm safe": the phone's own unlock
+    /// isn't DarkProof's, and whoever holds an unlocked phone mustn't say it for you (as on Android and in Shortcuts).
     func updateActions() {
-        let safe = UNNotificationAction(identifier: "safe", title: "I'm safe", options: AppLock.shared.enabled ? [.authenticationRequired] : [])
+        let safe = UNNotificationAction(identifier: "safe", title: "I'm safe", options: [])
         let help = UNNotificationAction(identifier: "help", title: "I need help", options: [.foreground, .destructive])
-        center.setNotificationCategories([UNNotificationCategory(identifier: Self.askCategory, actions: [safe, help], intentIdentifiers: [])])
+        let actions = AppLock.shared.enabled ? [help] : [safe, help]
+        center.setNotificationCategories([UNNotificationCategory(identifier: Self.askCategory, actions: actions, intentIdentifiers: [])])
+    }
+
+    /// Why a one-tap answer wasn't sent, as an alert: "I'm safe" answers without opening DarkProof.
+    private func notSent(_ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = "DarkProof"; c.body = body; c.sound = .default
+        center.add(UNNotificationRequest(identifier: "not-sent-\(UUID().uuidString)", content: c, trigger: nil))
     }
 
     func setUp() {
@@ -188,15 +197,27 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
                                 withCompletionHandler done: @escaping () -> Void) {
         let info = r.notification.request.content.userInfo
         let tab = (info["tab"] as? Int).flatMap(Nav.Tab.init(rawValue:)) ?? .chat
-        let code = (info["group"] as? String).flatMap(GroupTag.code(for:))
+        // The group that asked, under the code it has now: a removal may have given it a new one since the alert came.
+        let answer = GroupTag.answer(for: info["group"] as? String)
+        let code: String? = if case .group(let c) = answer { c } else { nil }
         DispatchQueue.main.async {
             Mesh.shared.startIfSetUp()
             switch r.actionIdentifier {
             case "safe":
+                // Not offered with the lock on; one from an alert made before it was turned on isn't sent either.
+                if AppLock.shared.enabled { self.notSent("Open DarkProof and unlock it to say you're safe."); return done() }
+                guard answer != .gone else {
+                    self.notSent("“I'm safe” wasn't sent: the group that asked isn't on this phone any more. Open DarkProof to answer.")
+                    return done()
+                }
                 guard let e = Mesh.shared.engine else { return done() }
                 e.checkIn(.safe, group: code, done: done)
             case "help":
                 Nav.shared.open(group: code, tab: .people)
+                guard answer != .gone else { // never to another group than the one that asked
+                    Nav.shared.toast("Not sent: the group that asked isn't on this phone any more.")
+                    return done()
+                }
                 guard let e = Mesh.shared.engine else { return done() }
                 e.checkIn(.help, group: code, done: done)
             default:

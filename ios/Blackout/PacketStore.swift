@@ -12,6 +12,9 @@ final class PacketStore {
     enum Naming { case id, first, key }
     private let naming: Naming
     private let url: URL
+    /// The largest cipher a record may hold, written or read: a packet's, or for the copies in "history.bin" `History.maxSealed`.
+    /// A longer record is never written, as the reader would take it for damage and stop there.
+    private let limit: Int
     private let lock = NSLock() // appends and rewrites; reading needs no lock (a rewrite replaces the file atomically)
     private static let piece = 1 << 20
 
@@ -21,11 +24,22 @@ final class PacketStore {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         url = dir.appendingPathComponent(file)
+        limit = file == "history.bin" ? History.maxSealed : Packet.maxCipher
         // Protocol v0.5: older packets were sealed with v0.4 keys that no phone uses any more (and no longer decode).
         if file == "packets.bin" && !UserDefaults.standard.bool(forKey: "storeV05") {
             try? FileManager.default.removeItem(at: url)
             UserDefaults.standard.set(true, forKey: "storeV05")
         }
+        excludeFromBackup() // a file kept by an earlier version too
+    }
+
+    /// The store stays on this phone: never in an iCloud or computer backup (PRIVACY.md, "What stays on your phone").
+    /// Set again after each rewrite, which replaces the file.
+    private func excludeFromBackup() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        var u = url, v = URLResourceValues()
+        v.isExcludedFromBackup = true
+        try? u.setResourceValues(v)
     }
 
     /// Calls `body` with every stored packet, in the order they were stored, reading 1 MB at a time. Any thread; may
@@ -33,7 +47,7 @@ final class PacketStore {
     func forEach(_ body: (Packet) -> Void) {
         guard let h = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? h.close() }
-        Self.records(h) { _, p in if let p { body(p) } }
+        Self.records(h, limit) { _, p in if let p { body(p) } }
     }
 
     /// Like `forEach`, with the name each packet goes by (`Naming`).
@@ -41,7 +55,7 @@ final class PacketStore {
         guard let h = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? h.close() }
         var seen = Set<String>()
-        Self.records(h) { _, p in if let p { body(p, name(p, &seen)) } }
+        Self.records(h, limit) { _, p in if let p { body(p, name(p, &seen)) } }
     }
 
     /// `seen`: the ids of the records before this one.
@@ -63,7 +77,7 @@ final class PacketStore {
         let tmp = url.appendingPathExtension("new")
         guard FileManager.default.createFile(atPath: tmp.path, contents: nil), let out = try? FileHandle(forWritingTo: tmp) else { return }
         var pending = Data(), seen = Set<String>()
-        Self.records(h) { record, p in
+        Self.records(h, limit) { record, p in
             guard let p, !ids.contains(name(p, &seen)) else { return } // unreadable records go too
             pending.append(record)
             if pending.count >= Self.piece { try? out.write(contentsOf: pending); pending = Data() }
@@ -71,6 +85,7 @@ final class PacketStore {
         try? out.write(contentsOf: pending)
         try? out.close()
         if Foundation.rename(tmp.path, url.path) != 0 { try? FileManager.default.removeItem(at: tmp) }
+        excludeFromBackup()
     }
 
     /// Raises the ttl of stored packets in place: `ttls` is `MeshRouter.key` → the ttl of a copy that came with more
@@ -82,7 +97,7 @@ final class PacketStore {
         guard let h = try? FileHandle(forUpdating: url) else { return }
         defer { try? h.close() }
         var at: UInt64 = 0, found: [(at: UInt64, ttl: UInt8)] = []
-        Self.records(h) { record, p in
+        Self.records(h, limit) { record, p in
             if let p, ids.contains(p.id), let ttl = ttls[MeshRouter.key(p)], ttl > p.ttl, ttl <= Packet.maxTtl {
                 found.append((at + 4 + UInt64(Packet.headerSize) - 1, UInt8(ttl))) // the ttl is the last byte of the header
             }
@@ -94,6 +109,7 @@ final class PacketStore {
     }
 
     func append(_ p: Packet) {
+        guard p.cipher.count <= limit else { return } // the reader would stop at it, and lose every record after it
         let e = p.encode()
         let rec = Data([UInt8(e.count >> 24 & 0xFF), UInt8(e.count >> 16 & 0xFF), UInt8(e.count >> 8 & 0xFF), UInt8(e.count & 0xFF)]) + e
         lock.lock(); defer { lock.unlock() }
@@ -102,21 +118,22 @@ final class PacketStore {
             _ = try? h.seekToEnd(); try? h.write(contentsOf: rec)
         } else {
             try? rec.write(to: url)
+            excludeFromBackup()
         }
     }
 
     /// Each whole record (length prefix included) and its packet, or nil if it doesn't decode. Stops at a bad length.
-    private static func records(_ h: FileHandle, _ body: (Data, Packet?) -> Void) {
+    private static func records(_ h: FileHandle, _ limit: Int, _ body: (Data, Packet?) -> Void) {
         var buf: [UInt8] = []
         while let more = try? h.read(upToCount: piece), !more.isEmpty {
             buf.append(contentsOf: more)
             var i = 0
             while i + 4 <= buf.count {
                 let n = Int(buf[i]) << 24 | Int(buf[i + 1]) << 16 | Int(buf[i + 2]) << 8 | Int(buf[i + 3])
-                guard n > 0, n <= Packet.headerSize + Packet.maxCipher else { return } // damaged: ignore the rest
+                guard n > 0, n <= Packet.headerSize + limit else { return } // damaged: ignore the rest
                 guard i + 4 + n <= buf.count else { break }                             // the rest comes with the next piece
                 let record = Data(buf[i..<(i + 4 + n)])
-                body(record, Packet.decode(record.dropFirst(4)))
+                body(record, Packet.decode(record.dropFirst(4), limit: limit))
                 i += 4 + n
             }
             buf.removeFirst(i)
