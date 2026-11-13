@@ -1,14 +1,46 @@
-# DarkProof
+<h1 align="center">
+  <img src="docs/diagrams/hero.svg" alt="DarkProof. Messaging for when the network is gone." width="100%">
+</h1>
 
-<img src="brand/darkproof-logo.png" alt="DarkProof logo" width="160">
+<p align="center">
+  <b>A messaging app for when there is no internet and no mobile network.</b><br>
+  Phones talk to each other directly and pass messages along. Android and iPhone, one format, no servers of ours.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Android-Kotlin-555555?style=flat-square" alt="Android: Kotlin">
+  <img src="https://img.shields.io/badge/iPhone-SwiftUI-555555?style=flat-square" alt="iPhone: SwiftUI">
+  <a href="spec/FORMAT.md"><img src="https://img.shields.io/badge/wire%20format-v0.6-555555?style=flat-square" alt="Wire format v0.6"></a>
+  <img src="https://img.shields.io/badge/Tor-built%20in-555555?style=flat-square" alt="Tor built in">
+  <img src="https://img.shields.io/badge/servers-none-33D64A?style=flat-square" alt="Servers: none">
+</p>
+
+<p align="center">
+  <b><a href="https://darkproof.app">Website</a> · <a href="PRIVACY.md">Privacy</a> · <a href="spec/FORMAT.md">Wire format</a></b><br>
+  <a href="#how-it-works">How it works</a> · <a href="#features">Features</a> · <a href="#build">Build</a> · <a href="#ai-models">AI models</a> · <a href="#status">Status</a> · <a href="#known-limits">Known limits</a>
+</p>
 
 DarkProof is a messaging app for when there is no internet and no mobile network. Phones talk to each other directly and pass messages along, so a message can reach someone who is out of range of the sender. While there is internet, messages also travel through free public relays, so the same chats work across any distance; no server of ours is involved. An on-device AI helps with practical questions, and an optional LoRa radio extends the range to kilometres.
 
 There are two apps that work together: one for **Android** and one for **iPhone**. They use the same message format and encryption.
 
+## How it works
+
+<img src="docs/diagrams/message-path.svg" alt="How a message travels: you write it, your phone encrypts and signs it with the group's current key, and the sealed packet leaves over any link that is up (Bluetooth LE, a Wi-Fi network, a LoRa radio, or internet relays through Tor). Other phones carry it on without being able to read it, for up to 16 hops and 7 days. Group members open it and check the signature." width="100%">
+
+A message is encrypted and signed on your phone, then leaves over whatever link is up. The phones in between carry it without being able to read it.
+
+<img src="docs/diagrams/who-sees-what.svg" alt="Who sees what, by design. Group members read the message. Phones that carry a packet see its id, time, hops left and size, not the text. Internet relays see a 2-byte mailbox tag, timing and size, and your address only if Tor is switched off, not the text. Someone with only the group code can ask to join, and an admin must let them in." width="100%">
+
+This is what each party is meant to see. [Status](#status) says what has been checked on real phones and what has not.
+
+<img src="docs/diagrams/group-keys.svg" alt="How a group's keys change: creating a group makes a random code and the first key; an invite names the group's admins; an admin approves each join and a new key is sealed to every member; removing someone makes a new code and key that the removed phone is not given; every week there is a fresh key, and the old one is kept 7 days, then deleted." width="100%">
+
+The group code only opens the door. Messages are sealed with a random key that changes, so the code alone neither reads nor writes. The exact rules are in [spec/FORMAT.md](spec/FORMAT.md).
+
 ## Features
 
-- **Group chat with end-to-end encryption.** Everyone in a group shares a group code. Messages are encrypted with AES-256-GCM, using a key derived from that code (PBKDF2, 120,000 rounds). Phones that relay a message can't read it.
+- **Group chat with end-to-end encryption.** A group code lets a phone ask to join, and an admin lets it in. Messages are encrypted with AES-256-GCM under a random group key that changes every week and whenever someone joins or is removed, and every message is signed by its sender. Phones that relay a message can't read it.
 - **Mesh forwarding.** Every phone stores messages and passes them on to the phones it meets:
   - Duplicates are dropped.
   - Each message can be relayed up to 16 times.
@@ -75,8 +107,9 @@ There are two apps that work together: one for **Android** and one for **iPhone*
 | `ios/Vendor/fetch-llama.sh` | Downloads the pinned llama.cpp build for iPhone |
 | `spec/FORMAT.md` | Wire format and Bluetooth LE protocol, shared by both apps |
 | `spec/test-vectors.txt` | Byte-exact examples that both apps' tests check |
+| `docs/diagrams/` | This page's banner and diagrams, drawn by `tools/make-diagrams.py` |
 | `site/` | The darkproof.app website: home, privacy policy, invite-link page and app-link files (see `site/README.md`) |
-| `tools/` | Test tools: a Mac Bluetooth LE test peer, an AI check, and the test-vector generator |
+| `tools/` | Test tools: a Mac Bluetooth LE test peer, an AI check, the test-vector generator, and the diagram generator |
 
 ## Build
 
