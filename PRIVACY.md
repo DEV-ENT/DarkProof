@@ -17,8 +17,8 @@ DarkProof is a messaging app that keeps working when there is no internet. It ha
 
 Messages travel to nearby phones running DarkProof over Bluetooth, Wi-Fi peer-to-peer, Wi-Fi networks and LoRa radios. Every phone passes messages on to the phones it meets, for up to 7 days.
 
-- **Group messages** are encrypted end to end with a random key that changes whenever someone joins or is removed, and at least every week. Phones and relays that pass them on cannot read them. The group code doesn't read messages: it lets a phone ask to join. Anyone who has the code can join and read what is written from then on, and the group sees that they joined. They can't read what was written before.
-- **While your phone is waiting to join a group**, what you write is encrypted with a key made from the group code, so anyone who has the code can read those messages. The app says so at the time.
+- **Group messages** are encrypted end to end with a random key that changes whenever someone joins or is removed, and at least every week. Phones and relays that pass them on cannot read them. The group code doesn't read messages: it lets a phone ask to join. Anyone who has the code can ask; once an admin lets them in, they read what is written from then on, and the group sees that they joined. They can't read what was written before.
+- **While your phone is waiting to join a group**, what you write is not sent until an admin lets you in. Your request to join carries your name and your public key, encrypted with a key made from the group code, so anyone who has the code can read it.
 - **Admins** of a group can remove people. A removed person can't read what is written afterwards, and the group gets a new code. What their phone already received stays on it.
 - **Everyone messages** (the Public channel) can be read by anyone who has DarkProof. Treat them as public.
 - **Places you share** (water, shelter, charging, medical) are Everyone messages: anyone with DarkProof can read them, including the position if you choose to add yours.
