@@ -1,12 +1,12 @@
 # DarkProof privacy policy
 
-Last updated: November 8, 2026
+Last updated: November 13, 2026
 
 DarkProof is a messaging app that keeps working when there is no internet. It has no servers of ours, no accounts, no analytics, no ads and no tracking. The developer receives no data from the app; only the emails you choose to send us.
 
 ## What stays on your phone
 
-- The name you enter, and your group codes, encrypted with a key held by the phone's secure storage. Group codes and keys never go into a phone backup, and on Android nothing from DarkProof does.
+- Your group codes, encrypted with a key held by the phone's secure storage. The name you enter is saved in the app's own storage and is not encrypted by DarkProof; on iPhone the same goes for the names of your groups. Group codes and keys never go into a phone backup, and on Android nothing from DarkProof does. On iPhone, your messages, the list of your groups' members and your conversation with the AI assistant are kept out of backups too; your name and your groups' names are not.
 - Your groups' message keys from the last two weeks or so, and your member keys, one set per group, protected by the phone's secure storage (Android Keystore, iPhone Keychain and Secure Enclave), and the public keys of the other members your phone has heard from.
 - Every message packet your phone receives or sends. This includes encrypted packets from other groups that your phone passes on but cannot read. Your groups' messages, including your own, are deleted from your phone one to two weeks after they were written, when the key that opens them is deleted. The newest 2,000 Everyone messages are kept, and packets your phone can't read are removed after 7 days. The store is capped at about 40 MB: when it is full, packets your phone can't read go first.
 - Your conversation with the AI assistant, and any AI models you download.
@@ -71,8 +71,8 @@ Invite links and QR codes carry your group's name and code. Anyone who has one c
 - **Internet (Android)**: for the relays, Tor, AI model downloads and maps described above.
 - **Camera (iPhone, optional)**: only when you tap Take photo or Scan QR code. The QR code is read on the phone. Photos you choose from your library are picked by the system: DarkProof sees only the one you choose. On Android, photos come only from the system photo picker, and QR codes are scanned by Google Play services on the phone, with no camera or photo library permission for DarkProof.
 - **Add to Photos (iPhone, optional)**: only if you save a photo from the chat.
-- **Face ID, fingerprint or your phone's passcode (optional)**: only if you turn on Lock DarkProof in Settings. The phone itself does the check; DarkProof never sees your face, fingerprint or passcode. While the lock is on, notifications don't show who wrote or what they said.
-- **Notifications (optional)**: alerts for new group messages and check-ins, made on your phone. No push server is involved and nothing is sent to Apple, Google or us.
+- **Face ID, fingerprint or your phone's passcode (optional)**: only if you turn on Lock DarkProof in Settings. The phone itself does the check; DarkProof never sees your face, fingerprint or passcode. While the lock is on, notifications don't show who wrote or what they said, and alerts offer only "I need help": to say you're safe, open DarkProof and unlock it.
+- **Notifications (optional)**: alerts for new group messages and check-ins, made on your phone. No push server is involved and nothing is sent to Apple, Google or us. An alert is removed when its message is deleted from your phone, and a week after the message at the latest.
 - **Location (optional)**: only while the app is open: to add your position to check-ins if you turned that on, to add it to a place you share if you choose, to sort shared places by distance, and to point you toward a friend or a place. Never in the background.
 - **Android only**:
   - **Location and nearby devices**: Android requires these to search for other phones over Bluetooth and Wi-Fi.
@@ -80,7 +80,7 @@ Invite links and QR codes carry your group's name and code. Anyone who has one c
 
 ## Shortcuts and quick buttons
 
-The "I'm safe" and "I need help" shortcuts (Siri, Spotlight, the Action button and Shortcuts on iPhone; the quick-settings tile and app shortcuts on Android) send a check-in to your group like the buttons in the app. The Android "I'm safe" tile also works from the lock screen. Alerts on the iPhone carry a fingerprint of the group, never its code. The battery estimate on Home is worked out on your phone from its own battery level and is never sent.
+The "I'm safe" and "I need help" shortcuts (Siri, Spotlight, the Action button and Shortcuts on iPhone; the quick-settings tile and app shortcuts on Android) send a check-in to your group like the buttons in the app. The Android "I'm safe" tile also works from the lock screen. With Lock DarkProof on, the Android "I'm safe" app shortcut sends only if you unlock DarkProof within 2 minutes. Alerts on the iPhone carry a fingerprint of the group, never its code. When a group gets a new code, the iPhone keeps a note linking the old fingerprint to the new one, so an answer to an older alert goes to that group and never to another. The battery estimate on Home is worked out on your phone from its own battery level and is never sent.
 
 DarkProof sends your location only where you choose: to your group in check-ins if you turn that on, or to everyone when you share a place with your position.
 
@@ -90,7 +90,7 @@ DarkProof is not meant for children under 13. The Everyone chat is open to anyon
 
 ## Deleting your data
 
-Delete the app to remove everything it stored on your phone. Copies of your messages on other phones are not deleted, but those phones stop passing them on after 7 days. Copies on internet relays are marked for deletion after 7 days.
+Delete the app to remove what it stored on your phone. One exception on iPhone: iOS keeps your group codes and keys in its Keychain after the app is deleted. No other app can read them, and DarkProof deletes them the first time it starts after being installed again. Copies of your messages on other phones are not deleted, but those phones stop passing them on after 7 days. Copies on internet relays are marked for deletion after 7 days.
 
 ## Changes
 
