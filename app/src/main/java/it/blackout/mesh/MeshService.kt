@@ -105,7 +105,8 @@ class MeshService : Service() {
                 peer == LoraLink.PEER -> lora.offer(p)
                 peer == MeshCoreLink.PEER -> meshcore.offer(p)
                 BleLink.owns(peer) -> ble.send(peer, p)
-                else -> client.sendPayload(peer, Payload.fromBytes(p.encode()))
+                NearbyPeers.owns(peer) -> client.sendPayload(NearbyPeers.endpoint(peer), Payload.fromBytes(p.encode()))
+                else -> { } // no link has such a name
             }
         }
         ble.start()
@@ -147,7 +148,8 @@ class MeshService : Service() {
     private val payloads = object : PayloadCallback() {
         override fun onPayloadReceived(ep: String, p: Payload) {
             val raw = p.asBytes() ?: run { client.cancelPayload(p.id); return } // DarkProof sends only packets: a file from someone could fill the disk
-            io.execute { Packet.decode(raw)?.let { MeshEngine.router?.receive(ep, it) } }
+            // In the router a Nearby link is its endpoint id behind a prefix: an id can't be taken for "lora" or "nostr".
+            io.execute { Packet.decode(raw)?.let { MeshEngine.router?.receive(NearbyPeers.peer(ep), it) } }
         }
         override fun onPayloadTransferUpdate(ep: String, u: PayloadTransferUpdate) {}
     }
@@ -160,12 +162,12 @@ class MeshService : Service() {
             pending -= ep
             if (r.status.isSuccess) {
                 connected += ep
-                io.execute { MeshEngine.router?.peerUp(ep); MeshEngine.notifyUi() }
+                io.execute { MeshEngine.router?.peerUp(NearbyPeers.peer(ep)); MeshEngine.notifyUi() }
             } else ui.postDelayed({ dial(ep) }, 5_000)
         }
         override fun onDisconnected(ep: String) {
             connected -= ep
-            io.execute { MeshEngine.router?.peerDown(ep); MeshEngine.notifyUi() }
+            io.execute { MeshEngine.router?.peerDown(NearbyPeers.peer(ep)); MeshEngine.notifyUi() }
             ui.postDelayed({ dial(ep) }, 3_000)
         }
     }

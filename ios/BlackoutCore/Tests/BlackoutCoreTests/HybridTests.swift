@@ -93,9 +93,12 @@ final class HybridTests: XCTestCase {
     }
 
     func testMemberListIsSeparateFromTheParts() throws {
-        let r = Rekey(epoch: 6, made: now, maker: Data(count: 33), admins: [anna], answers: nil, parts: [(ben, Data(count: 4))], members: [anna, ben])
+        let members = (1...11).map { String(format: "%016x", $0) }, share = Rekey.split(members)[1]      // a key for 11 goes in 3 packets
+        let r = Rekey(epoch: 6, made: now, maker: Data(count: 33), admins: [members[0]], answers: nil, parts: share.map { ($0, Data(count: 4)) }, members: members)
         let back = try XCTUnwrap(Rekey.decode(r.encode()))
-        XCTAssertEqual(back.members, [anna, ben]); XCTAssertEqual(back.parts.map(\.id), [ben]); XCTAssertEqual(r.encode().first, Rekey.type)
+        XCTAssertEqual(back.members, members); XCTAssertEqual(back.parts.map(\.id), share); XCTAssertEqual(r.encode().first, Rekey.type)
+        // Up to 10 members it is one packet with a part for each: listing someone and giving them none is refused.
+        XCTAssertNil(Rekey.decode(Rekey(epoch: 6, made: now, maker: Data(count: 33), admins: [anna], answers: nil, parts: [(ben, Data(count: 4))], members: [anna, ben]).encode()))
     }
 
     func testPartForSomeoneNotInTheListIsRefused() {

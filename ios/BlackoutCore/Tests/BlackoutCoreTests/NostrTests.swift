@@ -7,7 +7,8 @@ final class NostrTests: XCTestCase {
     /// A date before 1970 from a hostile relay is refused: paging back from it would crash the app on every launch.
     func testEventsDatedBefore1970AreRefused() throws {
         let packet = Packet(id: "6a44000000000001", ts: 1, ttl: 1, cipher: Data(count: 40)).encode().base64EncodedString()
-        func event(_ t: String) -> String { #"["EVENT","s",{"id":"a","pubkey":"b","created_at":\#(t),"kind":\#(Nostr.kind),"tags":[],"content":"\#(packet)"}]"# }
+        let id = String(repeating: "ab", count: 32), pub = String(repeating: "cd", count: 32) // an id and author are 32 bytes of hex: anything else is refused whatever the date
+        func event(_ t: String) -> String { #"["EVENT","s",{"id":"\#(id)","pubkey":"\#(pub)","created_at":\#(t),"kind":\#(Nostr.kind),"tags":[],"content":"\#(packet)"}]"# }
         XCTAssertNotNil(Nostr.received(event("1794000000")))
         XCTAssertNil(Nostr.received(event("-1")))
         XCTAssertNil(Nostr.received(event("-9223372036854775808")))
@@ -154,14 +155,14 @@ final class NostrTests: XCTestCase {
         XCTAssertNil(o.answer(relay: "r1", Nostr.Ok(eventId: "ev1", accepted: false, reason: "blocked: not in web of trust")))
         XCTAssertFalse(o.isSent(p1.id))
         XCTAssertEqual(o.answer(relay: "r2", Nostr.Ok(eventId: "ev1", accepted: true, reason: "")), p1.id) // sent once one relay took it
-        XCTAssertTrue(o.isSent(p1.id)); XCTAssertTrue(o.changed); XCTAssertEqual(o.sentList(), [p1.id]); XCTAssertFalse(o.changed)
+        XCTAssertTrue(o.isSent(p1.id)); XCTAssertTrue(o.changed); XCTAssertEqual(o.sentList(), [MeshRouter.key(p1)]); XCTAssertFalse(o.changed) // saved as the very packet, not its id alone
         o.offer(p1, mine: true); XCTAssertNil(o.next(bridged: true))      // never twice
 
         // #x lookup: a relay copy with other contents doesn't count
         let batch = o.toCheck(50); XCTAssertEqual(batch.map(\.id), [pkt(2, 0).id])
         _ = o.fromRelay(Packet(id: batch[0].id, ts: batch[0].ts, ttl: 9, cipher: Data([99])))
         XCTAssertEqual(o.checked(batch), [])
-        let (p2, own2) = try XCTUnwrap(o.next(bridged: true)); XCTAssertEqual(p2.id, batch[0].id); XCTAssertFalse(own2)
+        let (p2, own2) = try XCTUnwrap(o.next(bridged: true)); XCTAssertEqual(p2.id, batch[0].id); XCTAssertTrue(own2) // an older own packet goes up with the own ones once looked up
 
         // every relay refused: queued again, at most 3 tries
         o.posted(eventId: "ev2", p2, fromOwn: own2, relays: ["r1"])
@@ -178,7 +179,7 @@ final class NostrTests: XCTestCase {
         // a relay copy with the same contents (any ttl) means it's there
         let p4 = pkt(4, t - 10 * 60_000); o.offer(p4, mine: false)
         let b2 = o.toCheck(50); _ = o.fromRelay(p4.withTtl(2))
-        XCTAssertEqual(o.checked(b2), [p4.id]); XCTAssertTrue(o.isSent(p4.id))
+        XCTAssertEqual(o.checked(b2), []); XCTAssertTrue(o.isSent(p4.id)) // sent, but someone else's: nothing to show as "Sent"
         let p5 = pkt(5, t - 1_000); _ = o.fromRelay(p5); o.offer(p5, mine: true); XCTAssertNil(o.next(bridged: true)) // came from relays
     }
 

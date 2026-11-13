@@ -40,11 +40,13 @@ final class ReceiptsTests: XCTestCase {
             Message(id: "r\(sender)\(ts)", ts: ts, sender: sender, name: name, text: Receipt.text(for: ids))
         }
         let a = "000000000000000a", b = "000000000000000b"
-        let d = Deliveries([
+        var d = Deliveries()
+        d.sent(group: "g", a); d.sent(group: "g", b) // receipts count only for messages this phone wrote, in their group
+        for receipt in [
             r("lucia", "Lucia", 300, [a]),
             r("marco", "Marco", 200, [a, b]),
-            r("marco", "Marco R.", 100, [a]),   // same reader again: counted once, earliest time, newest name
-        ])
+            r("marco", "Marco R.", 100, [a]),   // same reader again: counted once, with the time and name of the earliest
+        ] { d.add(group: "g", receipt) }
         XCTAssertEqual(d.readers[a]?.map(\.id), ["marco", "lucia"])
         XCTAssertEqual(d.readers[a]?.first?.ts, 100)
         XCTAssertEqual(d.readers[a]?.first?.name, "Marco R.")

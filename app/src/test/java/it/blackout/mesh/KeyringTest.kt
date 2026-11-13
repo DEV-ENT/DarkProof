@@ -50,6 +50,33 @@ class KeyringTest {
         assertNull(Keyring().admit(rekey(6, listOf(dan), admins = listOf(dan), removes = cara), dan, "old"))
     }
 
+    @Test fun aPhoneStillJoiningTakesNoKeyOnceARemovalWentPast() {
+        val eve = "5555555555555555"; val annaKey = ByteArray(33) { 1 }; val benKey = ByteArray(33) { 2 }
+        val pins = Invite.pin(annaKey) + Invite.pin(benKey)                                  // an invite made while Anna and Ben were the admins
+        val first = Rekey(1, 2, benKey, listOf(ben), eve, listOf(ben, eve).map { it to Rekey.box(secret(2), null) })
+        fun take(r: Keyring, k: Rekey, by: String) = r.take(k, by, eve, "d1", false, null, 10, Invite.allows(pins, k.maker)) { it }
+        assertTrue(take(Keyring(), first, ben) is Keyring.Taken.Added)                        // until then, either of them lets it in
+        val r = Keyring()
+        val removal = Rekey(6, 1, annaKey, listOf(anna), ben, listOf(anna, cara).map { it to Rekey.box(secret(1), "AAAA-AAAA-AAAA-AAAA") }, true)
+        assertTrue(take(r, removal, anna) is Keyring.Taken.Closed); assertTrue(r.closed)
+        // Ben still has the old code and answers the request himself. The invite names him, but its code no longer works.
+        assertTrue(take(r, first, ben) is Keyring.Taken.Ignored); assertNull(r.currentOrNull())
+        assertTrue(take(Keyring().also { it.closed = true }, first, ben) is Keyring.Taken.Ignored) // nor after a restart: the engine saved it
+        // A removal from someone the invite doesn't name closes nothing.
+        val other = Keyring(); val zed = ByteArray(33) { 9 }
+        assertTrue(take(other, Rekey(6, 1, zed, listOf(dan), ben, listOf(dan).map { it to Rekey.box(secret(3), "AAAA-AAAA-AAAA-AAAA") }, true), dan) is Keyring.Taken.Ignored)
+        assertFalse(other.closed); assertTrue(take(other, first, ben) is Keyring.Taken.Added)
+    }
+
+    @Test fun seniorityIsReadFromEpochsWithAMemberList() {
+        val r = Keyring(); r.add(Keyring.Epoch(5, 1, secret(5), listOf(anna, ben, cara), listOf(anna, ben)))
+        r.add(Keyring.Epoch(6, 1, secret(6), listOf(anna, ben, cara), listOf(anna, ben)))
+        for (n in 4L..5L) r.add(Keyring.Epoch(n, 1, secret(n.toInt() + 3), emptyList(), listOf(ben), by = ben)) // kept only to read with: their admins are whatever their maker wrote
+        assertEquals(1, r.rank(rekey(6, listOf(anna)), ben)); assertEquals(0, r.rank(rekey(6, listOf(anna)), anna))
+        assertEquals(1, r.rank(rekey(5, listOf(anna)), ben))                                  // only such an epoch before it: the current epoch's list
+        assertEquals(Int.MAX_VALUE, r.rank(rekey(9, listOf(anna)), anna))                     // none before it
+    }
+
     @Test fun lateEpochsAreOnlyForReading() {
         val r = ring(); r.add(Keyring.Epoch(9, 1, secret(9), listOf(anna, ben, cara, dan), listOf(anna)))
         assertNotNull(r.admit(rekey(3, listOf(ben)), ben, null))
@@ -96,6 +123,7 @@ class KeyringTest {
         r.add(Keyring.Epoch(6, 500, secret(6), listOf(anna, cara), listOf(anna), "code-a", "old", ben, anna, 0))
         r.add(Keyring.Epoch(6, 500, secret(7), listOf(ben, cara), listOf(ben), "code-b", "old", anna, ben, 1))
         assertTrue(r.removedBefore(ben, 501)); assertFalse(r.removedBefore(anna, 501))
+        assertTrue(r.shutOut(ben, 1, had = false)); assertFalse(r.shutOut(anna, 1, had = false)); assertFalse(r.shutOut(anna, 501, had = true))
     }
 
     @Test fun aRemovalCantPickAHigherNumberToGetAhead() {
@@ -115,6 +143,56 @@ class KeyringTest {
         val day = 24 * 3600_000L; val r = Keyring()
         r.add(Keyring.Epoch(1, 20 * day, secret(1))); r.add(Keyring.Epoch(2, 0, secret(2)))
         assertTrue(r.expire(21 * day).isEmpty())                        // epoch 1 was made a day ago, whatever epoch 2 says
+    }
+
+    @Test fun aMembersKeyDatedLongAgoNeitherExpiresOlderEpochsNorMakesTheWeeklyKeyDue() {
+        val day = 24 * 3600_000L; val hour = 3600_000L; val now = 1000 * day; val two = listOf(anna, ben)
+        // Anna's phone: epoch 1 is 8 days old, epoch 2 replaced it an hour ago.
+        fun r() = Keyring().also { it.add(Keyring.Epoch.fresh(1, now - 8 * day, secret(1), two, listOf(anna), by = anna)); it.add(Keyring.Epoch.fresh(2, now - hour, secret(2), two, listOf(anna), by = anna)) }
+        fun bens(made: Long) = Rekey.decode(Rekey(3, made, ByteArray(33), listOf(anna), null, two.map { it to ByteArray(1) }).encode())!!
+        assertTrue(r().expire(now).isEmpty())
+        for (made in listOf(now - 60_000, 0L)) {                                              // Ben, who isn't an admin, dates his key a minute ago, or in 1970
+            val ring = r()
+            assertTrue(ring.take(bens(made), ben, anna, "door", false, null, now) { secret(3) } is Keyring.Taken.Added)
+            val cur = ring.current(); assertEquals(3L, cur.number); assertEquals(made, cur.made); assertEquals(now, cur.taken)
+            assertTrue("dated $made", ring.expire(now).isEmpty()); assertEquals(listOf(1L, 2L, 3L), ring.all().map { it.number }.sorted())
+            assertFalse(Keyring.weeklyDue(cur.since, now, 0)); assertFalse(Keyring.overdue(cur.since, now))
+            assertTrue(Keyring.weeklyDue(cur.since, now + 7 * day, 0))                        // a week after it got here
+            assertEquals(listOf(1L), ring.expire(now - hour + 7 * day + 1).map { it.number }) // a week after epoch 2 replaced it, as without Ben's key
+        }
+        val saved = Keyring.Epoch(4, 5 * day, secret(4)); assertEquals(5 * day, saved.taken); assertEquals(5 * day, saved.since) // saved before phones noted the arrival: its date
+    }
+
+    @Test fun theSameSecretInAnotherKeyIsAnotherEpoch() {
+        val r = Keyring(); val five = Keyring.Epoch(5, 1, secret(5), listOf(anna, ben, cara), listOf(anna, ben)); r.add(five)
+        assertFalse(r.add(Keyring.Epoch(5, 9, secret(5), listOf(anna), listOf(anna))))                         // the same key read again: kept once
+        assertTrue(r.add(Keyring.Epoch(6, 2, secret(5), listOf(anna, ben, cara), listOf(anna, ben), by = cara))) // its secret in a key of Cara's: held beside it
+        assertTrue(r.add(Keyring.Epoch(6, 2, secret(5), listOf(anna, ben), listOf(anna), "new", "old", cara, anna, 0))) // and in a removal of Anna's, which wins
+        assertFalse(r.add(Keyring.Epoch(6, 3, secret(5), emptyList(), listOf(anna), by = cara)))               // Cara's again, kept only to read with: still one
+        assertEquals(3, r.all().size); assertTrue(r.all().any { it === five }); assertEquals(cara, r.current().removes)
+        assertEquals(3, r.all().map { it.id }.toSet().size); assertEquals(1, r.all().map { it.hash }.toSet().size)
+        // Of two keys with one secret, number and standing, the maker's id decides, whichever came first.
+        for (order in listOf(listOf(ben, cara), listOf(cara, ben))) {
+            val k = Keyring(); order.forEach { k.add(Keyring.Epoch(6, 2, secret(5), listOf(anna, ben, cara), listOf(anna), by = it)) }
+            assertEquals(ben, k.current().by)
+        }
+    }
+
+    @Test fun anAdminsKeyComesBeforeAMembersOfTheSameNumber() {
+        val r = Keyring(); r.add(Keyring.Epoch(5, 1, secret(5), listOf(anna, ben, cara), listOf(anna, ben)))
+        assertEquals(Keyring.BY_ADMIN, r.standing(rekey(6, listOf(anna, ben, cara)), ben)); assertEquals(Int.MAX_VALUE, r.standing(rekey(6, listOf(anna, ben, cara)), cara))
+        assertEquals(1, r.standing(rekey(6, listOf(anna, cara), removes = ben), ben))                          // a removal keeps its maker's place
+        assertEquals(Keyring.BY_ADMIN, r.standing(rekey(9, listOf(anna, ben, cara)), anna))                    // no epoch 8 here: the current one says who is an admin, as for admit
+        assertEquals(Keyring.BY_ADMIN, Keyring().standing(rekey(6, listOf(dan), admins = listOf(anna)), anna)) // still joining: the key's own list
+        assertEquals(Int.MAX_VALUE, Keyring().standing(rekey(6, listOf(dan), admins = listOf(anna)), cara))
+        for ((a, b) in listOf(1 to 2, 2 to 1, 3 to 4, 4 to 3)) for (adminFirst in listOf(true, false)) {
+            val k = Keyring()
+            val admins = Keyring.Epoch(6, 1, secret(a), listOf(anna, ben, cara, dan), listOf(anna), by = anna, rank = Keyring.BY_ADMIN)
+            val members = Keyring.Epoch(6, 1, secret(b), listOf(anna, ben, cara), listOf(anna), by = cara)
+            (if (adminFirst) listOf(admins, members) else listOf(members, admins)).forEach { k.add(it) }
+            assertSame(admins, k.current()); assertTrue(k.won(admins)); assertFalse(k.won(members))
+            k.add(Keyring.Epoch(6, 1, secret(9), listOf(anna, ben), listOf(anna), "new", "old", cara, ben, 1)); assertEquals(cara, k.current().removes) // a removal still beats both
+        }
     }
 
     @Test fun theWeeklyKeyWaitsForAWeekAndThisPhonesDelay() {
@@ -196,6 +274,15 @@ class KeyringTest {
         assertEquals(listOf(2L), r.all().map { it.number })
         assertTrue(r.expire(30 * day).isEmpty())                        // the current one stays, however old
         assertNotNull(r.current().group.mailbox)
+    }
+
+    @Test fun whatLostGoesWithTheEpochThatBeatIt() {
+        val day = 24 * 3600_000L; val r = ring()
+        r.add(Keyring.Epoch(6, 1 * day, secret(6), listOf(anna, cara), listOf(anna), "code-a", "old", ben, anna, 0)) // Anna removes Ben
+        r.add(Keyring.Epoch(6, 5 * day, secret(7), listOf(ben, cara), listOf(ben), "code-b", "old", anna, ben, 1))   // his rival removal lost; he dated it later
+        r.add(Keyring.Epoch(7, 2 * day, secret(8), listOf(anna, cara), listOf(anna)))
+        assertEquals(listOf(5L, 6L, 6L), r.expire(10 * day).map { it.number }.sorted())       // or it would be the only removal numbered 6 left, and so the one that won
+        assertFalse(r.removedBefore(anna, 10 * day)); assertTrue(r.stillToRemove().isEmpty())
     }
 
     @Test fun groupIdIsStableAndKeysComeFromTheSecret() {

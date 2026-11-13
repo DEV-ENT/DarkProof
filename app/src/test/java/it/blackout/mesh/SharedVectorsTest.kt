@@ -34,6 +34,15 @@ class SharedVectorsTest {
         assertEquals(2, of("ask").size)
     }
 
+    /** Names that draw the same have one key, on both phones (spec "Reports about others"). */
+    @Test fun nameKeys() {
+        assertEquals(16, of("name-key").size)
+        of("name-key").forEach { v ->
+            val name = String(unhex(v["name_hex"]!!), Charsets.UTF_8)
+            assertEquals(v["name_hex"], v["key_hex"], Vouch.key(name).toByteArray(Charsets.UTF_8).joinToString("") { "%02x".format(it) })
+        }
+    }
+
     @Test fun codeNormalize() = of("code-normalize").forEach { v ->
         val input = v["input"] ?: String(unhex(v["input_hex"]!!), Charsets.UTF_8)
         val out = Invite.normalizeCode(input)

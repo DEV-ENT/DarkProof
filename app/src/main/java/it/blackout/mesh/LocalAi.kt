@@ -203,7 +203,16 @@ object LocalAi {
         }
     }
 
-    private val checked = HashSet<String>()
+    /**
+     * Before Android 11 any app with the storage permission can replace a model file, so there it is checked each time
+     * before the engine opens it, not once per run: the engine is let go after 5 idle minutes and opens the file again,
+     * and so does the CPU engine after a GPU that failed. Throws if the file is not the one that was downloaded.
+     * A file swapped in the moment between this check and the engine opening it is not caught.
+     */
+    private fun unchanged(m: AiModel) {
+        if (android.os.Build.VERSION.SDK_INT <= 29)
+            check(runCatching { file(m).length() == m.bytes && sha256(file(m)) == m.sha256 }.getOrDefault(false)) { "This model file has changed. Remove it and download it again." }
+    }
     private fun sha256(f: File): String {
         val md = MessageDigest.getInstance("SHA-256"); val buf = ByteArray(1 shl 20)
         f.inputStream().use { s -> while (true) { val n = s.read(buf); if (n < 0) break; md.update(buf, 0, n) } }
@@ -259,7 +268,9 @@ object LocalAi {
         if (m == null || states[m.id] != State.Ready) {
             finish(Turn("assistant", "No AI model on this phone yet. Download one first.", true), done); return
         }
-        val history = AiContext.fit(conversation.dropLast(1).filter { !it.isError }, { it.text }, { it.role == "user" })
+        // What [system] holds beyond the app's own instructions is other people's words: counted in bytes, the most it can cost.
+        val beside = system.toByteArray().size - (instructions + "\n\n" + situationIntro).toByteArray().size + question.toByteArray().size
+        val history = AiContext.fit(conversation.dropLast(1).filter { !it.isError }, { it.text }, { it.role == "user" }, AiContext.historyChars(beside))
         conversation += Turn("assistant", "…")
         busy = true; stopped = false
         main.removeCallbacks(release)
@@ -340,11 +351,7 @@ object LocalAi {
      * before trying and becomes "yes" only after a GPU answer, so after any failure the CPU is used from then on.
      */
     private fun load(m: AiModel): Engine {
-        // Before Android 11 any app with storage permission can replace this file: checked once per run, before it is parsed.
-        if (android.os.Build.VERSION.SDK_INT <= 29 && m.id !in checked) {
-            check(runCatching { sha256(file(m)) == m.sha256 }.getOrDefault(false)) { "This model file has changed. Remove it and download it again." }
-            checked += m.id
-        }
+        unchanged(m)
         val key = "gpu.${m.id}"
         if (prefs.getString(key, null) != "no") {
             prefs.edit().putString(key, "no").commit() // stays "no" if the app dies while trying
@@ -354,6 +361,7 @@ object LocalAi {
                 backendName = "GPU"
                 return e
             } catch (_: Throwable) { }
+            unchanged(m) // the GPU try took a while, and the file is opened a second time
         }
         val e = Engine(EngineConfig(modelPath = file(m).path, backend = Backend.CPU(), maxNumTokens = 4096, cacheDir = app.cacheDir.path))
         e.initialize(); backendName = "CPU"

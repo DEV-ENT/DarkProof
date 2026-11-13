@@ -19,7 +19,6 @@ import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
@@ -34,6 +33,15 @@ object WifiBoard {
     private const val MAX_NAME = 30
     private const val MAX_TEXT = 500
     private const val MIN_POST_GAP_MS = 5_000L
+    /** Posts taken in a minute, from everyone together: fewer than the 13 packets a minute a phone passes on to the relays, so board posts can't hold up everything else it passes on. */
+    private const val MAX_POSTS_PER_MINUTE = 10
+    /** Of those, the most from one visitor's address, so one visitor can't use up everyone's. */
+    private const val MAX_CLIENT_POSTS_PER_MINUTE = 4
+    /** Connections one visitor's address holds at a time, of the 24 places: a browser needs the page, the list, a post and the download. */
+    private const val MAX_CLIENT_CONNECTIONS = 4
+    /** App downloads at a time, which may hold a worker for minutes: two workers stay free for the page, and one visitor has at most two (a browser may hand a download over to its downloader, which asks again). */
+    private const val MAX_DOWNLOADS = 6
+    private const val MAX_CLIENT_DOWNLOADS = 2
     private val main = Handler(Looper.getMainLooper())
     private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
     @Volatile private var server: ServerSocket? = null
@@ -44,8 +52,9 @@ object WifiBoard {
     @Volatile private var app: Context? = null
     private val pool = java.util.concurrent.ThreadPoolExecutor(8, 8, 0L, java.util.concurrent.TimeUnit.MILLISECONDS, java.util.concurrent.ArrayBlockingQueue(16)) // caps how many browsers are served at once
     private val watchdog = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "board-watchdog").apply { isDaemon = true } }
-    private var minuteStart = 0L; private var postsThisMinute = 0
-    private val lastPost = ConcurrentHashMap<String, Long>() // client address -> time of last post
+    private val door = BoardDoor(MAX_CLIENT_CONNECTIONS)
+    private val downloads = BoardDoor(MAX_CLIENT_DOWNLOADS, MAX_DOWNLOADS)
+    private val posts = BoardPosts(MIN_POST_GAP_MS, MAX_POSTS_PER_MINUTE, MAX_CLIENT_POSTS_PER_MINUTE)
     private val time = SimpleDateFormat("HH:mm", Locale.US)
     private val HOTSPOT_IFACES = listOf("ap", "swlan", "softap", "wlan1", "wlan2")
     private val CELLULAR_IFACES = listOf("rmnet", "ccmni", "dummy", "tun")
@@ -122,18 +131,40 @@ object WifiBoard {
                 error = "Couldn't start the board. Restart DarkProof and try again."; main.post { stop(); changed() }; return@thread
             }
             server = ss
-            try { while (true) { val s = ss.accept(); try { pool.execute { handle(s) } } catch (_: java.util.concurrent.RejectedExecutionException) { s.close() } } }
+            try { while (true) {
+                val s = ss.accept(); val who = s.inetAddress?.hostAddress ?: "?"
+                // Before it takes a place: an address of a local network, and no more places than one visitor's share.
+                if (!BoardRules.mayEnter(s.inetAddress) || !door.enter(who)) { runCatching { s.close() }; continue }
+                val cut = limit(s, 30) // from now, not from when a worker is free: waiting in line can't hold a place for long either
+                try { pool.execute { try { handle(s, cut) } finally { door.leave(who) } } }
+                catch (_: java.util.concurrent.RejectedExecutionException) { cut.cancel(false); door.leave(who); runCatching { s.close() } }
+            } }
             catch (_: Exception) { }
             finally { ss.close(); if (server === ss) server = null }
         }
     }
 
-    private fun handle(s: Socket): Unit = s.use {
-        // The Wi-Fi around this phone only: not the mobile network, and not other apps on this phone.
-        if (!s.inetAddress.isSiteLocalAddress && !s.inetAddress.isLinkLocalAddress) return
-        fun limit(seconds: Long) = watchdog.schedule({ runCatching { s.close() } }, seconds, java.util.concurrent.TimeUnit.SECONDS)
-        var cut = limit(30) // sending one byte every few seconds can't hold a place for long
+    private fun limit(s: Socket, seconds: Long) = watchdog.schedule({ runCatching { s.close() } }, seconds, java.util.concurrent.TimeUnit.SECONDS)
+
+    /**
+     * Whether the caller is on the Wi-Fi around this phone (BoardRules.nearby): which of this phone's networks the
+     * connection came in on, how big that network is, and whether the caller is this phone itself.
+     */
+    private fun nearby(s: Socket): Boolean = runCatching {
+        val all = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+        val here = s.localAddress
+        val iface = all.firstOrNull { n -> n.interfaceAddresses.any { it.address == here } }
+        val prefix = iface?.interfaceAddresses?.firstOrNull { it.address == here }?.networkPrefixLength?.toInt() ?: -1
+        BoardRules.nearby(s.inetAddress, here, prefix, iface?.name, all.flatMap { it.inetAddresses.toList() })
+    }.getOrDefault(false)
+
+    /** [first]: the 30-second limit that started when the connection was accepted. */
+    private fun handle(s: Socket, first: java.util.concurrent.ScheduledFuture<*>): Unit = s.use {
+        var cut = first // sending one byte every few seconds can't hold a place for long
         try {
+            // The Wi-Fi around this phone only: not the mobile network, and not other apps on this phone.
+            if (!nearby(s)) return
+            val who = s.inetAddress?.hostAddress ?: "?"
             s.soTimeout = 10_000
             val inp = BufferedInputStream(s.getInputStream())
             val head = readHead(inp) ?: return
@@ -148,7 +179,9 @@ object WifiBoard {
             when {
                 foreign -> respond(s, 404, "text/plain", "Not found")
                 method == "GET" && path == "/" -> respond(s, 200, "text/html; charset=utf-8", page())
-                method == "GET" && path == "/DarkProof.apk" && apk() != null -> { cut.cancel(false); cut = limit(300); sendFile(s, apk()!!) }
+                method == "GET" && path == "/DarkProof.apk" && apk() != null ->
+                    if (!downloads.enter(who)) respond(s, 503, "text/plain", "Too many downloads right now. Try again in a minute.")
+                    else try { cut.cancel(false); cut = limit(s, 300); sendFile(s, apk()!!) } finally { downloads.leave(who) }
                 method == "GET" && path.startsWith("/messages") -> respond(s, 200, "application/json", messages())
                 method == "POST" && path == "/send" -> respond(s, 200, "application/json", post(s, String(body, Charsets.UTF_8)))
                 else -> respond(s, 404, "text/plain", "Not found")
@@ -170,7 +203,7 @@ object WifiBoard {
 
     private fun respond(s: Socket, code: Int, type: String, text: String) {
         val body = text.toByteArray(Charsets.UTF_8)
-        val head = "HTTP/1.1 $code ${if (code == 200) "OK" else "Not Found"}\r\nContent-Type: $type\r\nContent-Length: ${body.size}\r\n" +
+        val head = "HTTP/1.1 $code ${when (code) { 200 -> "OK"; 503 -> "Service Unavailable"; else -> "Not Found" }}\r\nContent-Type: $type\r\nContent-Length: ${body.size}\r\n" +
             "Cache-Control: no-store\r\nConnection: close\r\n\r\n"
         s.getOutputStream().apply { write(head.toByteArray(Charsets.US_ASCII)); write(body); flush() }
     }
@@ -200,12 +233,12 @@ object WifiBoard {
         fun clean(v: String?, max: Int) = v.orEmpty().filter { it == '\n' || !it.isISOControl() }.trim().take(max)
         val name = clean(f["name"], MAX_NAME); val text = clean(f["text"], MAX_TEXT)
         if (name.isEmpty() || text.isEmpty()) return """{"ok":false,"error":"Write your name and a message."}"""
-        val who = s.inetAddress.hostAddress ?: "?"; val now = System.currentTimeMillis()
-        if (now - (lastPost[who] ?: 0L) < MIN_POST_GAP_MS) return """{"ok":false,"error":"Wait a few seconds between messages."}"""
-        lastPost[who] = now
-        synchronized(this) { // these go worldwide under this phone's name: not too many, whoever sends them
-            if (now - minuteStart > 60_000) { minuteStart = now; postsThisMinute = 0 }
-            if (++postsThisMinute > 60) return """{"ok":false,"error":"Too many messages right now. Try again in a minute."}"""
+        // These go worldwide under this phone's name: not too many, whoever sends them, and not all from one visitor (BoardPosts).
+        when (posts.ask(s.inetAddress?.hostAddress ?: "?", System.currentTimeMillis())) {
+            BoardPosts.Answer.WAIT -> return """{"ok":false,"error":"Wait a few seconds between messages."}"""
+            BoardPosts.Answer.SHARE_USED -> return """{"ok":false,"error":"You've sent a few messages. Try again in a minute."}"""
+            BoardPosts.Answer.FULL -> return """{"ok":false,"error":"Too many messages right now. Try again in a minute."}"""
+            BoardPosts.Answer.TAKEN -> {}
         }
         MeshEngine.sendFromBoard(name, text)
         return """{"ok":true}"""

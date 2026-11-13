@@ -125,7 +125,7 @@ object DebugTools {
             if (i.getStringExtra("found") != null) MeshEngine.found(c, j.substringAfter('|'))
         }
         i.getStringExtra("joinLink")?.let { j -> // Name|darkproof://join?…: like join, through the code that reads an invite
-            Groups.readInvite(c, j.substringAfter('|'))?.let { (_, code) -> Groups.setUp(c, j.substringBefore('|'), SavedGroup("Group", code)) }
+            Groups.readInvite(j.substringAfter('|'))?.let { g -> Groups.setUp(c, j.substringBefore('|'), SavedGroup("Group", g.code, g.pins)) }
         }
         if (i.getStringExtra("logPins") != null) whenStarted { log("pins ${Groups.code(c)?.let(MeshEngine::invitePins) ?: "none"}") } // key hashes, not the group code
         log("debug intent: samples=${i.getStringExtra("samples")} started=${MeshEngine.router != null}")

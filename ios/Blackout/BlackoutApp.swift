@@ -17,6 +17,7 @@ struct BlackoutApp: App {
         if let i = args.firstIndex(of: "joinLink"), args.indices.contains(i + 1), let bar = args[i + 1].firstIndex(of: "|"),
            let invite = InviteLinks.read(String(args[i + 1][args[i + 1].index(after: bar)...])) { // joinLink "Name|darkproof://join?…": like join, through the code that reads an invite
             UserDefaults.standard.set(String(args[i + 1][..<bar]), forKey: "name")
+            GroupSecrets.shared.joining(invite.code, pins: invite.pins)
             GroupSecrets.shared.setCode(invite.code)
         }
         if args.contains("found"), let c = GroupSecrets.shared.current { Engine.found(c) } // with join: as if this phone created the group

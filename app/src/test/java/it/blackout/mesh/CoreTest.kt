@@ -76,10 +76,10 @@ class CoreTest {
 
     /** After a restart, packets handled earlier but no longer passed on must not be shown again when they come back. */
     @Test fun restoredSeenIdsAreNotDeliveredAgain() {
-        val got = mutableListOf<String>()
+        val got = mutableListOf<String>(); val t = System.currentTimeMillis()
         val r = MeshRouter({ _, _ -> }, { got += it.id })
-        r.restore(emptyList(), listOf(MeshRouter.key(Packet(M1, 1, 16, byteArrayOf(1)))))
-        r.receive("peer", Packet(M1, System.currentTimeMillis(), 16, byteArrayOf(1)))
+        r.restore(emptyList(), listOf(MeshRouter.key(Packet(M1, t, 16, byteArrayOf(1))))) // the same packet: id, header time and content
+        r.receive("peer", Packet(M1, t, 3, byteArrayOf(1)))
         assertTrue(got.isEmpty())
         r.receive("peer", Packet("00000000000000b2", System.currentTimeMillis(), 16, byteArrayOf(1)))
         assertEquals(listOf("00000000000000b2"), got)
@@ -113,6 +113,24 @@ class CoreTest {
         repeat(50) { r.receive("bad", Packet("%016x".format(1000 + it), t, 16, byteArrayOf(1))) }
         sent.clear(); r.peerUp("new")
         assertTrue("the first link's packet is still here", "00000000000000a1" in sent)
+    }
+
+    // Wi-Fi board posts were published like this phone's own packets, which count against no link's share: 500 of them
+    // pushed every packet the phone held for others out of the store (audit of 2026-11).
+    @Test fun boardPostsCantPushOutEveryoneElse() {
+        val sent = HashSet<String>(); val t = System.currentTimeMillis()
+        val r = MeshRouter({ _, p -> sent += p.id }, { }, maxStored = 8)
+        r.receive("good", Packet("00000000000000a1", t, 16, byteArrayOf(1)))
+        repeat(50) { r.publish(Packet("%016x".format(1000 + it), t, 16, byteArrayOf(1)), MeshEngine.BOARD) }
+        sent.clear(); r.peerUp("new")
+        assertTrue("the link's packet is still here", "00000000000000a1" in sent)
+        assertEquals("with the newest board posts", 8, sent.size)
+        // This phone's own packets count against no share, as before.
+        val own = MeshRouter({ _, p -> sent += p.id }, { }, maxStored = 8)
+        own.receive("good", Packet("00000000000000a2", t, 16, byteArrayOf(1)))
+        repeat(50) { own.publish(Packet("%016x".format(2000 + it), t, 16, byteArrayOf(1))) }
+        sent.clear(); own.peerUp("new")
+        assertFalse("00000000000000a2" in sent)
     }
 
     // ---- spec "Forwarding rules": timestamps and ttl (same vectors as the iPhone's CoreTests) ----

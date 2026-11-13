@@ -13,13 +13,15 @@ enum InviteLinks {
         useWebLinks ? Invite.webUrl(name: name, code: code, pins: pins) : Invite.url(name: name, code: code, pins: pins)
     }
 
-    /// The group name and code in invite `link`, or nil if it isn't one. Keeps the admins it names for when this phone joins.
-    static func read(_ link: String) -> (name: String, code: String)? {
+    /// The group name and code in invite `link` and the admins it names, or nil if it isn't one. Reading a link keeps
+    /// nothing: the admins are saved only when the user joins with it (`GroupSecrets.joining`).
+    static func read(_ link: String) -> PendingInvite? {
         guard let i = Invite.parse(link) else { return nil }
-        let pins = Invite.pins(link)
-        if !pins.isEmpty { GroupSecrets.shared.setPins(i.code, pins) }
-        return i
+        return PendingInvite(name: i.name, code: i.code, pins: Invite.pins(link))
     }
+
+    /// The admins to keep when the user joins `code`: those `invited` names, if the code is still the one that link carried.
+    static func pins(_ invited: PendingInvite?, for code: String) -> String { invited?.code == code ? invited?.pins ?? "" : "" }
 }
 
 /// Groups this phone has been in, so random codes are never lost when switching. Stored only on this phone.
@@ -55,8 +57,17 @@ enum SavedGroups {
         return list.last
     }
 
+    /// `old` turned out to be an old code of the saved group whose code is `now`: that group is shown in its place, and `old` isn't kept.
+    static func follow(_ old: String, _ now: String) {
+        guard let g = all().first(where: { $0.code == now }) else { return }
+        GroupSecrets.shared.setGroups(all().filter { $0.code != old })
+        if GroupSecrets.shared.current == old { GroupSecrets.shared.setCode(now); UserDefaults.standard.set(g.name, forKey: "groupName") }
+    }
+
     /// Makes [code] this phone's group: keeps the old one in the list, saves the new one, and shows its messages.
-    static func switchTo(groupName: String, code: String, engine: Engine) {
+    /// `pins`: the admins the invite it came from names; kept if this phone doesn't have the code yet.
+    static func switchTo(groupName: String, code: String, engine: Engine, pins: String = "") {
+        GroupSecrets.shared.joining(code, pins: pins)
         let d = UserDefaults.standard
         if let old = GroupSecrets.shared.current, !old.isEmpty, old != code {
             remember(Entry(name: d.string(forKey: "groupName") ?? "My group", code: old))
@@ -173,7 +184,7 @@ struct InviteSheet: View {
 
 /// Scans an invite QR code with the camera (darkproof:// and darkproof.app/join links).
 struct QRScannerSheet: View {
-    let found: (_ name: String, _ code: String) -> Void
+    let found: (PendingInvite) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var problem: (text: String, settings: Bool)?
     @State private var notInvite = false
@@ -193,7 +204,7 @@ struct QRScannerSheet: View {
                     QRCamera(onCode: { s in
                         if let i = InviteLinks.read(s) {
                             UINotificationFeedbackGenerator().notificationOccurred(.success)
-                            found(i.name, i.code); dismiss()
+                            found(i); dismiss()
                         } else { notInvite = true }
                     }, onProblem: { problem = $0 })
                     .ignoresSafeArea()
@@ -291,6 +302,8 @@ struct QRCamera: UIViewControllerRepresentable {
 struct CodeEntry: View {
     @Binding var code: String
     @Binding var groupName: String
+    /// The invite link the code came from, with the admins it names (`InviteLinks.pins`).
+    @Binding var invited: PendingInvite?
     var focusCode: FocusState<Bool>.Binding? = nil
     @State private var scanning = false
     @State private var fromLink: String?
@@ -321,11 +334,11 @@ struct CodeEntry: View {
         }
         .onChange(of: code) { new in
             guard let i = InviteLinks.read(new) else { return } // a pasted invite link: keep its code, offer its name
-            code = i.code; fromLink = i.name
+            code = i.code; fromLink = i.name; invited = i
             if groupName.trimmingCharacters(in: .whitespaces).isEmpty { groupName = i.name }
         }
         .sheet(isPresented: $scanning) {
-            QRScannerSheet { name, c in code = c; fromLink = name; groupName = name }
+            QRScannerSheet { i in code = i.code; fromLink = i.name; groupName = i.name; invited = i }
         }
     }
 }
@@ -333,12 +346,13 @@ struct CodeEntry: View {
 /// Join another group from Settings or the group list: asks for a name, keeps the name of a group saved before.
 struct JoinGroupSheet: View {
     @ObservedObject var engine: Engine
-    var prefill: (name: String, code: String)? = nil
+    var prefill: PendingInvite? = nil
     @Environment(\.dismiss) private var dismiss
     @CurrentCode private var current
     @AppStorage("groupName") private var currentName = "My group"
     @State private var code = ""
     @State private var name = ""
+    @State private var invited: PendingInvite?
 
     private var clean: String { Invite.normalizeCode(code) }
     private var saved: SavedGroups.Entry? { SavedGroups.all().first { $0.code == clean } }
@@ -346,7 +360,7 @@ struct JoinGroupSheet: View {
     var body: some View {
         SheetPage(title: "Join a group", close: "Cancel") {
             Text("Scan your friend's invite QR, or type their code.").scaledFont(15).foregroundStyle(Theme.dim)
-            CodeEntry(code: $code, groupName: $name)
+            CodeEntry(code: $code, groupName: $name, invited: $invited)
             if clean == current && !clean.isEmpty {
                 Label("You're already in this group: \(currentName).", systemImage: "checkmark.circle.fill")
                     .scaledFont(15, .semibold).foregroundStyle(Theme.safe)
@@ -365,13 +379,13 @@ struct JoinGroupSheet: View {
             Text("Switching shows the other group's messages. This group's messages stay on the phone.")
                 .font(.footnote).foregroundStyle(Theme.dim)
         }
-        .onAppear { if let p = prefill { code = p.code; name = p.name } }
+        .onAppear { if let p = prefill { code = p.code; name = p.name; invited = p } }
     }
 
     private func join() {
         let typed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Invite.maxGroupName))
         let n = saved?.name ?? (typed.isEmpty ? "Group" : typed)
-        SavedGroups.switchTo(groupName: n, code: clean, engine: engine)
+        SavedGroups.switchTo(groupName: n, code: clean, engine: engine, pins: InviteLinks.pins(invited, for: clean))
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         Nav.shared.toast("You're now in \(n)")
         Nav.shared.sheet = nil

@@ -256,8 +256,11 @@ fun qrBitmap(text: String, size: Int = 720): Bitmap {
     return Bitmap.createBitmap(px, size, size, Bitmap.Config.ARGB_8888)
 }
 
-/** The group in use and the ones the user switched away from, so they can come back (like the iPhone's SavedGroups). */
-data class SavedGroup(val name: String, val code: String)
+/**
+ * The group in use and the ones the user switched away from, so they can come back (like the iPhone's SavedGroups).
+ * [pins]: only on an invite that was read, the admins it names (spec "Invites"); kept when the user joins with it.
+ */
+data class SavedGroup(val name: String, val code: String, val pins: String = "")
 
 object Groups {
     private fun prefs(c: Context) = c.getSharedPreferences("mesh", 0)
@@ -309,14 +312,21 @@ object Groups {
     /** First setup: saves the name and group. The mesh service starts afterwards. */
     @Synchronized fun setUp(c: Context, name: String, g: SavedGroup) {
         prefs(c).edit().putString("name", name).apply()
+        joining(c, g)
         write(c, saved(c).copy(code = g.code, name = g.name))
     }
     /** Someone was removed from a group: it now has a new code (spec "Removing and the code"). Its name stays. */
     @Synchronized fun replaceCode(c: Context, old: String, new: String) = saved(c).let { s ->
         write(c, s.copy(code = if (s.code == old) new else s.code, others = s.others.map { if (it.code == old) it.copy(code = new) else it }))
     }
+    /** [old] turned out to be an old code of the saved group whose code is [now]: that group is shown in its place, and [old] isn't kept. */
+    @Synchronized fun follow(c: Context, old: String, now: String) = saved(c).let { s ->
+        val g = find(c, now) ?: return@let
+        write(c, s.copy(code = if (s.code == old) g.code else s.code, name = if (s.code == old) g.name else s.name, others = s.others.filter { it.code != old }))
+    }
     /** Shows another group's messages; this group's stay on the phone. */
     @Synchronized fun switchTo(c: Context, g: SavedGroup) {
+        joining(c, g)
         current(c)?.let { remember(c, it) }
         write(c, saved(c).copy(code = g.code, name = g.name))
         MeshEngine.switchGroup(g.code)
@@ -328,28 +338,49 @@ object Groups {
 
     /** The admins the invite for [code] named ("" if none): only they can let this phone in (spec "Invites"). */
     fun pins(c: Context, code: String) = saved(c).pins[code].orEmpty()
-    @Synchronized fun setPins(c: Context, code: String, pins: String) = saved(c).let { s -> write(c, s.copy(pins = (s.pins - code + (code to pins)).toList().takeLast(20).toMap())) }
+    /**
+     * The user chose to join [g], or to show it: if this phone doesn't have its code yet, the admins its invite names
+     * are kept from now on ([Invite.joinPins]). Nothing else writes them. Call before [g] is saved.
+     */
+    @Synchronized private fun joining(c: Context, g: SavedGroup) = saved(c).let { s ->
+        val pins = Invite.joinPins(s.pins, all(c).map { it.code }, g.code, g.pins)
+        if (pins != s.pins) write(c, s.copy(pins = pins))
+    }
 
-    /** The group name and code in invite [link], or null if it isn't one. Keeps the admins it names for when this phone joins. */
-    fun readInvite(c: Context, link: String): Pair<String, String>? = Invite.parse(link)?.also { (_, code) -> Invite.pins(link).takeIf { it.isNotEmpty() }?.let { setPins(c, code, it) } }
+    /**
+     * The group name and code in invite [link] and the admins it names, or null if it isn't one. Reading a link keeps
+     * nothing: the admins are saved only when the user joins with it ([switchTo], [setUp]).
+     */
+    fun readInvite(link: String): SavedGroup? = Invite.parse(link)?.let { (name, code) -> SavedGroup(name, code, Invite.pins(link)) }
 }
 
 /**
- * People the user blocked and messages the user reported: both are hidden everywhere (chats, places, people, alerts).
- * Kept only on this phone. Reports also go to the internet relays (NostrLink) when there is internet.
+ * People the user blocked and messages the user reported or hid: both are hidden everywhere (chats, places, people,
+ * alerts). Kept only on this phone. Reports also go to the internet relays (NostrLink) when there is internet.
+ * A block holds for the channel it was made in, Everyone or one group, and only a checked message's sender can be
+ * blocked ([Blocks]): an unchecked message can be hidden, not its sender.
  */
 object Moderation {
     private fun prefs(c: Context) = c.getSharedPreferences("mesh", 0)
     @Volatile private var blockedCache: Map<String, String>? = null
     @Volatile private var hiddenCache: Set<String>? = null
 
-    /** Blocked sender ids and the name they had. */
+    /** What is blocked ([Blocks.key]: the channel and the sender id) and the name that sender had. */
     fun blocked(c: Context): Map<String, String> = blockedCache ?: runCatching {
         val o = JSONObject(prefs(c).getString("blocked", "{}")!!); o.keys().asSequence().associateWith { o.getString(it) }
     }.getOrDefault(emptyMap()).also { blockedCache = it }
 
-    fun block(c: Context, id: String, name: String) = saveBlocked(c, blocked(c) + (id to name))
-    fun unblock(c: Context, id: String) = saveBlocked(c, blocked(c) - id)
+    /** Blocks the sender of [m] in the channel [m] came in. False, and nothing saved, if that sender can't be blocked ([Blocks.canBlock]). */
+    fun block(c: Context, m: Message): Boolean {
+        val channel = channelOf(m)
+        if (channel == null || !Blocks.canBlock(m, MeshEngine.deviceId)) return false
+        saveBlocked(c, blocked(c) + (Blocks.key(channel, m.sender) to m.name))
+        return true
+    }
+    /** [key]: a key of [blocked]. */
+    fun unblock(c: Context, key: String) = saveBlocked(c, blocked(c) - key)
+    /** The channel a message's sender is blocked in: Everyone, or its group's id (which stays when the group's code changes). */
+    private fun channelOf(m: Message): String? = if (m.public) Blocks.EVERYONE else MeshEngine.groupId(m.group)
     private fun saveBlocked(c: Context, m: Map<String, String>) {
         blockedCache = m; prefs(c).edit().putString("blocked", JSONObject(m).toString()).apply()
     }
@@ -361,7 +392,11 @@ object Moderation {
         hiddenCache = s; prefs(c).edit().putStringSet("hidden", s).apply()
     }
 
-    fun visible(c: Context, m: Message) = m.sender !in blocked(c) && m.id !in hidden(c)
+    fun visible(c: Context, m: Message): Boolean {
+        if (m.id in hidden(c)) return false
+        val b = blocked(c)
+        return b.isEmpty() || !Blocks.hides(b.keys, channelOf(m), m.sender)
+    }
 }
 
 /**

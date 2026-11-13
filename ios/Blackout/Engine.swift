@@ -78,7 +78,7 @@ final class Engine: ObservableObject {
     /// key there (Keychain), and the members' public keys this phone knows (`known`, guarded by `lock`).
     final class Keys: @unchecked Sendable {
         private var doors: (now: Door, old: [Door]) // lock
-        private var state: (removedAt: (number: Int64, rank: Int)?, closed: Bool, rejoiningSince: Int64) = (nil, false, 0) // lock
+        private var state: (removedAt: (number: Int64, rank: Int)?, removedBy: String?, closed: Bool, rejoiningSince: Int64, leftOut: LeftOut?) = (nil, nil, false, 0, nil) // lock
         /// The door in use. It changes when someone is removed; the old ones stay a week, for removals that crossed.
         var door: Door { lock.withLock { doors.now } }
         var oldDoors: [Door] { lock.withLock { doors.old } }
@@ -86,8 +86,13 @@ final class Engine: ObservableObject {
         var code: String { door.code }
         var intros: GroupCrypto { door.intros }
         var rekeys: GroupCrypto { door.rekeys }
-        /// This phone was removed from the group: that removal's epoch number and its maker's rank.
+        /// This phone was removed from the group: that removal's epoch number and its maker's rank, and `removedBy` its maker.
         var removedAt: (number: Int64, rank: Int)? { get { lock.withLock { state.removedAt } } set { lock.withLock { state.removedAt = newValue } } }
+        var removedBy: String? { get { lock.withLock { state.removedBy } } set { lock.withLock { state.removedBy = newValue } } }
+        /// A new key that lists this phone but gave it no part it can open (`Keyring.Taken.leftOut`): its number and rank, and
+        /// how many keys this phone has made to get back in.
+        typealias LeftOut = (number: Int64, rank: Int, tries: Int)
+        var leftOut: LeftOut? { get { lock.withLock { state.leftOut } } set { lock.withLock { state.leftOut = newValue } } }
         var removed: Bool { removedAt != nil }
         /// This phone had been away past the weekly key and asked to come back (its new key is the request): since when, or 0.
         var rejoiningSince: Int64 { get { lock.withLock { state.rejoiningSince } } set { lock.withLock { state.rejoiningSince = newValue } } }
@@ -132,7 +137,7 @@ final class Engine: ObservableObject {
     /// Group id -> what was written before an admin let this phone in. Main thread.
     private var waitingToJoin: [String: [(text: String, photo: Data?)]] = [:]
 
-    struct Known { let checker: MemberKey.Checker; let enc: Data?; let name: String; var encAt: Int64 = 0; var pq: Data? = nil }
+    struct Known { let checker: MemberKey.Checker; let enc: Data?; let name: String; var encAt: Int64 = 0; var pq: Data? = nil; var seen: Int64 = 0 } // seen: when it last changed here
 
     /// A packet opened with one of `Keys`: not shown before its signature is checked (spec "Signatures").
     private enum Seen {
@@ -144,11 +149,13 @@ final class Engine: ObservableObject {
     }
 
     /// A message or receipt from a member whose public key isn't known yet; checked when the introduction comes.
-    private struct Pending { let k: Keys; let sender: String; let o: GroupCrypto.Opened; let receipt: Message? }
-    private var pending: [String: Pending] = [:] // main thread: packet id -> waiting
-    private static let maxPending = 1_000, maxKnown = 500, introEvery: Int64 = 3 * 24 * 3_600_000
+    private struct Pending { let k: Keys; let o: GroupCrypto.Opened; let receipt: Message? }
+    /// What waits for a key, each group and the Public channel apart (`KeyWait`). Main thread.
+    private var unchecked = KeyWait<ObjectIdentifier, Pending>()
+    private static let maxKnown = 500, introEvery: Int64 = 3 * 24 * 3_600_000
     private let keyLock = NSLock()
     private let knownLock = NSLock()
+    private var knownDirty: [String: Keys] = [:] // group id -> keys whose saved key list is behind memory; knownLock
     private let rescanLock = NSLock(), rescanFlag = Flag() // new keys arriving together: one reading of the store
     private final class Flag { var on = false }
     private var keyCache: [String: Keys] = [:] // code -> keys: each derivation takes 32 MiB of scrypt, so only once
@@ -164,21 +171,26 @@ final class Engine: ObservableObject {
     private var myReceipts = Set<String>() // ids of receipts written on this phone (they go up to the relays first); idsLock
     private var sentIds: RecentIds         // my messages already handed off, saved on the phone; idsLock
     private var receiptIds = RecentIds(max: 20_000) // receipt packets this phone can open, kept off LoRa; guarded by idsLock
+    private var shownAs: [String: String] = [:] // what was signed (`GroupCrypto.Opened.mark`) -> the row that shows it; idsLock
 
     private let storeLock = NSLock()
     private var index: [String: StoreCap.Entry] = [:] // every stored packet, for the store cap; guarded by storeLock
     private var indexBytes = 0                        // storeLock
+    private var doorCount = 0, doorBytes = 0          // what the index holds of `StoreCap.Kind.door`; storeLock
+    private var joinAlertAt: [String: Int64] = [:]    // group id -> when this phone last alerted "asks to join" there; storeLock
     private var allKeys = false                       // every saved group's key was tried on the whole store; storeLock
     private var compacting = false                    // storeLock
+    private var raisedTtl: [String: Int] = [:]        // stored packets whose ttl a later copy raised (MeshRouter.key → ttl), until written; storeLock
     private let work = DispatchQueue(label: "engine", qos: .userInitiated) // loading, keys and compaction, in order
 
     private var raw: [Message] = []          // main thread: every readable message, before moderation
     private var rawIds = Set<String>()       // main thread
-    private var receiptMsgs: [String: Message] = [:] // main thread: opened receipts by packet id
     private var pendingAcks: [(id: String, key: Keys)] = [] // main thread: messages to confirm, with their group's keys
     private var firstAck: Int64 = 0, lastAck: Int64 = 0            // main thread
 
     private let store = PacketStore()
+    /// Packets that arrived under an id another packet had already taken: each goes by its key (`StoreCap.name`).
+    private let more = PacketStore(file: "more.bin", naming: .key)
     private let history = PacketStore(file: "history.bin")
     private(set) var router: MeshRouter!
     private var ble: BleLink!
@@ -187,6 +199,8 @@ final class Engine: ObservableObject {
     private(set) var meshcore: MeshCoreLink!
     private(set) var wifi: WifiLink!
     private(set) var nostr: NostrLink!
+    /// Packets a relay brought first: they never go back up, after a restart either (spec "Publish"). Saved by the relay links.
+    private let fromRelays = FromRelays(UserDefaults.standard.string(forKey: FromRelays.pref) ?? "")
 
     /// Starts the transports at once; keys and stored messages are read in the background (no scrypt key
     /// derivation or store reading on the main thread), then published.
@@ -209,13 +223,15 @@ final class Engine: ObservableObject {
         handedOff = Set(sentIds.list)
         router = MeshRouter(send: { [weak self] peer, p in self?.route(peer, p) },
                             deliver: { [weak self] p in self?.onDeliver(p) },
-                            minCipher: MeshRouter.minSealed, maxPerMinute: MeshRouter.linkPerMinute, unlimited: { $0 == NostrLink.peer })
+                            minCipher: MeshRouter.minSealed, maxPerMinute: MeshRouter.linkPerMinute, unlimited: { $0 == NostrLink.peer },
+                            raised: { [weak self] p in self?.onRaised(p) })
         mc = MultipeerLink(nodeId: linkId, router: router) { [weak self] s in self?.setStatus("1-mc", s) }
         ble = BleLink(nodeId: linkId, router: router) { [weak self] s in self?.setStatus("2-ble", s) }
         lora = LoraLink(router: router) { [weak self] s in self?.setStatus("3-lora", s) }
         meshcore = MeshCoreLink(router: router) { [weak self] s in self?.setStatus("3b-meshcore", s) }
         wifi = WifiLink(nodeId: linkId, router: router) { [weak self] s in self?.setStatus("4-wifi", s) }
-        nostr = NostrLink(router: router, viaTor: d.object(forKey: "tor") as? Bool ?? true, scopes: { [weak self] in self?.relayScopes() ?? [] },
+        nostr = NostrLink(router: router, viaTor: TorSetting.isOn(d), scopes: { [weak self] in self?.relayScopes() ?? [] },
+                          packetKey: { [weak self] id in self?.packetKey(id) }, fromRelays: fromRelays,
                           onRelays: { [weak self] id in self?.markHandedOff(id) }) { [weak self] s in
             self?.setStatus("5-internet", s)
         }
@@ -281,6 +297,16 @@ final class Engine: ObservableObject {
         OfflineMap.shared.applyNetwork()
     }
 
+    /// The very packet a message is shown from (`MeshRouter.key`), or nil: what a report of that message is about.
+    /// `id` is the name the packet goes by in the store (`StoreCap.name`): the packet stored first under an id goes by
+    /// that id, any other by its key. Reads the whole store (once per reported message); any thread.
+    private func packetKey(_ id: String) -> String? {
+        if id.count > 16 { return id }
+        var key: String?
+        store.forEachNamed { p, name in if name == id { key = MeshRouter.key(p) } }
+        return key
+    }
+
     /// This phone's relay mailboxes (spec/FORMAT.md, "Mailboxes"): its group's, the other saved groups', the Public
     /// channel's last. Any thread.
     private func relayScopes() -> [NostrLink.Scope] {
@@ -294,13 +320,23 @@ final class Engine: ObservableObject {
     }
 
     /// The cached keys of `code`, derived the first time (32 MiB of scrypt). Any thread; never holds a lock while
-    /// deriving, so the main thread never waits for another group's key.
-    private func keys(_ code: String) -> Keys {
+    /// deriving, so the main thread never waits for another group's key. A code its group has moved on from (an old
+    /// invite, an alert from before a removal) gives the keys that group has under its new code, if it is saved here: a
+    /// second holder would put the old door on the group's current keyring and save over it.
+    private func keys(_ code: String, follow: Bool = true) -> Keys {
         if let k = keyLock.withLock({ keyCache[code] }) { return k }
         let k = Keys(code: code)
+        if follow, let now = movedTo(k) { return keys(now, follow: false) }
         loadKnown(k)
         loadRing(k)
         return keyLock.withLock { if let other = keyCache[code] { return other }; keyCache[code] = k; return k }
+    }
+
+    /// The code `k`'s group has now, if `k` was made from another one and the group is saved on this phone under it (`moveDoor` notes it).
+    private func movedTo(_ k: Keys) -> String? {
+        guard let now = Vault.get("door.\(k.id)").flatMap({ String(data: $0, encoding: .utf8) }), now != k.code,
+              SavedGroups.all().contains(where: { $0.code == now }) else { return nil }
+        return now
     }
 
     // MARK: - Member keys (spec/FORMAT.md, "Signatures", "Introductions")
@@ -311,37 +347,58 @@ final class Engine: ObservableObject {
         var out: [String: Known] = [:]
         for (id, v) in saved {
             guard let p = v["p"], let c = MemberKey.Checker(Self.unhex(p)) else { continue }
-            out[id] = Known(checker: c, enc: v["e"].map(Self.unhex), name: v["n"] ?? "", encAt: Int64(v["a"] ?? "") ?? 0, pq: v["q"].map(Self.unhex))
+            out[id] = Known(checker: c, enc: v["e"].map(Self.unhex), name: v["n"] ?? "", encAt: Int64(v["a"] ?? "") ?? 0, pq: v["q"].map(Self.unhex), seen: Int64(v["s"] ?? "") ?? 0)
         }
         k.lock.withLock { k.known = out }
     }
 
-    /// A member's public keys from a checked introduction: saved (the 500 most recently seen per group stay). True if new.
+    /// A member's public keys from a checked introduction: kept (the 500 most recently changed per group stay), and saved
+    /// soon after. True if new. Someone who isn't in the group and isn't known here yet is kept only while there is room
+    /// among those asking to join (`Joining`).
     @discardableResult private func learn(_ k: Keys, _ id: String, _ c: MemberKey.Checker, enc: Data? = nil, encAt: Int64 = 0, pq: Data? = nil, name who: String = "") -> Bool {
-        let (fresh, cur): (Bool, Known) = k.lock.withLock {
+        if !k.isPublic, id != k.me, k.lock.withLock({ k.known[id] == nil }), !Joining.keeps(id, asking: asking(k), listed: k.ring.everyone(), me: k.me) { return false }
+        let members = Set(k.members)
+        let (fresh, changed): (Bool, Bool) = k.lock.withLock {
             let had = k.known[id]
             let newer = enc != nil && EncSchedule.isNewer(known: had?.encAt ?? 0, ts: encAt)
-            let now = Known(checker: c, enc: newer ? enc : had?.enc, name: who.isEmpty ? had?.name ?? "" : who, encAt: newer ? encAt : had?.encAt ?? 0, pq: newer ? pq : had?.pq)
-            k.known[id] = now
-            return (had == nil, now)
+            let name = who.isEmpty ? had?.name ?? "" : who
+            let changed = had == nil || newer || had?.checker.pub != c.pub || had?.name != name
+            k.known[id] = Known(checker: c, enc: newer ? enc : had?.enc, name: name, encAt: newer ? encAt : had?.encAt ?? 0, pq: newer ? pq : had?.pq,
+                                seen: changed ? Self.nowMs() : had?.seen ?? 0)
+            if k.known.count > Self.maxKnown {
+                // The least recently changed go, but never someone in the group, or new keys for them couldn't be sealed.
+                let old = k.known.filter { !members.contains($0.key) && $0.key != id }.sorted { $0.value.seen < $1.value.seen }
+                for (gone, _) in old.prefix(k.known.count - Self.maxKnown) { k.known[gone] = nil } // a flood of made-up members can't fill the memory
+            }
+            return (had == nil, changed)
         }
-        let d = UserDefaults.standard, key = "known.\(k.id)"
-        knownLock.lock(); defer { knownLock.unlock() } // read, change, write: two at once would lose a key
-        var saved = d.dictionary(forKey: key) as? [String: [String: String]] ?? [:]
-        let hex: (Data) -> String = { $0.map { String(format: "%02x", $0) }.joined() }
-        var v = saved[id] ?? [:]
-        v["s"] = String(Self.nowMs()); v["p"] = hex(c.pub)
-        if let e = cur.enc { v["e"] = hex(e); v["a"] = String(cur.encAt); v["q"] = cur.pq.map(hex) }
-        if !who.isEmpty { v["n"] = who }
-        saved[id] = v
-        if saved.count > Self.maxKnown {
-            // The least recently seen go, but never someone in the group, or new keys for them couldn't be sealed.
-            let members = Set(k.members)
-            let old = saved.filter { !members.contains($0.key) && $0.key != id }.sorted { (Int64($0.value["s"] ?? "") ?? 0) < (Int64($1.value["s"] ?? "") ?? 0) }
-            for (id, _) in old.prefix(saved.count - Self.maxKnown) { saved.removeValue(forKey: id); k.lock.withLock { _ = k.known.removeValue(forKey: id) } } // in memory too: a flood of made-up members can't fill it
-        }
-        d.set(saved, forKey: key)
+        // An introduction that brings nothing new (one read again from the store, or played back) writes nothing.
+        if changed { saveKnownSoon(k) }
         return fresh
+    }
+
+    /// Saves `k`'s key list 2 s from now, with whatever else changes until then: the whole list is written once, not once
+    /// for every introduction that arrives. What isn't saved when the app ends is learned again from the stored packets.
+    private func saveKnownSoon(_ k: Keys) {
+        let first = knownLock.withLock { () -> Bool in let was = knownDirty.isEmpty; knownDirty[k.id] = k; return was }
+        guard first else { return }
+        work.asyncAfter(deadline: .now() + 2) { self.saveKnown() }
+    }
+
+    /// Writes the key lists that changed: member id -> ["s": when it last changed here, ms, "p": signing key hex, "e":
+    /// encryption key hex, "a": when it was introduced, "q": ML-KEM key hex, "n": name]. On `work`.
+    private func saveKnown() {
+        let all = knownLock.withLock { () -> [Keys] in let a = Array(knownDirty.values); knownDirty = [:]; return a }
+        for k in all {
+            var saved: [String: [String: String]] = [:]
+            for (id, w) in k.lock.withLock({ k.known }) {
+                var v = ["s": String(w.seen), "p": Self.hex(w.checker.pub)]
+                if let e = w.enc { v["e"] = Self.hex(e); v["a"] = String(w.encAt); v["q"] = w.pq.map(Self.hex) }
+                if !w.name.isEmpty { v["n"] = w.name }
+                saved[id] = v
+            }
+            UserDefaults.standard.set(saved, forKey: "known.\(k.id)")
+        }
     }
 
     /// `k`'s epoch secrets from the Keychain. A group this phone founded (created here, or saved before v0.6) and that
@@ -353,7 +410,8 @@ final class Engine: ObservableObject {
                 guard let n = (o["n"] as? NSNumber)?.int64Value, let made = (o["made"] as? NSNumber)?.int64Value, let s = o["s"] as? String else { continue }
                 func text(_ n: String) -> String? { (o[n] as? String).flatMap { $0.isEmpty ? nil : $0 } }
                 k.ring.add(.init(number: n, made: made, secret: Self.unhex(s), members: o["m"] as? [String] ?? [], admins: o["a"] as? [String] ?? [],
-                                 code: text("c"), via: text("v"), removes: text("r"), by: text("b"), rank: (o["k"] as? NSNumber)?.intValue ?? .max))
+                                 code: text("c"), via: text("v"), removes: text("r"), by: text("b"), rank: (o["k"] as? NSNumber)?.intValue ?? .max,
+                                 taken: (o["t"] as? NSNumber)?.int64Value)) // saved before "t": its date
             }
         }
         if let raw = Vault.get("mkeys.\(k.id)") {
@@ -362,16 +420,24 @@ final class Engine: ObservableObject {
                 let hash = String(decoding: b[i..<(i + 64)], as: UTF8.self), n = b[(i + 64)..<(i + 68)].reduce(0) { $0 << 8 | Int($1) }
                 i += 68
                 guard i + n <= b.count else { break }
-                if let e = k.ring.all.first(where: { $0.hash == hash }) { e.messageKeys = MessageKeys.decode(Data(b[i..<(i + n)])) }
+                // By the epoch's id: two epochs can share a secret. By its hash for keys saved before epochs had an id.
+                let all = k.ring.all
+                if let e = all.first(where: { $0.id == hash }) ?? all.first(where: { $0.hash == hash }) { e.messageKeys = MessageKeys.decode(Data(b[i..<(i + n)])) }
                 i += n
             }
         }
+        // The parts it opened, only together with the epochs they brought: without those, the stored new keys are read again.
+        if k.joined, let raw = Vault.get("parts.\(k.id)") { k.ring.restoreParts(String(decoding: raw, as: UTF8.self).split(separator: ",").map(String.init)) }
         var via: [String] = []
         for c in k.ring.all.compactMap(\.via) where c != k.code && !via.contains(c) { via.append(c) }
         k.setDoors(k.door, old: via.map(Door.init))
+        if k.ring.lastMove?.code == k.code, Vault.get("door.\(k.id)") == nil { Vault.put("door.\(k.id)", Data(k.code.utf8)) } // moved before this was noted
         let d = UserDefaults.standard
         k.rejoiningSince = Int64(d.double(forKey: "rejoining.\(k.id)"))
-        if let p = d.string(forKey: "removedAt.\(k.id)")?.split(separator: ":"), p.count == 2, let n = Int64(p[0]), let r = Int(p[1]) { k.removedAt = (n, r) }
+        if let p = d.string(forKey: "removedAt.\(k.id)")?.split(separator: ":"), p.count >= 2, let n = Int64(p[0]), let r = Int(p[1]) {
+            k.removedAt = (n, r); k.removedBy = p.count > 2 ? String(p[2]) : nil
+        }
+        if d.bool(forKey: "closed.\(k.id)") { k.closed = true; k.ring.closed = true }
         var found = Set(GroupSecrets.shared.found)
         if !k.joined && found.contains(k.code) {
             var b = [UInt8](repeating: 0, count: 32); _ = SecRandomCopyBytes(kSecRandomDefault, 32, &b)
@@ -388,8 +454,15 @@ final class Engine: ObservableObject {
         saveMessageKeys(k)
         let hex: (Data) -> String = { $0.map { String(format: "%02x", $0) }.joined() }
         let list: [[String: Any]] = k.ring.all.map { ["n": $0.number, "made": $0.made, "s": hex($0.secret), "m": $0.members, "a": $0.admins,
-                                                  "c": $0.code ?? "", "v": $0.via ?? "", "r": $0.removes ?? "", "b": $0.by ?? "", "k": $0.rank] }
+                                                  "c": $0.code ?? "", "v": $0.via ?? "", "r": $0.removes ?? "", "b": $0.by ?? "", "k": $0.rank, "t": $0.taken] }
         Vault.put("epochs.\(k.id)", try? JSONSerialization.data(withJSONObject: list))
+        saveParts(k)
+    }
+
+    /// The sealed parts `k`'s keyring has opened (`Keyring.openedParts`): saved after the epochs they brought, never before.
+    private func saveParts(_ k: Keys) {
+        _ = k.ring.partsToSave()
+        Vault.put("parts.\(k.id)", Data(k.ring.openedParts.joined(separator: ",").utf8))
     }
 
     /// Marks `code` as founded on this phone (a new group): its first epoch is made here.
@@ -415,7 +488,7 @@ final class Engine: ObservableObject {
     func rejoining(_ code: String?) -> Bool { held(code)?.rejoining ?? false }
 
     /// Makes the weekly new key of every saved group that is due. On `work`.
-    func weeklyCheck() { let s = keySet; for k in [s.active].compactMap({ $0 }) + s.others { rekeyIfDue(k); finishRemovals(k) } }
+    func weeklyCheck() { let s = keySet; for k in [s.active].compactMap({ $0 }) + s.others { rekeyIfDue(k); finishRemovals(k); answerLeftOut(k) } }
 
     private func hourly() {
         work.asyncAfter(deadline: .now() + .seconds(Int(Keyring.hourMs / 1000))) { [weak self] in
@@ -428,8 +501,9 @@ final class Engine: ObservableObject {
     /// phones don't all do it at once; the first to do it settles it for the rest. Well past that delay this phone has
     /// missed the group's new keys, or the whole group was quiet: its new key is then also how it asks to come back.
     private func rekeyIfDue(_ k: Keys) {
-        guard let cur = k.ring.currentOrNil, !k.isPublic, !k.removed, Keyring.weeklyDue(made: cur.made, now: Self.clock(), delay: k.weeklyDelay) else { return }
-        let away = Keyring.overdue(made: cur.made, now: Self.clock())
+        // Counted from when this phone got the key, if that was after its date: a member's key dated long ago isn't due at once.
+        guard let cur = k.ring.currentOrNil, !k.isPublic, !k.removed, Keyring.weeklyDue(made: cur.since, now: Self.clock(), delay: k.weeklyDelay) else { return }
+        let away = Keyring.overdue(made: cur.since, now: Self.clock())
         if makeRekey(k, add: [], answers: nil) && away { setRejoining(k, Self.nowMs()) }
     }
 
@@ -461,9 +535,25 @@ final class Engine: ObservableObject {
 
     /// A member's phone missed our keys: a new epoch, sealed to everyone, brings it back (spec "Away for a while"). Not if
     /// another member answered first, or this phone made a key in the last hour (a flood of these must not cost more than that).
-    private func answerBehind(_ k: Keys, made: Int64) {
-        guard let cur = k.ring.currentOrNil, !k.removed, cur.made < made, !k.ring.tooSoon(k.me, made: Self.clock()) else { return }
+    /// `at`: this phone's current epoch when that member's key came. Another one since then is the answer, whatever date
+    /// the key carried: its maker writes the date, and one a few minutes ahead would have every phone answer.
+    private func answerBehind(_ k: Keys, made: Int64, at: Keyring.Epoch?) {
+        guard let cur = k.ring.currentOrNil, !k.removed, cur === at, cur.made < made, !k.ring.tooSoon(k.me, made: Self.clock()) else { return }
         makeRekey(k, add: [], answers: nil)
+    }
+
+    /// A new key listed this phone but its part didn't open (`Keyring.Taken.leftOut`): the others may have moved on to it,
+    /// and can't tell. Like a phone that was away, this one makes a key of its own, sealed to everyone, and shows that it is
+    /// rejoining. That key has the same number as the one it couldn't open if that was the next one, so it can lose to it:
+    /// an hour later this phone makes one more, numbered above both. Not once a key that settles it got here: a
+    /// higher-numbered one, or one of the same number that comes before the one it couldn't open whatever the hashes.
+    private func answerLeftOut(_ k: Keys) {
+        guard let t = k.leftOut, let cur = k.ring.currentOrNil else { return }
+        if k.removed || cur.number > t.number || (cur.number == t.number && (cur.code != nil || cur.rank < t.rank)) { k.leftOut = nil; return }
+        if k.ring.tooSoon(k.me, made: Self.clock()) { return } // the hourly check tries again
+        guard makeRekey(k, add: [], answers: nil) else { return }
+        setRejoining(k, Self.nowMs())
+        k.leftOut = t.tries == 0 ? (t.number, t.rank, 1) : nil
     }
     /// The admins an invite to `code`'s group names (spec "Invites"), first listed first, or nil until its keys are loaded.
     func invitePins(_ code: String) -> String? {
@@ -518,28 +608,40 @@ final class Engine: ObservableObject {
     private func acceptRekey(_ k: Keys, _ o: GroupCrypto.Opened, _ r: Rekey, _ packetId: String, _ door: Door) -> Bool {
         let maker = o.message.sender
         guard signed(o, r) else { return false }
-        let pinned = Invite.allows(GroupSecrets.shared.pins(k.code), maker: r.maker) // only read while this phone has no epoch
+        let pins = GroupSecrets.shared.pins(k.code)
+        let pinned = Invite.allows(pins, maker: r.maker) // only read while this phone has no epoch
         #if DEBUG
         if !pinned && !k.joined { DebugLog.write("new key from someone this invite doesn't name: ignored") }
         #endif
-        if r.removal && k.rejoining && maker != k.me { k.closed = true } // the group may have moved on while this phone was away
-        switch k.ring.take(r, maker: maker, me: k.me, door: door.code, oldDoor: door !== k.door, removedAt: k.removedAt, pinned: pinned, open: { k.encs.open($0, info: Rekey.info(door.id), aad: Rekey.aad(packetId, k.me)) }) {
+        // The group may have moved on while this phone was away. Only on an admin's word: anyone who has the code can sign a removal.
+        if r.removal && k.rejoining && maker != k.me && door === k.door && k.ring.movedOn(r, maker: maker) { k.closed = true }
+        defer { if k.ring.partsToSave() { saveParts(k) } } // a part opened for an epoch this phone holds already: not opened again either
+        switch k.ring.take(r, maker: maker, me: k.me, door: door.code, oldDoor: door !== k.door, removedAt: k.removedAt, pinned: pinned, removedBy: k.removedBy, named: Invite.names(pins, maker: r.maker), inUse: otherCodes(k), open: { k.encs.open($0, info: Rekey.info(door.id), aad: Rekey.aad(packetId, k.me)) }) {
         case .ignored:
+            return false
+        case .leftOut(let number, let rank):
+            // The others may have taken this key and be writing with it; this phone can't. It asks its way back with a key of its own.
+            #if DEBUG
+            DebugLog.write("epoch \(number) from \(o.message.name) lists this phone, but its part doesn't open")
+            #endif
+            if (k.leftOut?.number ?? 0) < number { k.leftOut = (number, rank, 0) } // read again from the store: the count stays
+            work.asyncAfter(deadline: .now() + .milliseconds(Int.random(in: 0..<3_000))) { self.answerLeftOut(k) }
             return false
         case .closed:
             k.closed = true
+            UserDefaults.standard.set(true, forKey: "closed.\(k.id)") // saved: the keyring takes no key through this code from now on
             DispatchQueue.main.async { self.refresh() }
             return false
-        case .removed(let number, let rank):
-            k.removedAt = (number, rank)
-            UserDefaults.standard.set("\(number):\(rank)", forKey: "removedAt.\(k.id)")
+        case .removed(let number, let rank, let by):
+            k.removedAt = (number, rank); k.removedBy = by
+            UserDefaults.standard.set("\(number):\(rank):\(by)", forKey: "removedAt.\(k.id)")
             #if DEBUG
             DebugLog.write("removed from a group by \(o.message.name)")
             #endif
             DispatchQueue.main.async { self.refresh() }
             return false
         case .added(let e, let moveTo, let back):
-            if back { k.removedAt = nil; UserDefaults.standard.removeObject(forKey: "removedAt.\(k.id)") }
+            if back { k.removedAt = nil; k.removedBy = nil; UserDefaults.standard.removeObject(forKey: "removedAt.\(k.id)") }
             if moveTo != nil { moveDoor(k) }
             saveRing(k)
             if k.ring.current === e && maker != k.me { setRejoining(k, 0) }
@@ -549,6 +651,12 @@ final class Engine: ObservableObject {
             #endif
             return true
         }
+    }
+
+    /// The codes of the other groups on this phone, saved or held: a removal can't move `k`'s group onto one of them.
+    private func otherCodes(_ k: Keys) -> [String] {
+        let held = keyLock.withLock { keyCache.filter { $0.value !== k }.map(\.key) }
+        return (SavedGroups.all().map(\.code) + [GroupSecrets.shared.code] + held).filter { !$0.isEmpty && $0 != k.code }
     }
 
     /// Two admins removed different people at once: only one removal won, so the other person is still in the current
@@ -569,7 +677,9 @@ final class Engine: ObservableObject {
         let next = Door(code)
         Vault.put("origin.\(next.id)", Data(k.id.utf8))
         k.setDoors(next, old: [old] + k.oldDoors.filter { $0.code != code })
+        k.closed = false // that was about the code it left
         keyLock.withLock { keyCache.removeValue(forKey: old.code); keyCache[code] = k }
+        Vault.put("door.\(k.id)", Data(code.utf8)) // where the group is now: its old codes lead here (`keys`)
         SavedGroups.replaceCode(old.code, code)
         let d = UserDefaults.standard
         d.removeObject(forKey: "introAt.\(k.id)") // introduce ourselves through the new door
@@ -591,11 +701,24 @@ final class Engine: ObservableObject {
     /// the door in the last week and aren't in the group, weren't removed and weren't turned down.
     func joinRequests(_ code: String?) -> [JoinRequest] {
         guard let k = held(code), let cur = k.ring.currentOrNil, !k.removed, cur.admins.contains(k.me) else { return [] }
-        let gone = Set(k.ring.all.compactMap(\.removes)), no = declined(k), cut = Self.nowMs() - 7 * 24 * 3_600_000
+        let gone = Set(k.ring.all.compactMap(\.removes)), ids = asking(k).filter { !gone.contains($0) }
         return k.lock.withLock {
-            k.known.filter { id, w in id != k.me && !cur.members.contains(id) && !gone.contains(id) && !no.contains(id) && w.pq != nil && w.encAt >= cut }
-                .map { JoinRequest(id: $0.key, name: $0.value.name.isEmpty ? "Someone" : $0.value.name, pub: $0.value.checker.pub) }
+            ids.compactMap { id in k.known[id].map { JoinRequest(id: id, name: $0.name.isEmpty ? "Someone" : $0.name, pub: $0.checker.pub) } }
         }.sorted { $0.id < $1.id }
+    }
+
+    /// Who is asking to join `k`'s group (`Joining.asking`): they introduced themselves through the door in the last week,
+    /// aren't in the group and weren't turned down. At most `Joining.maxAsking`: anyone with the code can make up keys.
+    private func asking(_ k: Keys) -> [String] {
+        let at = k.lock.withLock { k.known.filter { $0.value.pq != nil }.mapValues(\.encAt) }
+        return Joining.asking(at, members: Set(k.members), declined: declined(k), me: k.me, now: Self.nowMs())
+    }
+
+    /// The class of a packet `k`'s door opened (`StoreCap.door`): the group's own only if someone in the group wrote it,
+    /// or this phone. `signed`: the packet names `by` and their signature checks. The door opens with the code alone, so
+    /// anything else gets the small room of people who aren't in (`StoreCap.Kind.door`) and can't push a message out.
+    private func doorKind(_ k: Keys, _ by: String, signed: Bool) -> StoreCap.Kind {
+        StoreCap.door(mine: signed && by == k.me, member: signed && k.ring.inGroup(by))
     }
 
     /// An admin lets `id` in: a new epoch for everyone, them included (spec "Joining"). `done` says on the main thread if it worked.
@@ -660,7 +783,7 @@ final class Engine: ObservableObject {
         }
         guard let rk = made else { return false }
         k.ring.add(.fresh(number: rk.epoch, made: now, secret: secret, members: members, admins: list, code: code, via: remove == nil ? nil : door.code, removes: remove, by: k.me,
-                         rank: remove == nil ? .max : k.ring.rank(rk, maker: k.me)))
+                         rank: k.ring.standing(rk, maker: k.me)))
         if code != nil { moveDoor(k) }
         saveRing(k)
         for p in packets {
@@ -678,38 +801,49 @@ final class Engine: ObservableObject {
         return true
     }
 
-    /// true: signed by that member; false: not (forged or broken); nil: the member's public key isn't known yet.
-    private func check(_ k: Keys, _ o: GroupCrypto.Opened) -> Bool? {
+    /// true: signed by that member; false: not (forged or broken), or its sender isn't in the group or was removed; nil:
+    /// the member's public key isn't known yet. `had`: this phone accepted the packet before, so it is read from its own
+    /// copy or was waiting for its sender's key. Only then does a removed member's date count (`Keyring.shutOut`).
+    private func check(_ k: Keys, _ o: GroupCrypto.Opened, had: Bool = false) -> Bool? {
         let id = o.message.sender.hasPrefix("web-") ? String(o.message.sender.dropFirst(4)) : o.message.sender
-        if k.ring.removed(id, before: o.message.ts) { return false } // written after they were removed
+        if k.ring.shutOut(id, at: o.message.ts, had: had) { return false } // not in the group; or removed, and seen only now or dated after the removal
         guard let c = k.checker(id) else { return nil }
         return c.verify(digest: o.digest, signature: o.signature)
     }
 
     /// Messages and receipts of `id` in `k`'s group that waited for its key: shown as checked, or dropped. Main thread.
     private func resolve(_ k: Keys, _ id: String) {
-        let waiting = pending.values.filter { $0.k === k && $0.sender == id }
-        guard !waiting.isEmpty else { return }
-        for w in waiting {
-            pending.removeValue(forKey: w.o.message.id)
-            let ok = check(k, w.o) == true
-            if let r = w.receipt { if ok { receiptMsgs[r.id] = r; deliveries.add(r) }; continue }
-            guard let i = raw.firstIndex(where: { $0.id == w.o.message.id }) else { continue }
-            if ok { raw[i].verified = true; w.o.leaf?.forget(); saveMessageKeys(w.k) } else { rawIds.remove(raw[i].id); raw.remove(at: i) }
+        guard k.checker(id) != nil else { return } // its key wasn't kept (`Joining`): nothing can be checked
+        let waited = unchecked.take(channel: ObjectIdentifier(k), sender: id)
+        guard !waited.isEmpty else { return }
+        for e in waited {
+            let w = e.item
+            let ok = check(k, w.o, had: true) == true
+            if let r = w.receipt { if ok { deliveries.add(group: k.id, r) }; continue }
+            // Only a packet that is the one shown under its id waits (`KeyWait.message`), so this row is that packet's.
+            guard let row = e.row, let i = raw.firstIndex(where: { $0.id == row }), !raw[i].verified else { continue }
+            if ok { raw[i].verified = true; w.o.leaf?.forget(); saveMessageKeys(w.k) } else { rawIds.remove(raw[i].id); idsLock.withLock { shownAs[w.o.mark] = nil }; raw.remove(at: i) }
         }
         refresh()
     }
 
     /// Sends this phone's introduction to `k`'s group when the last one there is more than 3 days old (or there was
     /// none), so members' introductions are always among the packets of the last 7 days. Any thread.
-    private func introIfDue(_ k: Keys) {
+    private func introIfDue(_ k: Keys, writing: Bool = false) {
         guard !k.removed else { return }
         let d = UserDefaults.standard, key = "introAt.\(k.id)", now = Self.nowMs()
+        // The Public channel: only when the user writes there, then while a post of theirs is still shown. A phone
+        // whose user never posts on Everyone doesn't announce itself there.
+        if k.isPublic && !writing {
+            let last = DispatchQueue.main.sync { raw.filter { $0.isPublic && $0.sender == deviceId }.map(\.ts).max() }
+            guard PublicIntro.wanted(writing: false, lastOwnPost: last, now: now) else { return }
+        }
         let rotated = !k.isPublic && k.encs.rotateIfDue(now: Self.clock()) // a new encryption key has to be introduced at once
         guard rotated || now - Int64(d.double(forKey: key)) >= Self.introEvery else { return }
         let id = Packet.newId(mailbox: k.intros.mailbox), who = DispatchQueue.main.sync { name }
         let pq = k.isPublic ? nil : k.encs.currentPq // the Public channel has no new keys to seal
-        guard let c = try? k.intros.seal(id: id, ts: now, sender: k.me, name: who, text: "", extra: pq.map { Data([3]) + k.pub + k.encPub + $0 } ?? Data([2]) + k.pub + k.encPub, sign: { try k.sign($0) })
+        // No name on the Public channel: nothing reads it there, and a post carries its sender's name itself.
+        guard let c = try? k.intros.seal(id: id, ts: now, sender: k.me, name: k.isPublic ? "" : who, text: "", extra: pq.map { Data([3]) + k.pub + k.encPub + $0 } ?? Data([2]) + k.pub + k.encPub, sign: { try k.sign($0) })
         else { return }
         let p = Packet(id: id, ts: k.intros.hideTime(now, c), ttl: Self.maxTtl, cipher: c)
         idsLock.withLock { _ = myReceipts.insert(id) } // written here: goes up to the relays first, like receipts
@@ -734,18 +868,43 @@ final class Engine: ObservableObject {
     /// The user compared `id`'s emoji and they matched: this key is that person's from now on (an older one for the name goes).
     func markChecked(_ code: String?, _ id: String, _ name: String) {
         guard let t = tagOf(code) else { return }
-        let key = Vouch.key(name)
-        var list = checkedList.filter { !($0.hasPrefix("\(t)|") && ($0.hasSuffix("|\(key)") || $0.hasPrefix("\(t)|\(id)|"))) }
-        list.append("\(t)|\(id)|\(key)")
-        UserDefaults.standard.set(list, forKey: "checked")
+        UserDefaults.standard.set(Checked.marked(checkedList, group: t, id: id, name: name), forKey: "checked")
         objectWillChange.send()
     }
 
     /// True if `name` belongs to a checked person but `id` is another key: a reinstall, or someone using their name.
     func newKeyFor(_ code: String?, _ id: String, _ name: String) -> Bool {
         guard id != deviceId, let t = tagOf(code) else { return false }
-        let key = Vouch.key(name)
-        return checkedList.contains { $0.hasPrefix("\(t)|") && $0.hasSuffix("|\(key)") && !$0.hasPrefix("\(t)|\(id)|") }
+        let checked = checkedList
+        return !checked.isEmpty && Checked.newKey(checked, group: t, id: id, name: name)
+    }
+
+    /// The id of the group whose code is or was `code` (`Message.group`): it stays when the code changes, so blocks hang
+    /// off it (`Blocks`). The door a group has just left still counts, for a message read a moment before the move.
+    private func groupId(_ code: String?) -> String? {
+        guard let code else { return nil }
+        if let k = keyLock.withLock({ keyCache[code] }) { return k.id }
+        let all = keyLock.withLock { Array(keyCache.values) }
+        return all.first { k in k.oldDoors.contains { $0.code == code } }?.id
+    }
+
+    /// The channel a message's sender is blocked in (`Blocks`): Everyone, or its group's id.
+    private func channel(of m: Message) -> String? { m.isPublic ? Blocks.everyone : groupId(m.group) }
+
+    /// Blocks the sender of `m` in the channel `m` came in, and shows the messages again. False, and nothing saved, if
+    /// that sender can't be blocked: `m` is this phone's own, or its signature wasn't checked (`Blocks.canBlock`). Main thread.
+    @discardableResult func block(_ m: Message) -> Bool {
+        guard Blocks.canBlock(m, me: deviceId), let c = channel(of: m) else { return false }
+        Moderation.block(Blocks.key(channel: c, sender: m.sender), name: m.name)
+        refresh()
+        return true
+    }
+
+    /// False for a message hidden on this phone: reported or hidden itself, or from someone blocked in its channel. Main thread.
+    private func visible(_ m: Message) -> Bool {
+        if Moderation.hidden.contains(m.id) { return false }
+        let blocked = Moderation.blocked
+        return blocked.isEmpty || !Blocks.hides(Set(blocked.keys), channel: channel(of: m), sender: m.sender)
     }
 
     /// This phone's public key in `code`'s group ("your emoji"), or nil if its keys aren't ready.
@@ -779,12 +938,15 @@ final class Engine: ObservableObject {
     private func startUp(_ code: String) {
         let now = Self.nowMs(), cut = now - Self.week
         var recent: [Packet] = [], seen = Set<String>()
-        store.forEach { p in
-            guard p.ts >= cut, !MeshRouter.inFuture(p.ts, now: now) else { return }
-            seen.insert(MeshRouter.key(p)); recent.append(p)
-            if recent.count >= 2_000 { recent.sort { $0.ts > $1.ts }; recent.removeLast(recent.count - 500) }
+        for s in [store, more] {
+            s.forEach { p in
+                guard p.ts >= cut, !MeshRouter.inFuture(p.ts, now: now) else { return }
+                seen.insert(MeshRouter.key(p)); recent.append(p)
+                if recent.count >= 2_000 { recent.sort { $0.ts > $1.ts }; recent.removeLast(recent.count - 500) }
+            }
         }
-        router.restore(recent, seenIds: seen) // the router keeps the newest 500
+        // The router keeps the newest 500. What the relays brought before the restart doesn't go back to them.
+        router.restore(recent, seenIds: seen, from: { [fromRelays] key in fromRelays.contains(key) ? NostrLink.peer : "" })
         let a = keys(code), pub = keys(GroupCrypto.publicCode)
         cryptoLock.withLock { _active = a; _public = pub }
         load()
@@ -797,9 +959,18 @@ final class Engine: ObservableObject {
     /// store again only if there are any, then trims the store.
     private func savedGroupsChanged(_ code: String) {
         let known = keyLock.withLock { Set(keyCache.keys) }
-        var codes: [String] = []
-        for c in SavedGroups.all().map(\.code) where c != code && !codes.contains(c) { codes.append(c) }
-        let a = keys(code), o = codes.map(keys)
+        let a = keys(code)
+        if a.code != code { // an old code of a group saved here: that group is shown, not a second one
+            let now = a.code
+            DispatchQueue.main.async { SavedGroups.follow(code, now); if self.activeCode == code { self.activeCode = now }; self.refresh() }
+            return savedGroupsChanged(now)
+        }
+        var codes: [String] = [], o: [Keys] = []
+        for c in SavedGroups.all().map(\.code) where c != code && !codes.contains(c) {
+            let k = keys(c)
+            if k.code != c { SavedGroups.follow(c, k.code) } else { codes.append(c) } // an old code among the saved ones isn't kept: its group is saved too
+            if k !== a && !o.contains(where: { $0 === k }) { o.append(k) }
+        }
         cryptoLock.withLock { _active = a; _others = o }
         if !(codes + [code]).allSatisfy(known.contains) { load() }
         storeLock.withLock { allKeys = true }
@@ -813,48 +984,66 @@ final class Engine: ObservableObject {
     /// Packets dated more than 10 minutes ahead are removed. Publishes on the main thread.
     private func load() {
         let k = keySet, now = Self.nowMs()
-        var msgs: [Message] = [], recs: [Message] = [], own = Set<String>(), ownR = Set<String>(), rIds = Set<String>()
+        var msgs: [(Message, String)] = [], recs: [(group: String, receipt: Message)] = [], own = Set<String>(), ownR = Set<String>(), rIds = Set<String>() // msgs: with what was signed (`mark`)
+        var sent: [(group: String, id: String)] = [] // this phone's own group messages, with their group's id (`Deliveries.sent`)
         var idx: [String: StoreCap.Entry] = [:], future = Set<String>()
-        var opened: [(Message, Keys, GroupCrypto.Opened, Bool, Bool)] = [] // checked once every introduction is known
+        var opened: [(Message, Keys, GroupCrypto.Opened, Bool, Bool, Bool)] = [] // checked once every introduction is known; the last: another packet had its id first
         var copies: [String: Data] = [:]
         history.forEach { copies[$0.id] = $0.cipher }
-        store.forEach { stored in
+        // `name`: what the packet goes by (`StoreCap.name`): its id, or its key if another packet had that id first.
+        // `extra`: it comes from the file of those other packets.
+        func read(_ stored: Packet, _ name: String, _ extra: Bool) {
             let p = MeshRouter.clamp(stored)
-            if let had = idx[p.id], had.kind != .unreadable { return } // a record written twice; a readable packet does replace junk sent first under its id
-            if MeshRouter.inFuture(p.ts, now: now) { future.insert(p.id); return }
+            if MeshRouter.inFuture(p.ts, now: now) { future.insert(name); return }
+            // This phone's copy is kept under the packet's name. In "packets.bin" a later record under an id (written by
+            // an older version: a readable packet after junk) may still have its copy under that id.
+            let underId = extra ? nil : copies[p.id]
+            let sealed = underId == nil ? name : p.id, copy = underId ?? copies[Self.copyId(name)]
             // Introductions are learned at once; messages and receipts are checked after the loop, when every
-            // introduction in the store is known, whatever their order.
+            // introduction in the store is known, whatever their order. This phone's own introductions and new keys
+            // count as written here, like its receipts: after a restart too they go up on their group's relay links,
+            // not with the packets it passes on (Nostr.scope).
+            // What came through a group's door is the group's own only from someone in it (`doorKind`).
             let kind: StoreCap.Kind
-            switch copies[p.id].flatMap({ fromHistory(p.id, $0, k) }) ?? see(p, k) {
-            case .intro(let keys, let id, let c, let enc, let who, let ts, let pq)?: learn(keys, id, c, enc: enc, encAt: ts, pq: pq, name: who); kind = keys.isPublic ? .isPublic : .group
-            case .newKey(let keys, let o, let r, let pid, let d)?: _ = acceptRekey(keys, o, r, pid, d); kind = .group
-            case .msg(let m, let keys, let o, let copy)?: opened.append((m, keys, o, false, copy)); kind = m.isPublic ? .isPublic : .group
-            case .receipt(let r, let keys, let o)?: opened.append((r, keys, o, true, false)); rIds.insert(p.id); kind = .group
+            switch copy.flatMap({ fromHistory(sealed, $0, k) }) ?? see(p, k) {
+            case .intro(let keys, let id, let c, let enc, let who, let ts, let pq)?:
+                if id == keys.me { ownR.insert(p.id) }
+                learn(keys, id, c, enc: enc, encAt: ts, pq: pq, name: who); kind = keys.isPublic ? .isPublic : doorKind(keys, id, signed: true)
+            case .newKey(let keys, let o, let r, let pid, let d)?:
+                let ok = signed(o, r)
+                if o.message.sender == keys.me, ok { ownR.insert(p.id) }
+                _ = acceptRekey(keys, o, r, pid, d); kind = doorKind(keys, o.message.sender, signed: ok)
+            case .msg(let m, let keys, let o, let copy)?: opened.append((m.id == name ? m : m.withId(name), keys, o, false, copy, name != p.id)); kind = m.isPublic ? .isPublic : .group
+            case .receipt(let r, let keys, let o)?: opened.append((r, keys, o, true, false, false)); rIds.insert(p.id); kind = .group
             default: kind = .unreadable
             }
-            idx[p.id] = StoreCap.Entry(id: p.id, ts: p.ts, size: Packet.headerSize + p.cipher.count, kind: kind)
+            idx[name] = StoreCap.Entry(id: name, ts: p.ts, size: Packet.headerSize + p.cipher.count, kind: kind)
         }
+        store.forEachNamed { read($0, $1, false) }
+        more.forEachNamed { read($0, $1, true) }
         var waiting: [Pending] = [], spent: [Keys] = []
-        for (m, keys, o, receipt, copy) in opened {
-            switch check(keys, o) {
+        for (m, keys, o, receipt, copy, other) in opened {
+            if other, !receipt, m.sender == deviceId { continue } // another packet under an id that was taken, naming this phone as its sender: never a row of its own
+            switch check(keys, o, had: copy) {
             case true?:
-                if receipt { recs.append(m); if m.sender == deviceId { ownR.insert(m.id) } }
+                if receipt { recs.append((keys.id, m)); if m.sender == deviceId { ownR.insert(m.id) } }
                 else {
-                    msgs.append(m); if m.sender == deviceId { own.insert(m.id) }
+                    msgs.append((m, o.mark))
+                    if m.sender == deviceId { own.insert(m.id); if !m.isPublic { sent.append((keys.id, m.id)) } }
                     if !copy { remember(m.id, keys, o) }
                     if let l = o.leaf { l.forget(); if !spent.contains(where: { $0 === keys }) { spent.append(keys) } }
                 }
             case nil:
-                if receipt { waiting.append(Pending(k: keys, sender: o.message.sender, o: o, receipt: m)) }
-                else { var u = m; u.verified = false; msgs.append(u); waiting.append(Pending(k: keys, sender: o.message.sender, o: o, receipt: nil)); if !copy { remember(m.id, keys, o) } }
+                if receipt { waiting.append(Pending(k: keys, o: o, receipt: m)) }
+                else { var u = m; u.verified = false; msgs.append((u, o.mark)); waiting.append(Pending(k: keys, o: o, receipt: nil)); if !copy { remember(m.id, keys, o) } }
             case false?:
                 if let e = idx[m.id] { idx[m.id] = StoreCap.Entry(id: e.id, ts: e.ts, size: e.size, kind: .unreadable) }
             }
         }
         spent.forEach(saveMessageKeys)
         if !future.isEmpty {
-            store.remove(future)
-            history.remove(future)
+            store.remove(future); more.remove(future)
+            history.remove(Set(future.map(Self.copyId)))
             #if DEBUG
             DebugLog.write("store: removed \(future.count) packets dated in the future")
             #endif
@@ -863,54 +1052,99 @@ final class Engine: ObservableObject {
         storeLock.withLock {
             for (id, e) in index where idx[id] == nil { idx[id] = e } // stored while reading
             index = idx; indexBytes = idx.values.reduce(0) { $0 + $1.size }
+            let door = idx.values.filter { $0.kind == .door }
+            doorCount = door.count; doorBytes = door.reduce(0) { $0 + $1.size }
         }
+        // Who confirmed what, worked out here and not on the main thread. A receipt counts only for a message written
+        // on this phone, in the group whose receipt key opened it; the receipts themselves aren't kept in memory.
+        var found = Deliveries()
+        for (group, id) in sent { found.sent(group: group, id) }
+        for (group, r) in recs { found.add(group: group, r) }
+        let confirmed = found
         DispatchQueue.main.async {
-            for m in msgs where self.rawIds.insert(m.id).inserted { self.raw.append(m) }
+            var added = Set<String>()
+            for (m, mark) in msgs {
+                // Another packet already shows this very message: it is one row, whatever packets bring it.
+                let free = self.idsLock.withLock { () -> Bool in if let row = self.shownAs[mark], row != m.id { return false }; return true }
+                guard free else { continue }
+                if self.rawIds.insert(m.id).inserted { self.raw.append(m); added.insert(m.id) }
+                self.idsLock.withLock { self.shownAs[mark] = m.id }
+            }
             self.raw.sort { $0.ts < $1.ts }
-            for r in recs { self.receiptMsgs[r.id] = r }
-            self.deliveries = Deliveries(Array(self.receiptMsgs.values))
-            for w in waiting where self.pending.count < Self.maxPending { self.pending[w.o.message.id] = w }
+            self.deliveries.merge(confirmed)
+            // A message waits only if its row was made just now from the stored packet: a row that was there already
+            // may show another packet with that id.
+            for w in waiting {
+                let channel = ObjectIdentifier(w.k), sender = w.o.message.sender
+                if w.receipt != nil { self.unchecked.receipt(w.o.key, channel: channel, sender: sender, w) }
+                else { self.unchecked.message(w.o.key, channel: channel, sender: sender, id: w.o.message.id, shown: added.contains(w.o.message.id), w) }
+            }
             self.refresh()
         }
     }
 
     /// Keeps the store small, once every saved group's key has been tried: packets older than 7 days that no saved
-    /// group can read go (phones stop passing them on after 7 days anyway), Public messages beyond the newest 2,000
-    /// go, and then the store cap (StoreCap: about 40 MB and 20,000 packets, unreadable packets first). Same rules as
-    /// the Android app (MeshEngine.compact).
+    /// group can read go (phones stop passing them on after 7 days anyway), and so do those that came through a group's
+    /// door from someone who isn't in it; Public packets beyond 2,000 go (no sender more than its share:
+    /// StoreCap.everyone), and then the store cap (StoreCap: about 40 MB and 20,000 packets, unreadable packets first,
+    /// and the door's own small room). Same rules as the Android app (MeshEngine.compact).
     private func compact() {
         let now = Self.nowMs()
         for k in keyLock.withLock({ Array(keyCache.values) }) where !k.ring.expire(now: now).isEmpty { // keys replaced more than 7 days ago go (v0.6), from the Keychain too
             saveRing(k)
             k.setDoors(k.door, old: k.oldDoors.filter { d in k.ring.all.contains { $0.via == d.code } })
         }
+        // Over the Everyone channel's cap, not simply the oldest go: one sender can't push everyone else's messages and
+        // places out (StoreCap.everyone). Who sent what is read before the store lock is taken: the main thread may be
+        // waiting for that lock.
+        let many = storeLock.withLock { allKeys && index.values.filter { $0.kind == .isPublic }.count > Self.maxPublic }
+        var shown: [String: (sender: String, verified: Bool)] = [:]
+        if many { shown = DispatchQueue.main.sync { everyoneSenders() } }
+        let written: Set<String> = many ? idsLock.withLock { myReceipts } : []
         let drop: Set<String> = storeLock.withLock {
             compacting = false
             guard allKeys else { return [] }
             let cut = Self.nowMs() - Self.week
-            var drop = Set(index.values.filter { $0.kind == .unreadable && $0.ts < cut }.map(\.id))
-            let pub = index.values.filter { $0.kind == .isPublic }.sorted { ($0.ts, $0.id) < ($1.ts, $1.id) }
-            if pub.count > Self.maxPublic { pub.prefix(pub.count - Self.maxPublic).forEach { drop.insert($0.id) } }
+            var drop = Set(index.values.filter { ($0.kind == .unreadable || $0.kind == .door) && $0.ts < cut }.map(\.id))
+            let pub = index.values.filter { $0.kind == .isPublic }
+            if many, pub.count > Self.maxPublic {
+                // A Public packet that isn't a message is an introduction; this phone's own are the ones it wrote.
+                let held = pub.map { e -> StoreCap.Held in
+                    guard let m = shown[e.id] else { return StoreCap.Held(id: e.id, ts: e.ts, holder: "introductions", own: written.contains(e.id)) }
+                    let sender = m.sender.hasPrefix("web-") ? String(m.sender.dropFirst(4)) : m.sender
+                    return StoreCap.Held(id: e.id, ts: e.ts, holder: m.verified ? sender : "not verified", own: m.sender == deviceId)
+                }
+                drop.formUnion(StoreCap.everyone(held, max: Self.maxPublic))
+            }
             drop.formUnion(StoreCap.overflow(index.values.filter { !drop.contains($0.id) }))
-            for id in drop { if let e = index.removeValue(forKey: id) { indexBytes -= e.size } }
+            for id in drop { if let e = index.removeValue(forKey: id) { indexBytes -= e.size; if e.kind == .door { doorCount -= 1; doorBytes -= e.size } } }
             return drop
         }
         guard !drop.isEmpty else { return }
-        store.remove(drop)
-        history.remove(drop)
+        store.remove(drop); more.remove(drop)
+        history.remove(Set(drop.map(Self.copyId)))
         #if DEBUG
         DebugLog.write("store: removed \(drop.count) packets")
         #endif
         DispatchQueue.main.async {
             self.raw.removeAll { drop.contains($0.id) }; self.rawIds.subtract(drop)
+            self.idsLock.withLock { self.shownAs = self.shownAs.filter { !drop.contains($0.value) } }
+            self.unchecked.forget(drop); self.deliveries.forget(drop) // nothing waits for, or confirms, a message that is gone
             self.refresh()
         }
+    }
+
+    /// The Everyone messages by id: who sent each, and whether that was checked. Main thread.
+    private func everyoneSenders() -> [String: (sender: String, verified: Bool)] {
+        var out: [String: (sender: String, verified: Bool)] = [:]
+        for m in raw where m.isPublic { out[m.id] = (sender: m.sender, verified: m.verified) }
+        return out
     }
 
     /// The store grew well past its cap while running: trim it in the background. Any thread.
     private func compactIfFull() {
         let full = storeLock.withLock {
-            guard allKeys, !compacting, indexBytes > StoreCap.maxBytes / 10 * 11 || index.count > StoreCap.maxCount + 1_000 else { return false }
+            guard allKeys, !compacting, indexBytes > StoreCap.maxBytes / 10 * 11 || index.count > StoreCap.maxCount + 1_000 || StoreCap.doorFull(count: doorCount, bytes: doorBytes) else { return false }
             compacting = true; return true
         }
         if full { work.async { self.compact() } }
@@ -927,27 +1161,83 @@ final class Engine: ObservableObject {
         }
     }
 
-    /// A packet that arrived: on disk only if it counts. Packets with one id and different content all reach here, and
-    /// what isn't counted could otherwise fill the file without the store cap ever seeing it.
-    private func keep(_ p: Packet, _ kind: StoreCap.Kind) { if indexed(p, kind) { store.append(p) } }
+    /// A packet that arrived: kept, and counted, under the name it goes by (`StoreCap.name`), which is returned. The first
+    /// packet stored under an id goes by that id; any other packet with that id is kept too, by its key, in a file of its
+    /// own. Nothing replaces anything: whoever sends junk, or a message of their own, first under an id doesn't keep the
+    /// real packet out of the store.
+    @discardableResult private func keep(_ p: Packet, _ kind: StoreCap.Kind) -> String {
+        let (name, first, isNew): (String, Bool, Bool) = storeLock.withLock {
+            let first = index[p.id] == nil, name = StoreCap.name(p, first: first)
+            if index[name] != nil { return (name, first, false) }
+            let size = Packet.headerSize + p.cipher.count
+            index[name] = StoreCap.Entry(id: name, ts: p.ts, size: size, kind: kind)
+            indexBytes += size
+            if kind == .door { doorCount += 1; doorBytes += size }
+            return (name, first, true)
+        }
+        if isNew { (first ? store : more).append(p) }
+        return name
+    }
+
+    /// The id this phone's copy of a message is kept under in "history.bin": the packet's name, or for a packet that goes
+    /// by its key the second half of it (a record's id is 8 bytes).
+    private static func copyId(_ name: String) -> String { name.count > 16 ? String(name.suffix(16)) : name }
+
+    /// Called by the router while it holds its lock: a copy of a stored packet came with more hops left. The saved ttl
+    /// is raised too, or a restart would pass the packet on with the first copy's. Written 10 s later, together with
+    /// those that came meanwhile, in one pass over the file.
+    private func onRaised(_ p: Packet) {
+        let first = storeLock.withLock { () -> Bool in
+            let was = raisedTtl.isEmpty
+            if raisedTtl.count < 1_000 { raisedTtl[MeshRouter.key(p)] = p.ttl }
+            return was
+        }
+        guard first else { return }
+        work.asyncAfter(deadline: .now() + 10) {
+            let ttls = self.storeLock.withLock { () -> [String: Int] in let all = self.raisedTtl; self.raisedTtl = [:]; return all }
+            self.store.raise(ttls); self.more.raise(ttls)
+        }
+    }
 
     // MARK: - Messages
 
     /// Shows the messages again: this group's and the Public channel's in `messages`, all groups' in `allMessages`,
     /// without blocked people and reported messages. Main thread.
     private func refresh() {
-        let blocked = Moderation.blocked, hidden = Moderation.hidden // read once, not per message
-        let visible = raw.filter { blocked[$0.sender] == nil && !hidden.contains($0.id) }
+        let blocked = Set(Moderation.blocked.keys), hidden = Moderation.hidden // read once, not per message
+        var ids: [String: String] = [:] // group code -> group id ("" if not known), looked up once per group
+        let visible = raw.filter { m in
+            if hidden.contains(m.id) { return false }
+            if blocked.isEmpty { return true }
+            var channel: String? = Blocks.everyone // a block holds in the channel it was made in (`Blocks`)
+            if !m.isPublic {
+                let code = m.group ?? ""
+                if ids[code] == nil { ids[code] = groupId(code) ?? "" }
+                channel = ids[code].flatMap { $0.isEmpty ? nil : $0 }
+            }
+            return !Blocks.hides(blocked, channel: channel, sender: m.sender)
+        }
         allMessages = visible
         messages = visible.filter { $0.isPublic || $0.group == activeCode }
     }
 
     /// Adds a message in time order. Main thread.
-    private func add(_ m: Message) {
-        guard rawIds.insert(m.id).inserted else { return }
+    /// False if a message with this id is already there.
+    @discardableResult private func add(_ m: Message) -> Bool {
+        guard rawIds.insert(m.id).inserted else { return false }
         let i = raw.lastIndex { $0.ts <= m.ts }.map { $0 + 1 } ?? 0
         raw.insert(m, at: i)
         refresh()
+        return true
+    }
+
+    /// Adds a received message unless another row already shows the very message it carries (`GroupCrypto.Opened.mark`):
+    /// the same signed message can come in several packets. False if nothing was added. Main thread.
+    private func show(_ m: Message, mark: String) -> Bool {
+        let free = idsLock.withLock { () -> Bool in if let row = shownAs[mark], row != m.id { return false }; return true }
+        guard free, add(m) else { return false }
+        idsLock.withLock { shownAs[mark] = m.id }
+        return true
     }
 
     /// The saved name of the group whose code is `code` (`Message.group`), for alerts. Main thread.
@@ -965,7 +1255,7 @@ final class Engine: ObservableObject {
         let k = keys(code), cr = k.group // cached; derived here only if the user writes within a second of switching
         if !isPublic && k.removed { return true } // the screen no longer offers this
         if !isPublic && !k.joined { waitingToJoin[k.id, default: []].append((text, photo)); return true } // sent once an admin lets this phone in
-        work.async { self.introIfDue(k) } // members can check this message only with this phone's key
+        work.async { self.introIfDue(k, writing: true) } // members can check this message only with this phone's key
         let id = Packet.newId(mailbox: cr.mailbox), ts = Int64(Date().timeIntervalSince1970 * 1000)
         guard let c = sealOne(k, cr, isPublic: isPublic, id: id, ts: ts, text: text, photo: photo) else { return true }
         let p = Packet(id: id, ts: cr.hideTime(ts, c), ttl: Self.maxTtl, cipher: c)
@@ -973,7 +1263,8 @@ final class Engine: ObservableObject {
         store.append(p)
         indexed(p, isPublic ? .isPublic : .group)
         add(Message(id: id, ts: ts, sender: deviceId, name: name, text: text, isPublic: isPublic, photo: isPublic ? nil : photo,
-                    group: isPublic ? nil : target))
+                    group: isPublic ? nil : k.code)) // the group's code now, if `target` was one it has moved on from
+        if !isPublic { deliveries.sent(group: k.id, id) } // only this group's receipts confirm it
         router.publish(p)
         return (!lora.connected || Meshtastic.fits(p)) && (!meshcore.connected || MeshCore.fits(p))
     }
@@ -1030,21 +1321,25 @@ final class Engine: ObservableObject {
         let (newlyMine, ownPacket, receipt) = idsLock.withLock {
             (mine.contains(p.id) && !sentIds.contains(p.id), mine.contains(p.id) || myReceipts.contains(p.id), receiptIds.contains(p.id))
         }
+        // For the relays and the radios: did this phone write this very packet, or did a link bring it? Its id alone
+        // doesn't say: anyone can send another packet under the id of one of this phone's (MeshRouter.source).
+        let from = peer == LoraLink.peer || peer == MeshCoreLink.peer || peer == NostrLink.peer ? router.source(p) : nil
+        let own = ownPacket && from == ""
         if peer == LoraLink.peer {
             if receipt { return }             // receipts stay off LoRa, where airtime is scarce
-            lora.offer(p)
+            lora.offer(p, mine: own)          // the radios send this phone's own packets first (LoraQueue)
             if !Meshtastic.fits(p) { return } // too long for the radio: not really sent
         }
         else if peer == MeshCoreLink.peer {
             if receipt { return }             // same rules as Meshtastic
-            meshcore.offer(p)
+            meshcore.offer(p, mine: own)
             if !MeshCore.fits(p) { return }
         }
         else if peer.hasPrefix(BleLink.prefix) { ble.send(peer, p) }
         else if peer.hasPrefix(MultipeerLink.prefix) { mc.send(peer, p) }
         else if peer.hasPrefix(WifiLink.prefix) { wifi.send(peer, p) }
         // Written on this phone (a message or a receipt): goes up first. "Sent" once a relay accepts it.
-        else if peer == NostrLink.peer { nostr.send(p, mine: ownPacket); return }
+        else if peer == NostrLink.peer { nostr.send(p, mine: own, from: from ?? ""); return }
         if newlyMine { markHandedOff(p.id) }
     }
 
@@ -1065,7 +1360,10 @@ final class Engine: ObservableObject {
         for keys in [k.active, k.pub].compactMap({ $0 }) + k.others {
           for e in keys.ring.all where e.group.mailbox == box {
             if let o = e.open(p) { return message(keys, o) }
-            if let o = e.receipts.openSigned(p) { return .receipt(asMine(o.message, keys.me), keys, o) }
+            if let o = e.openReceipt(p) {
+                guard let r = asMine(o.message, keys.me) else { return .forged }
+                return .receipt(r, keys, o)
+            }
           }
           // Only the Public channel reads through its door: in a group the code alone doesn't let anyone write.
           if keys.isPublic, keys.door.crypto.mailbox == box, let o = keys.door.crypto.openSigned(p) { return message(keys, o) }
@@ -1082,7 +1380,7 @@ final class Engine: ObservableObject {
     }
 
     private func message(_ keys: Keys, _ o: GroupCrypto.Opened) -> Seen {
-        var m = asMine(o.message, keys.me)
+        guard var m = asMine(o.message, keys.me) else { return .forged } // a sender that is no member id: like a packet nobody can open
         if keys.isPublic {
             let mine = m.sender == deviceId
             m = Message(id: m.id, ts: m.ts, sender: m.sender, name: mine ? m.name : WordFilter.clean(m.name),
@@ -1098,20 +1396,21 @@ final class Engine: ObservableObject {
         return Data(b)
     }()
 
-    /// Keeps a readable copy of a message opened with its own key: that key is about to be deleted.
+    /// Keeps a readable copy of a message opened with its own key: that key is about to be deleted. `id`: the name its
+    /// packet goes by (`StoreCap.name`).
     private func remember(_ id: String, _ k: Keys, _ o: GroupCrypto.Opened) {
-        guard let l = o.leaf, let blob = History.seal(key: Self.historyKey, id: id, group: k.id, epoch: l.epoch.hash, o, index: l.index, counter: l.counter) else { return }
-        history.append(Packet(id: id, ts: o.message.ts, ttl: 0, cipher: blob))
+        guard let l = o.leaf, let blob = History.seal(key: Self.historyKey, id: id, group: k.id, epoch: l.epoch.id, o, index: l.index, counter: l.counter) else { return }
+        history.append(Packet(id: Self.copyId(id), ts: o.message.ts, ttl: 0, cipher: blob))
     }
 
     /// A message from this phone's copy, while its epoch is still held: when the epoch goes, the message goes too.
     private func fromHistory(_ id: String, _ blob: Data, _ set: (active: Keys?, others: [Keys], pub: Keys?)) -> Seen? {
         guard let s = History.open(key: Self.historyKey, id: id, blob: blob),
               let k = ([set.active].compactMap({ $0 }) + set.others).first(where: { $0.id == s.group }),
-              let e = k.ring.all.first(where: { $0.hash == s.epoch }) else { return nil }
+              let e = k.ring.all.first(where: { $0.id == s.epoch }) ?? k.ring.all.first(where: { $0.hash == s.epoch }) else { return nil } // by hash: copies kept before epochs had an id
         var o = s.opened
         o.leaf = Leaf(epoch: e, index: s.index, counter: s.counter)
-        var m = asMine(o.message, k.me)
+        guard var m = asMine(o.message, k.me) else { return nil }
         m.group = k.code
         return .msg(m, k, o, true)
     }
@@ -1122,7 +1421,7 @@ final class Engine: ObservableObject {
             var d = Data()
             for e in k.ring.all {
                 guard let m = e.messageKeys?.encode() else { continue }
-                d.append(Data(e.hash.utf8))
+                d.append(Data(e.id.utf8))
                 d.append(contentsOf: [UInt8(m.count >> 24 & 255), UInt8(m.count >> 16 & 255), UInt8(m.count >> 8 & 255), UInt8(m.count & 255)])
                 d.append(m)
             }
@@ -1157,8 +1456,12 @@ final class Engine: ObservableObject {
         return .intro(k, id, c, enc, o.message.name, o.message.ts, withPq ? Data(e.suffix(MlKem.publicSize)) : nil)
     }
 
-    /// On this phone, its own messages carry `deviceId` as sender: one id for "me" in every group.
-    private func asMine(_ m: Message, _ me: String) -> Message { m.sender == me ? m.withSender(deviceId) : m }
+    /// On this phone, its own messages carry `deviceId` as sender: one id for "me" in every group. Nil for a packet whose
+    /// sender is no member id, or is `deviceId` itself (`Senders.shown`): nothing received may pass for written here.
+    private func asMine(_ m: Message, _ me: String) -> Message? {
+        guard let s = Senders.shown(wire: m.sender, me: me, device: deviceId) else { return nil }
+        return s == m.sender ? m : m.withSender(s)
+    }
 
     /// A packet seen for the first time: keep it, and show it if a saved group or the Public channel can read it and
     /// its signature checks (or its sender's key isn't known yet: shown as not verified, checked when it comes).
@@ -1169,20 +1472,26 @@ final class Engine: ObservableObject {
         #endif
         switch see(p, keySet) {
         case .intro(let k, let id, let c, let enc, let who, let ts, let pq)?:
-            keep(p, k.isPublic ? .isPublic : .group)
+            keep(p, k.isPublic ? .isPublic : doorKind(k, id, signed: true)) // through a group's door: the group's own only from someone in it
             let fresh = learn(k, id, c, enc: enc, encAt: ts, pq: pq, name: who)
             #if DEBUG
             if fresh { DebugLog.write("introduction \(p.id): key of \(id) (\(who))") }
             #endif
             // Not in the current epoch: a request to join. It waits for an admin here to let them in.
+            // At most one alert a minute in a group: the requests themselves are in the chat (`joinRequests`).
             let asking = fresh && !k.isPublic && !k.removed && id != k.me && !k.members.contains(id) && k.ring.currentOrNil?.admins.contains(k.me) == true && !declined(k).contains(id)
+                && storeLock.withLock { () -> Bool in
+                    let at = Self.nowMs()
+                    guard Joining.alertDue(last: joinAlertAt[k.id] ?? 0, now: at) else { return false }
+                    joinAlertAt[k.id] = at; return true
+                }
             DispatchQueue.main.async {
                 self.resolve(k, id)
                 self.refresh()
                 if asking { Notifier.shared.received(Message(id: "join-\(id)", ts: Self.nowMs(), sender: id, name: who, text: "asks to join", group: k.code)) }
             }
         case .newKey(let k, let o, let r, let pid, let d)?:
-            keep(p, .group)
+            let ok = signed(o, r), was = k.ring.currentOrNil
             if acceptRekey(k, o, r, pid, d) {
                 // Our introduction again, at once: newcomers need our keys to check our messages. Messages stored
                 // before the epoch came may open now; relays follow its mailbox.
@@ -1195,9 +1504,11 @@ final class Engine: ObservableObject {
                     for g in [self.keySet.active].compactMap({ $0 }) + self.keySet.others { self.introIfDue(g) }
                 } }
             }
+            // Classed once the keyring has decided: the key that lets this phone in is from someone in the group it now knows.
+            keep(p, doorKind(k, o.message.sender, signed: ok))
             // Made after our current epoch, yet numbered below it: that phone missed our keys. Answered after 0-3 s unless another member did.
-            if d === k.door, signed(o, r), k.ring.behind(r, maker: o.message.sender) {
-                work.asyncAfter(deadline: .now() + .milliseconds(Int.random(in: 0..<3_000))) { self.answerBehind(k, made: r.made) }
+            if d === k.door, ok, k.ring.behind(r, maker: o.message.sender) {
+                work.asyncAfter(deadline: .now() + .milliseconds(Int.random(in: 0..<3_000))) { self.answerBehind(k, made: r.made, at: was) }
             }
             if !k.ring.stillToRemove().isEmpty { work.asyncAfter(deadline: .now() + .milliseconds(Int.random(in: 0..<3_000))) { self.finishRemovals(k) } }
         case .msg(let m0, let k, let o, _)?:
@@ -1209,25 +1520,34 @@ final class Engine: ObservableObject {
                 #endif
                 break
             }
-            var m = m0; m.verified = ok == true
-            keep(p, m.isPublic ? .isPublic : .group)
-            remember(p.id, k, o)
+            // Another packet under an id that is taken, which only brings again a message already shown, or names this phone
+            // as its sender (the same message sealed again): nothing to keep or show.
+            if storeLock.withLock({ index[p.id] != nil }), m0.sender == deviceId || idsLock.withLock({ shownAs[o.mark] != nil }) { break }
+            // Any other packet under an id that is taken is a message of its own: kept and shown by its name (`StoreCap.name`).
+            let name = keep(p, m0.isPublic ? .isPublic : .group)
+            var m = name == p.id ? m0 : m0.withId(name); m.verified = ok == true
+            remember(name, k, o)
             if ok == true, let l = o.leaf { l.forget(); saveMessageKeys(k) } // this message's key is gone: only this phone's copy can show it now
             if k.rejoining, m.sender != deviceId, m.ts >= k.rejoiningSince { setRejoining(k, 0) } // someone wrote in a key this phone has: it's back
             DispatchQueue.main.async {
-                if ok == nil, self.pending.count < Self.maxPending { self.pending[m.id] = Pending(k: k, sender: o.message.sender, o: o, receipt: nil) }
                 let others = !m.isPublic && m.sender != self.deviceId
-                if others { self.ack(m.id, k) }
-                self.add(m)
-                guard others, Moderation.visible(m) else { return }
+                let fresh = self.show(m, mark: o.mark)
+                // It waits for its sender's key only as the message shown under its id: another packet with that id,
+                // checked later, must not mark or remove this row.
+                if ok == nil { self.unchecked.message(o.key, channel: ObjectIdentifier(k), sender: o.message.sender, id: m.id, shown: fresh, Pending(k: k, o: o, receipt: nil)) }
+                if fresh, !m.isPublic, m.sender == self.deviceId { self.deliveries.sent(group: k.id, m.id) } // written here before the store was lost: its receipts count again
+                // Not for a message already shown: another packet under its id, sealed again by a member, alerts and confirms nothing.
+                guard fresh, others else { return }
+                self.ack(p.id, k) // confirmed by its packet id, whatever name it goes by here
+                guard self.visible(m) else { return }
                 Notifier.shared.received(m)
             }
         case .receipt(let r, let k, let o)?:
             keep(p, .group)
             idsLock.withLock { _ = receiptIds.add(p.id) }
             switch check(k, o) {
-            case true?: DispatchQueue.main.async { self.receiptMsgs[r.id] = r; self.deliveries.add(r) }
-            case nil: DispatchQueue.main.async { if self.pending.count < Self.maxPending { self.pending[p.id] = Pending(k: k, sender: o.message.sender, o: o, receipt: r) } }
+            case true?: DispatchQueue.main.async { self.deliveries.add(group: k.id, r) }
+            case nil: DispatchQueue.main.async { self.unchecked.receipt(o.key, channel: ObjectIdentifier(k), sender: o.message.sender, Pending(k: k, o: o, receipt: r)) }
             case false?: break
             }
         default:
@@ -1278,6 +1598,12 @@ final class Engine: ObservableObject {
     }
 
     private static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+    private static func hex(_ d: Data) -> String {
+        var out = [UInt8](); out.reserveCapacity(d.count * 2)
+        for b in d { out.append(hexDigits[Int(b >> 4)]); out.append(hexDigits[Int(b & 15)]) }
+        return String(decoding: out, as: UTF8.self)
+    }
     private static func unhex(_ h: String) -> Data {
         var d = Data(), i = h.startIndex
         while i < h.endIndex { let j = h.index(i, offsetBy: 2); d.append(UInt8(h[i..<j], radix: 16) ?? 0); i = j }

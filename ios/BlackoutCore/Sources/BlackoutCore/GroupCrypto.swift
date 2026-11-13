@@ -29,6 +29,13 @@ public struct Message: Equatable, Sendable {
         m.verified = verified
         return m
     }
+
+    /// The same message under another id: the name its packet goes by on this phone when another packet had its id first (`StoreCap.name`).
+    public func withId(_ i: String) -> Message {
+        var m = Message(id: i, ts: ts, sender: sender, name: name, text: text, isPublic: isPublic, photo: photo, group: group)
+        m.verified = verified
+        return m
+    }
 }
 
 public enum GroupCryptoError: Error { case fieldTooLong, badIv, badSignature }
@@ -126,6 +133,22 @@ public final class GroupCrypto: Sendable {
         return d
     }
 
+    /// What the signature of a packet sealed with a message key covers (spec "Message keys"): a tag of its own, context, id,
+    /// ts, the sender's position and the message number, body. Every member holds every member's message keys: were the
+    /// position and number left out, one of them could seal someone's signed message again under that person's unused
+    /// numbers, and each phone that checked the signature would delete the key of a message not written yet. The tag keeps
+    /// the signature from being moved to or from a packet sealed with the epoch's key.
+    public func signed(index: Int, counter: Int, id: String, ts: Int64, body: Data) -> Data {
+        var d = Data("darkproof-sig-mk-v1".utf8)
+        d.append(context); d.append(Hex.decode(id))
+        withUnsafeBytes(of: ts.bigEndian) { d.append(contentsOf: $0) }
+        d.append(contentsOf: GroupCrypto.header(index, counter)); d.append(body)
+        return d
+    }
+
+    /// The 3 bytes that say which sender's which message a packet is: the position, then the number, big-endian.
+    private static func header(_ index: Int, _ counter: Int) -> [UInt8] { [UInt8(index & 255), UInt8(counter >> 8 & 255), UInt8(counter & 255)] }
+
     /// An opened packet: the message, its signature, SHA-256 of what it signs, and the raw 4th field. Not checked yet.
     public struct Opened: Sendable {
         public let message: Message
@@ -134,6 +157,17 @@ public final class GroupCrypto: Sendable {
         public let extra: Data?
         /// The message key that opened it, if one did.
         public var leaf: Leaf? = nil
+        /// Names what a signature check of this packet is about: its id, and what it signs together with the signature.
+        /// Packets that share an id differ in it, unless they are the same signed message sealed again (`KeyWait`).
+        public var key: String {
+            var h = SHA256()
+            h.update(data: digest); h.update(data: signature)
+            return message.id + ":" + h.finalize().prefix(16).map { String(format: "%02x", $0) }.joined()
+        }
+        /// Names the message this packet carries: its id and what was signed, without the signature. The same signed
+        /// message sealed again has the same mark, and so has one whose signature was rewritten (every ECDSA signature
+        /// has a twin that checks too): a chat shows it once, however many packets bring it (`StoreCap.name`).
+        public var mark: String { String(message.id.prefix(16)) + ":" + Hex.encode(Data(digest.prefix(8))) }
     }
 
     private func headerMask(_ iv: Data) -> [UInt8] { Array(HMAC<SHA256>.authenticationCode(for: Data("darkproof-header-v1".utf8) + iv, using: key)) }
@@ -159,11 +193,11 @@ public final class GroupCrypto: Sendable {
             body.append(UInt8(b.count >> 8)); body.append(UInt8(b.count & 0xFF)); body.append(b)
         }
         body.append(Data(count: Packet.padding(Packet.overhead + 3 + body.count, pad)))
-        let sig = try sign(signed(id: id, ts: ts, body: body))
+        let sig = try sign(signed(index: index, counter: counter, id: id, ts: ts, body: body))
         guard sig.count == 64 else { throw GroupCryptoError.badSignature }
         if let iv, iv.count != 12 { throw GroupCryptoError.badIv }
         let nonce = try iv.map { try AES.GCM.Nonce(data: $0) } ?? AES.GCM.Nonce()
-        let h = [UInt8(index), UInt8(counter >> 8 & 255), UInt8(counter & 255)]
+        let h = GroupCrypto.header(index, counter)
         let box = try AES.GCM.seal(sig + body, using: SymmetricKey(data: mk), nonce: nonce, authenticating: GroupCrypto.aad(id, ts) + Data(h))
         let ivData = Data(nonce), m = headerMask(ivData)
         return ivData + Data([h[0] ^ m[0], h[1] ^ m[1], h[2] ^ m[2]]) + box.ciphertext + box.tag
@@ -175,11 +209,12 @@ public final class GroupCrypto: Sendable {
         let ts = at ?? realTime(p.ts, p.cipher)
         let body = Data(p.cipher.dropFirst(15))
         guard let n = try? AES.GCM.Nonce(data: Data(p.cipher.prefix(12))), let box = try? AES.GCM.SealedBox(nonce: n, ciphertext: body.dropLast(16), tag: body.suffix(16)),
-              let plain = try? AES.GCM.open(box, using: SymmetricKey(data: mk), authenticating: GroupCrypto.aad(p.id, ts) + Data([UInt8(index), UInt8(counter >> 8 & 255), UInt8(counter & 255)])) else { return nil }
-        return parsed(p.id, ts, plain)
+              let plain = try? AES.GCM.open(box, using: SymmetricKey(data: mk), authenticating: GroupCrypto.aad(p.id, ts) + Data(GroupCrypto.header(index, counter))) else { return nil }
+        return parsed(p.id, ts, plain) { self.signed(index: index, counter: counter, id: p.id, ts: ts, body: $0) }
     }
 
-    private func parsed(_ id: String, _ ts: Int64, _ plain: Data) -> Opened? {
+    /// `covered`: what the signature covers, given the body; nil for a packet sealed with this key itself.
+    private func parsed(_ id: String, _ ts: Int64, _ plain: Data, covered: ((Data) -> Data)? = nil) -> Opened? {
         guard plain.count >= 64 + 6 else { return nil }
         let body = Data(plain.dropFirst(64))
         var r = FieldReader(bytes: [UInt8](body))
@@ -188,7 +223,7 @@ public final class GroupCrypto: Sendable {
         var photo: Data?
         if let a = extra, a.first == Photo.jpeg, a.count > 1, a.count - 1 <= Photo.maxBytes { photo = Data(a.dropFirst()) }
         let m = Message(id: id, ts: ts, sender: sender, name: name, text: text, photo: photo) // other bytes are ignored
-        return Opened(message: m, signature: Data(plain.prefix(64)), digest: Data(SHA256.hash(data: signed(id: id, ts: ts, body: body))),
+        return Opened(message: m, signature: Data(plain.prefix(64)), digest: Data(SHA256.hash(data: covered?(body) ?? signed(id: id, ts: ts, body: body))),
                       extra: extra.map { Data($0) })
     }
 

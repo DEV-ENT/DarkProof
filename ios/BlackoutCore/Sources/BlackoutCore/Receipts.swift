@@ -8,11 +8,12 @@ public enum Receipt {
 
     public static func text(for ids: [String]) -> String { ids.joined(separator: " ") }
 
-    /// The message ids a receipt confirms. Anything that isn't 16 lowercase hex characters is skipped.
+    /// The message ids a receipt confirms: its first `maxIds`. Whatever follows them is not read. Anything that isn't
+    /// 16 lowercase hex characters is skipped.
     public static func ids(in text: String) -> [String] {
-        text.split(separator: " ").map(String.init).filter { id in
-            id.count == 16 && id.allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) }
-        }
+        Array(text.utf8.split(separator: 32).lazy.filter { id in
+            id.count == 16 && id.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+        }.prefix(maxIds).map { String(decoding: $0, as: UTF8.self) })
     }
 
     /// Splits ids into receipt-sized batches.
@@ -29,25 +30,52 @@ public struct Reader: Equatable, Sendable {
     public init(id: String, name: String, ts: Int64) { self.id = id; self.name = name; self.ts = ts }
 }
 
-/// Who got which message, built from opened receipts.
+/// Who got which of this phone's own group messages, built from checked receipts (spec "Delivery receipts").
+/// A receipt counts for a message only if this phone wrote that message (`sent`) in the group whose receipt key opened
+/// the receipt: a member of one saved group can't confirm a message of another, and ids that are no message of this
+/// phone's take no memory. Same as Android's Deliveries.
 public struct Deliveries: Equatable, Sendable {
     /// Message id -> readers, earliest confirmation first.
     public private(set) var readers: [String: [Reader]] = [:]
+    private var groups: [String: String] = [:] // this phone's own group messages: id -> group id
 
-    public init(_ receipts: [Message] = []) { receipts.forEach { add($0) } }
+    public init() {}
 
-    /// Adds a receipt (a message opened with the receipt key). A reader counts once per message.
-    public mutating func add(_ r: Message) {
-        for id in Receipt.ids(in: r.text) {
-            var list = readers[id] ?? []
-            if let i = list.firstIndex(where: { $0.id == r.sender }) {
-                list[i].ts = min(list[i].ts, r.ts)
-                list[i].name = r.name
-            } else {
-                list.append(Reader(id: r.sender, name: r.name, ts: r.ts))
-            }
-            readers[id] = list.sorted { $0.ts < $1.ts }
+    /// This phone wrote `messageId` in the group whose id is `group`.
+    public mutating func sent(group: String, _ messageId: String) { if groups[messageId] == nil { groups[messageId] = group } }
+
+    /// Adds a checked receipt opened with a receipt key of the group whose id is `group`. A reader counts once per
+    /// message, with the time and name of their earliest receipt for it.
+    public mutating func add(group: String, _ r: Message) {
+        for id in Receipt.ids(in: r.text) where groups[id] == group {
+            count(Reader(id: r.sender, name: r.name, ts: r.ts), for: id)
         }
+    }
+
+    /// Adds what `other` holds: the messages it knows as written here, and their readers. For a table built off the
+    /// main thread from the stored packets.
+    public mutating func merge(_ other: Deliveries) {
+        for (id, group) in other.groups where groups[id] == nil { groups[id] = group }
+        for (id, list) in other.readers {
+            guard let group = other.groups[id], groups[id] == group else { continue }
+            for r in list { count(r, for: id) }
+        }
+    }
+
+    /// The messages `ids` left the store.
+    public mutating func forget<S: Sequence>(_ ids: S) where S.Element == String {
+        for id in ids { groups[id] = nil; readers[id] = nil }
+    }
+
+    private mutating func count(_ r: Reader, for id: String) {
+        var list = readers[id] ?? []
+        if let i = list.firstIndex(where: { $0.id == r.id }) {
+            guard r.ts < list[i].ts else { return }
+            list[i] = r
+        } else {
+            list.append(r)
+        }
+        readers[id] = list.sorted { $0.ts < $1.ts }
     }
 }
 

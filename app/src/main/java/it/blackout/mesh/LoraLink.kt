@@ -37,7 +37,7 @@ class LoraLink(private val ctx: Context) {
     @Volatile var status = "LoRa: no radio"; private set
 
     private fun set(s: String) { status = "LoRa: $s"; MeshEngine.notifyUi() }
-    fun offer(p: Packet) = queue.offer(p)
+    fun offer(p: Packet, mine: Boolean = false) = queue.offer(p, mine)
     /** A radio was set up here before: it is linked again whenever it is in reach. */
     val paired get() = prefs.getString("radio", null) != null
     fun start() { prefs.getString("radio", null)?.let(::connect) }

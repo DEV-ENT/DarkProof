@@ -103,6 +103,9 @@ fun SetupFlow(invite: SavedGroup?, askName: Boolean, modifier: Modifier = Modifi
     var name by rememberSaveable { mutableStateOf("") }
     var groupName by rememberSaveable(invite) { mutableStateOf(invite?.name ?: "") }
     var code by rememberSaveable(invite) { mutableStateOf(invite?.code ?: "") }
+    // The admins named by the invite link the code came from (spec "Invites"). They count only if the code is still that one when the user joins.
+    var linkCode by rememberSaveable(invite) { mutableStateOf(invite?.code ?: "") }
+    var linkPins by rememberSaveable(invite) { mutableStateOf(invite?.pins ?: "") }
     val ctx = LocalContext.current
     fun back() { if (invite != null) dropInvite() else mode = start }
     BackHandler(enabled = mode != start) { back() } // the system Back goes back a step, not out of the app
@@ -144,10 +147,10 @@ fun SetupFlow(invite: SavedGroup?, askName: Boolean, modifier: Modifier = Modifi
                 if (askName) InputField("Your name", name, { name = it.take(40) }, "Anna", keyboard = KeyboardOptions(KeyboardCapitalization.Words))
                 if (invite == null) {
                     SecondaryButton("Scan invite QR code", icon = R.drawable.ic_qr_code_2) {
-                        scanInvite(ctx) { (n, c) -> code = c; groupName = n }
+                        scanInvite(ctx) { g -> code = g.code; groupName = g.name; linkCode = g.code; linkPins = g.pins }
                     }
                     // A pasted invite link works too: its code is used and its name filled in.
-                    InputField("Group code", code, { v -> Groups.readInvite(ctx, v)?.let { (n, c) -> code = c; if (groupName.isBlank() || groupName == "Group") groupName = n } ?: run { code = v.take(64) } },
+                    InputField("Group code", code, { v -> Groups.readInvite(v)?.let { g -> code = g.code; linkCode = g.code; linkPins = g.pins; if (groupName.isBlank() || groupName == "Group") groupName = g.name } ?: run { code = v.take(64) } },
                         "XXXX-XXXX-XXXX-XXXX", keyboard = KeyboardOptions(KeyboardCapitalization.Characters, keyboardType = androidx.compose.ui.text.input.KeyboardType.Password))
                     InputField("Group name (you can leave it)", groupName, { groupName = it.take(Invite.MAX_GROUP_NAME) }, "Family", keyboard = KeyboardOptions(KeyboardCapitalization.Words))
                 }
@@ -159,7 +162,7 @@ fun SetupFlow(invite: SavedGroup?, askName: Boolean, modifier: Modifier = Modifi
                     else -> null
                 }
                 PrimaryButton(if (invite != null) "Join ${invite.name}" else "Join", enabled = why == null) {
-                    done(name.trim(), SavedGroup(groupName.trim().ifEmpty { invite?.name ?: "Group" }, clean), false)
+                    done(name.trim(), SavedGroup(groupName.trim().ifEmpty { invite?.name ?: "Group" }, clean, if (clean == linkCode) linkPins else ""), false)
                 }
                 if (why != null) Txt(why, 14, color = Theme.dim)
             }
@@ -167,13 +170,13 @@ fun SetupFlow(invite: SavedGroup?, askName: Boolean, modifier: Modifier = Modifi
     }
 }
 
-/** Opens Google's QR scanner (no camera permission needed) and passes on the group name and code of a DarkProof invite. */
-fun scanInvite(c: Context, got: (Pair<String, String>) -> Unit) {
+/** Opens Google's QR scanner (no camera permission needed) and passes on the group name and code of a DarkProof invite, and the admins it names. */
+fun scanInvite(c: Context, got: (SavedGroup) -> Unit) {
     val opts = GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
     runCatching {
         GmsBarcodeScanning.getClient(c, opts).startScan()
             .addOnSuccessListener { b ->
-                val invite = b.rawValue?.let { Groups.readInvite(c, it) }
+                val invite = b.rawValue?.let(Groups::readInvite)
                 if (invite != null) got(invite) else Toast.makeText(c, "This QR code isn't a DarkProof invite.", Toast.LENGTH_LONG).show()
             }
             .addOnFailureListener { Toast.makeText(c, "The scanner isn't ready on this phone. Point the camera app at the code, or type it.", Toast.LENGTH_LONG).show() }

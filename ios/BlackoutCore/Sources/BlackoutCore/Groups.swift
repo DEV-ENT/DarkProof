@@ -61,10 +61,23 @@ public enum Invite {
     public static func pin(_ pub: Data) -> String { Hex.encode(Data(SHA256.hash(data: pub).prefix(16))) }
 
     /// Whether a phone joining with `pins` may take a new key made by `maker`. With no pins (a typed code) there is nothing to check against.
-    public static func allows(_ pins: String, maker: Data) -> Bool {
-        if pins.isEmpty { return true }
+    public static func allows(_ pins: String, maker: Data) -> Bool { pins.isEmpty || names(pins, maker: maker) }
+
+    /// Whether `pins` name `maker`. No pins name nobody: a removal that shuts a joining phone out has to come from someone named.
+    public static func names(_ pins: String, maker: Data) -> Bool {
         let mine = pin(maker), p = Array(pins)
         return stride(from: 0, to: p.count, by: pinChars).contains { String(p[$0..<Swift.min($0 + pinChars, p.count)]) == mine }
+    }
+
+    /// The admins kept for each code once the user has chosen to join `code` with an invite that names `pins` ("" for a
+    /// typed code or a link that names nobody). They are fixed at that moment: for a code among `groups`, the ones this
+    /// phone has saved, nothing changes, so a link read later can neither replace nor push out the admins a pending join
+    /// trusts. What was kept for a code that is no longer saved goes.
+    public static func joinPins(_ saved: [String: String], groups: [String], code: String, pins: String) -> [String: String] {
+        if groups.contains(code) { return saved }
+        var kept = saved.filter { groups.contains($0.key) }
+        if !pins.isEmpty { kept[code] = pins }
+        return kept
     }
 
     /// The group code someone typed or pasted, cleaned up: the code of an invite link; a generated code typed in lower
@@ -254,15 +267,101 @@ public struct Vouch: Equatable, Sendable {
         return Vouch(subject: name, status: status, needs: needs, people: CheckIn.peopleIn(text), spot: Spot.last(in: text))
     }
 
-    /// How the People list matches names: case and spacing don't matter ("grandma " is "Grandma").
+    /// How names are matched (the People list, "Are you safe?", checked people; spec "Reports about others"): case and
+    /// spacing don't matter ("grandma " is "Grandma"), and neither does anything that draws the same: characters that
+    /// draw nothing are left out, and compatibility forms count as the letters they stand for (NFKC). Otherwise a name
+    /// with a zero-width space in it would look like a checked person's and not match it. Same as Android's Vouch.key.
     public static func key(_ name: String) -> String {
-        name.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").lowercased()
+        var seen = String.UnicodeScalarView()
+        for u in nfkc(name).lowercased().unicodeScalars where !drawsNothing(u.value) { seen.append(u) }
+        var out = String.UnicodeScalarView(), space = false
+        for u in nfkc(String(seen)).unicodeScalars {
+            if isSpace(u.value) { space = !out.isEmpty } else { if space { out.append(" ") }; space = false; out.append(u) }
+        }
+        return String(out)
+    }
+
+    private static func nfkc(_ s: String) -> String { s.utf8.allSatisfy { $0 < 0x80 } ? s : s.precomposedStringWithCompatibilityMapping }
+
+    /// White space in a name key: Unicode's White_Space, and the blank Braille pattern.
+    private static func isSpace(_ c: UInt32) -> Bool {
+        (0x09...0x0D).contains(c) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 || (0x2000...0x200A).contains(c)
+            || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x2800 || c == 0x3000
+    }
+
+    /// Left out of a name key: control characters and Unicode's Default_Ignorable_Code_Point (zero-width, direction
+    /// marks, variation selectors, fillers, tags).
+    private static func drawsNothing(_ c: UInt32) -> Bool {
+        if isSpace(c) { return false }
+        if c < 0x20 || (0x7F...0x9F).contains(c) || c == 0xAD || c == 0x34F || c == 0x61C || (0x115F...0x1160).contains(c) { return true }
+        if (0x17B4...0x17B5).contains(c) || (0x180B...0x180F).contains(c) || (0x200B...0x200F).contains(c) || (0x202A...0x202E).contains(c) { return true }
+        if (0x2060...0x206F).contains(c) || c == 0x3164 || (0xFE00...0xFE0F).contains(c) || c == 0xFEFF || c == 0xFFA0 || (0xFFF0...0xFFFB).contains(c) { return true }
+        return (0x1BCA0...0x1BCA3).contains(c) || (0x1D173...0x1D17A).contains(c) || (0xE0000...0xE0FFF).contains(c)
     }
 
     /// One line, no "·" (it separates the parts), at most maxName characters.
     static func cleanName(_ s: String) -> String {
         let t = s.replacingOccurrences(of: "·", with: " ").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         return String(t.prefix(maxName)).trimmingCharacters(in: .whitespaces)
+    }
+}
+
+/// People whose emoji the user compared (spec "Person emoji"), saved as "<group id>|<member id>|<name key>". Same as
+/// Android's Checked.
+public enum Checked {
+    public static func entry(group: String, id: String, name: String) -> String { "\(group)|\(id)|\(Vouch.key(name))" }
+
+    /// The name key of a saved entry of `group`, made again: entries saved by older versions have the older key.
+    private static func nameOf(_ entry: String, _ group: String) -> String {
+        let rest = entry.dropFirst(group.count + 1)
+        guard let bar = rest.firstIndex(of: "|") else { return Vouch.key(String(rest)) }
+        return Vouch.key(String(rest[rest.index(after: bar)...]))
+    }
+
+    /// True if `name` belongs to a checked person of `group` but `id` is another key: a reinstall, or someone using their name.
+    public static func newKey(_ checked: [String], group: String, id: String, name: String) -> Bool {
+        let key = Vouch.key(name)
+        return checked.contains { $0.hasPrefix("\(group)|") && !$0.hasPrefix("\(group)|\(id)|") && nameOf($0, group) == key }
+    }
+
+    /// `checked` once the user has compared `id`'s emoji in `group`: this key is `name`'s from now on (an older one for the name goes).
+    public static func marked(_ checked: [String], group: String, id: String, name: String) -> [String] {
+        let key = Vouch.key(name)
+        return checked.filter { !($0.hasPrefix("\(group)|") && ($0.hasPrefix("\(group)|\(id)|") || nameOf($0, group) == key)) } + [entry(group: group, id: id, name: name)]
+    }
+}
+
+/// Blocked people (spec "Blocking"). A block is saved as "<channel>|<sender id>": the channel is `everyone` for the
+/// Public channel and the group's id for a group, because a member id means a person only inside its channel. On the
+/// Public channel anyone can write under any id until that id's key is known, so the sender of an unchecked message
+/// can't be blocked at all (that message can be hidden): else a stranger could get a group member hidden by posting
+/// under their id. Same as Android's Blocks.
+public enum Blocks {
+    public static let everyone = "everyone"
+    public static func key(channel: String, sender: String) -> String { "\(channel)|\(sender)" }
+
+    /// Whether the sender of `m` can be blocked: someone else's message whose signature checked. `me`: this phone's mark for its own.
+    public static func canBlock(_ m: Message, me: String) -> Bool { m.verified && m.sender != me }
+
+    /// True if `blocked` hides what `sender` writes in `channel` (nil: a group whose id isn't known). An entry without a
+    /// channel was saved before blocks had one: it still hides that id everywhere, as it did when the user made it.
+    public static func hides(_ blocked: Set<String>, channel: String?, sender: String) -> Bool {
+        blocked.contains(sender) || (channel.map { blocked.contains(key(channel: $0, sender: sender)) } ?? false)
+    }
+}
+
+/// What a chat row shows a message as. Check-ins, reports about others and "Are you safe?" are group messages, and
+/// places are Public channel messages (spec/FORMAT.md): on the Public channel, where anyone can post, a text that looks
+/// like a check-in or a question is shown as plain text, with no answer buttons. Same as Android's MessageRow.
+public enum ChatCard: Equatable, Sendable {
+    case place(Place), checkIn(CheckIn), vouch(Vouch), ask(AreYouSafe), text
+
+    public static func of(_ m: Message) -> ChatCard {
+        if m.isPublic { return Place.of(m.text).map { .place($0) } ?? .text }
+        if let c = CheckIn.of(m.text) { return .checkIn(c) }
+        if let v = Vouch.of(m.text) { return .vouch(v) }
+        if let a = AreYouSafe.of(m.text) { return .ask(a) }
+        return .text
     }
 }
 

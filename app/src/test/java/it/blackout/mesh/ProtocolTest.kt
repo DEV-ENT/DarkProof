@@ -40,7 +40,8 @@ class ProtocolTest {
         fun r(sender: String, name: String, ts: Long, ids: List<String>) = Message("r$sender$ts", ts, sender, name, Receipt.text(ids))
         val a = "000000000000000a"; val b = "000000000000000b"
         val d = Deliveries()
-        listOf(r("lucia", "Lucia", 300, listOf(a)), r("marco", "Marco", 200, listOf(a, b)), r("marco", "Marco R.", 100, listOf(a))).forEach(d::add)
+        d.sent("g", a); d.sent("g", b) // receipts count only for messages this phone wrote, in their group
+        listOf(r("lucia", "Lucia", 300, listOf(a)), r("marco", "Marco", 200, listOf(a, b)), r("marco", "Marco R.", 100, listOf(a))).forEach { d.add("g", it) }
         assertEquals(listOf("marco", "lucia"), d.readers(a).map { it.id })
         assertEquals(100L, d.readers(a).first().ts)
         assertEquals("Marco R.", d.readers(a).first().name)
@@ -171,9 +172,10 @@ class ProtocolTest {
 
     @Test fun deliveredListIsACopy() {
         val d = Deliveries(); val a = "000000000000000a"
-        d.add(Message("r1", 100, "lucia", "Lucia", Receipt.text(listOf(a))))
+        d.sent("g", a)
+        d.add("g", Message("r1", 100, "lucia", "Lucia", Receipt.text(listOf(a))))
         val shown = d.readers(a)
-        d.add(Message("r2", 200, "marco", "Marco", Receipt.text(listOf(a)))) // arrives while the screen reads `shown`
+        d.add("g", Message("r2", 200, "marco", "Marco", Receipt.text(listOf(a)))) // arrives while the screen reads `shown`
         assertEquals(1, shown.size); assertEquals(2, d.readers(a).size)
     }
 

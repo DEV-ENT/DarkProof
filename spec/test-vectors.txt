@@ -390,6 +390,10 @@ psk: 03511108059ee5abeb91862c69772528b263b65b640a3aaa533594d8124a4481
 plaintext: 4242424242424242424242424242424242424242424242424242424242424242
 sealed: 04b088dbb3518299ed2bcec6b6ad9572e45bf8b907a41649861b4b4bd56606f092abf3dc32296993ec09964104567e56960aaabfa84cdc8f088cab5736c8e2782b5fa3a1535f606f0e34b34c2f3f70c91d97c62f2198ec7edd7d963d16f48bcfec8b153d7a87910927684b3c6c91b1e332
 
+# A message sealed with its own key (spec/FORMAT.md "Message keys"): member 1's message number 5. The signature here is
+# a fixed dummy; `signed_message` is what a real one covers (tag `darkproof-sig-mk-v1`, context, id, ts, position and
+# number, body with its padding), made by an independent Python script from the spec. Apps check that SHA-256 of it is
+# the digest they verify the signature against.
 kind: message-key
 secret: 1111111111111111111111111111111111111111111111111111111111111111
 member_0: 1111111111111111
@@ -405,4 +409,87 @@ name: Bea
 text: hello
 iv: 333333333333333333333333
 signature: 07070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707
+signed_message: 6461726b70726f6f662d7369672d6d6b2d7631d38c3947305923962ea1456c96cc4441a8a9e64ad11cf77ce3986af4e71f4e66e608000000000005000001a1b2bd76400100050010323232323232323232323232323232320003426561000568656c6c6f0000000000000000000000000000000000000000
 cipher: 333333333333333333333333e65b3b58a5ed94e69f0791fc406510998b0be5605f5a2f8894c9160c3c4bc1a9d8372199ee9027629ee1a8ae40db6669756405260e2f0ac1f6058e90bcff421c9bd25a700abd41581bfca1ea7dd5e221b4579e29329c6b165c8ff3049b4a9551fe970d4f6df71e915355d4ae7bdcc1d94d4fa14ae6f0d8f3c38ad57298cc5d57217e2225f3
+
+# Name keys (spec/FORMAT.md, "Reports about others"): Vouch.key(name) == key. Names and keys are UTF-8 in hex, because
+# several hold characters that draw nothing. Made by an independent Python script (unicodedata) from the spec.
+# plain
+kind: name-key
+name_hex: 416e6e61
+key_hex: 616e6e61
+
+# case and spacing
+kind: name-key
+name_hex: 20204772616e646d6109524f534120
+key_hex: 6772616e646d6120726f7361
+
+# zero-width space inside
+kind: name-key
+name_hex: 416ee2808b6e61
+key_hex: 616e6e61
+
+# word joiner at the end
+kind: name-key
+name_hex: 4d6172636fe281a0
+key_hex: 6d6172636f
+
+# soft hyphen
+kind: name-key
+name_hex: 4d6172c2ad636f
+key_hex: 6d6172636f
+
+# right-to-left override in front
+kind: name-key
+name_hex: e280ae4d6172636f
+key_hex: 6d6172636f
+
+# variation selector and zero-width joiner
+kind: name-key
+name_hex: 4d61efb88f72636fe2808d
+key_hex: 6d6172636f
+
+# Hangul filler
+kind: name-key
+name_hex: 416e6e61e385a4
+key_hex: 616e6e61
+
+# a tag character (U+E0061)
+kind: name-key
+name_hex: 416e6e61f3a081a1
+key_hex: 616e6e61
+
+# e and a combining accent
+kind: name-key
+name_hex: 4a6f7365cc81
+key_hex: 6a6f73c3a9
+
+# full-width letters
+kind: name-key
+name_hex: efbca1efbd8eefbd8eefbd81
+key_hex: 616e6e61
+
+# the accent joins its letter once the joiner between them is gone
+kind: name-key
+name_hex: 61e2808dcc816e6e61
+key_hex: c3a16e6e61
+
+# next line (U+0085) is white space
+kind: name-key
+name_hex: 416e6e61c2854d61726961
+key_hex: 616e6e61206d61726961
+
+# a control character (U+001F) draws nothing
+kind: name-key
+name_hex: 416e6e611f4d61726961
+key_hex: 616e6e616d61726961
+
+# the blank Braille pattern counts as a space
+kind: name-key
+name_hex: 416e6e6120e2a080204d61726961
+key_hex: 616e6e61206d61726961
+
+# a look-alike letter (Cyrillic o) is still another name
+kind: name-key
+name_hex: 4d617263d0be
+key_hex: 6d617263d0be

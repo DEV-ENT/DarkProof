@@ -249,13 +249,10 @@ final class GroupSecrets: ObservableObject, @unchecked Sendable { // guarded by 
     var found: [String] { read(\.found) }
     /// The admins the invite for `code` named ("" if none): only they can let this phone in (spec "Invites").
     func pins(_ code: String) -> String { read { $0.pins?[code] ?? "" } }
-    func setPins(_ code: String, _ pins: String) {
-        change { s in
-            var m = s.pins ?? [:]
-            m[code] = pins
-            if m.count > 20, let other = m.keys.first(where: { $0 != code }) { m[other] = nil }
-            s.pins = m
-        }
+    /// The user chose to join `code`, or to show it: if this phone doesn't have that code yet, the admins its invite
+    /// names are kept from now on (`Invite.joinPins`). Nothing else writes them. Call before the group is saved.
+    func joining(_ code: String, pins: String) {
+        change { s in s.pins = Invite.joinPins(s.pins ?? [:], groups: s.groups.map(\.code) + [s.code], code: code, pins: pins) }
     }
 
     func setCode(_ c: String) {

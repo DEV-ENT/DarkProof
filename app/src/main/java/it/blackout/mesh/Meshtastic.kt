@@ -59,20 +59,26 @@ object Meshtastic {
     }
 }
 
-/** LoRa has very little bandwidth: only recent messages that fit, one at a time. */
+/**
+ * LoRa has very little bandwidth: only recent messages that fit, one at a time. The packets this phone wrote go
+ * first, and a packet it only passes on never takes the place of one of them.
+ */
 class LoraQueue(private val now: () -> Long = System::currentTimeMillis, private val maxBytes: Int = Meshtastic.PAYLOAD_MAX) {
     private val q = ArrayDeque<Packet>()
-    private val sent = LinkedHashSet<String>()
+    private val own = ArrayDeque<Packet>() // written on this phone
+    private val sent = LinkedHashSet<String>() // MeshRouter.key, as the router tells packets apart: junk under an id can't keep the real packet off the radio
     private var last = 0L
-    @Synchronized fun offer(p: Packet) {
-        if (p.ts < now() - MAX_AGE_MS || p.encode().size > maxBytes || !sent.add(p.id)) return
+    /** [mine]: this very packet was written on this phone. */
+    @Synchronized fun offer(p: Packet, mine: Boolean = false) {
+        if (p.ts < now() - MAX_AGE_MS || p.encode().size > maxBytes || !sent.add(MeshRouter.key(p))) return
         if (sent.size > 1000) sent.remove(sent.first())
-        if (q.size >= MAX_QUEUE) q.removeFirst()
-        q.addLast(p)
+        // Full: the oldest packet passed on makes room. With only own packets waiting, the oldest of them does, for another own one.
+        if (q.size + own.size >= MAX_QUEUE) { if (q.isNotEmpty()) q.removeFirst() else if (mine) own.removeFirst() else return }
+        (if (mine) own else q).addLast(p)
     }
     @Synchronized fun next(): Packet? {
-        if (q.isEmpty() || now() - last < INTERVAL_MS) return null
-        last = now(); return q.removeFirst()
+        if ((q.isEmpty() && own.isEmpty()) || now() - last < INTERVAL_MS) return null
+        last = now(); return if (own.isNotEmpty()) own.removeFirst() else q.removeFirst()
     }
     companion object { const val MAX_AGE_MS = 30 * 60_000L; const val INTERVAL_MS = 20_000L; const val MAX_QUEUE = 20 }
 }

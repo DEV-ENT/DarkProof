@@ -92,7 +92,7 @@ class MeshCoreLink(private val ctx: Context) {
     @Volatile var status = "MeshCore: no radio"; private set
 
     private fun set(s: String) { status = "MeshCore: $s"; MeshEngine.notifyUi() }
-    fun offer(p: Packet) = queue.offer(p)
+    fun offer(p: Packet, mine: Boolean = false) = queue.offer(p, mine)
     /** A radio was set up here before: it is linked again whenever it is in reach. */
     val paired get() = prefs.getString("meshcore", null) != null
     fun start() { prefs.getString("meshcore", null)?.let(::connect) }

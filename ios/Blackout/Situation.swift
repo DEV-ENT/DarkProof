@@ -49,14 +49,13 @@ enum Situation {
                 lines.append("- \(who), \(ago(m.ts, now)): \(text.aiSafe(160))")
             }
         }
-        return lines.joined(separator: "\n")
+        // Other people's words fill most of it, so it has a size the model's window always holds (AiContext).
+        return AiContext.head(lines.joined(separator: "\n"), bytes: AiContext.maxSituationBytes)
     }
 }
 
 extension String {
-    /// Text from other people, for the assistant: one line, short, and it can't close the <data> block around it.
-    func aiSafe(_ max: Int = 40) -> String {
-        let line = components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
-        return String(line.replacingOccurrences(of: "<", with: "‹").replacingOccurrences(of: ">", with: "›").prefix(max))
-    }
+    /// Text from other people, for the assistant: one line, short however it is written, and it can't close the
+    /// <data> block around it (AiContext.field).
+    func aiSafe(_ max: Int = 40) -> String { AiContext.field(self, max: max) }
 }

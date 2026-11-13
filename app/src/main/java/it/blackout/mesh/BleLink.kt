@@ -44,9 +44,7 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
         private const val MAX_LINKS = 6
         private const val RETRY_MS = 5_000L
         private const val SWEEP_MS = 5_000L
-        private const val SAME_TIME_MS = 10_000L
         private const val ROTATE_MS = 30_000L      // at the limit, at most one settled link gives way this often
-        private const val ROTATE_AGE_MS = 60_000L
         private const val STALE_MS = 5_000L    // at the link limit, a link with no HELLO this old makes room
         fun owns(peer: String) = peer.startsWith(PREFIX)
         // Status notes, in plain words (Home and Connections show them).
@@ -306,7 +304,16 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
     // ---- both roles ---------------------------------------------------------------------------
 
     /** Queues a frame; the queue is capped (BleProtocol.Outbox): the oldest packet frames go first, HELLO never. */
-    private fun enqueue(l: Link, frame: ByteArray, hello: Boolean = false) { l.out.add(frame, hello); pump(l) }
+    private fun enqueue(l: Link, frame: ByteArray, hello: Boolean = false) { l.out.add(frame, hello); freed(l); pump(l) }
+
+    /**
+     * Tells the router how much room opened in the link's queue (packets sent whole, or dropped at the cap): it sends
+     * the next stored packets only as far as they fit (MeshRouter.room), so a long store doesn't push itself out.
+     */
+    private fun freed(l: Link) {
+        val (bytes, packets) = l.out.freed()
+        if (packets > 0 && l.up) MeshEngine.router?.room(l.id, bytes, packets)
+    }
 
     /** Sends the next chunk once the previous write or notification has completed. */
     private fun pump(l: Link) {
@@ -318,7 +325,7 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
         } catch (e: RuntimeException) { // the Bluetooth stack throws on some bad states: lose the link, not the app
             Log.w(TAG, "${l.id}: send failed: $e"); drop(l, hard = true); return
         }
-        if (ok) { l.out.commit(); l.busy = true } else h.postDelayed({ pump(l) }, 100) // stack busy: try again
+        if (ok) { l.out.commit(); l.busy = true; freed(l) } else h.postDelayed({ pump(l) }, 100) // stack busy: try again
     }
 
     private fun onChunk(l: Link, chunk: ByteArray) {
@@ -354,19 +361,24 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
     private fun hello(l: Link, remote: String) {
         l.remote = remote
         if (l.central) nodeOf[l.address] = remote
-        val other = links.values.firstOrNull { it !== l && it.remote == remote }
-        if (other != null) { // two links to the same phone: keep one (spec: "Duplicate links")
-            val keepCentral = BleProtocol.keepMyCentralLink(nodeId, remote)
-            // Only two links made at the same moment are really a duplicate. A later one claiming the same phone could be
-            // anyone: node ids prove nothing, so the link that's up stays. A dead one goes by its own disconnect.
-            val loser = if (kotlin.math.abs(l.createdAt - other.createdAt) >= SAME_TIME_MS) l else if (other.central == l.central) other else if (l.central == keepCentral) other else l
+        // Two links to the same phone: keep one (spec: "Duplicate links"). Only two links made at the same moment are
+        // surely a duplicate. Node ids prove nothing: whoever said a phone's id first must not keep that phone from
+        // linking. So a later link the other side dialed stays beside the link that's there (BleProtocol.twin); if both
+        // do lead to one phone, that phone closes the one it dialed, and a dead one goes by its own disconnect.
+        for (other in links.values.filter { it !== l && it.remote == remote }) {
+            val loser = when (BleProtocol.twin(nodeId, remote, l.central, other.central, kotlin.math.abs(l.createdAt - other.createdAt), l.address == other.address)) {
+                BleProtocol.Twin.CLOSE_NEW -> l
+                BleProtocol.Twin.CLOSE_OLD -> other
+                BleProtocol.Twin.BOTH_STAY -> continue
+            }
             Log.d(TAG, "duplicate link to $remote: closing ${loser.id}")
             drop(loser)
             if (loser === l) return
         }
         Log.d(TAG, "${l.id} up: ${if (l.central) "central" else "peripheral"}, remote $remote")
         l.up = true
-        MeshEngine.router?.peerUp(l.id)
+        // All links of one device count against one allowance in the router; the stored packets come as the queue has room.
+        MeshEngine.router?.peerUp(l.id, PREFIX + "@" + l.address, BleProtocol.ROOM_BYTES, BleProtocol.ROOM_PACKETS)
         recount()
     }
 
@@ -405,9 +417,10 @@ class BleLink(private val ctx: Context, private val nodeId: String) {
         links.values.filter { it.remote == null && now - it.createdAt >= STALE_MS }.minByOrNull { it.createdAt }?.let {
             Log.d(TAG, "link limit: closing ${it.id}, no HELLO yet"); drop(it); return true
         }
-        // Every place taken by a phone that said HELLO: one at random gives way now and then, so nobody can hold them all by just staying.
+        // Every place taken by a phone that said HELLO: one at random gives way now and then, whatever its age, so nobody
+        // can hold them all: not by just staying, and not by making its own links anew to keep them young.
         if (now - rotatedAt < ROTATE_MS) return false
-        val l = links.values.filter { now - it.createdAt >= ROTATE_AGE_MS }.randomOrNull() ?: return false
+        val l = links.values.filter { it.up }.randomOrNull() ?: return false
         rotatedAt = now; Log.d(TAG, "link limit: closing ${l.id} to make room"); drop(l, hard = true)
         return true
     }

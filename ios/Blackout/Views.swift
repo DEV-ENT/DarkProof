@@ -16,7 +16,7 @@ struct RootView: View {
         Group {
             if let engine {
                 MainView(engine: engine)
-                    .sheet(item: $linkInvite) { i in JoinGroupSheet(engine: engine, prefill: (i.name, i.code)) }
+                    .sheet(item: $linkInvite) { i in JoinGroupSheet(engine: engine, prefill: i) }
             } else if code.isEmpty {
                 SetupView(invite: invite) { n, g, c, created in
                     SavedGroups.remember(.init(name: g, code: c))
@@ -34,14 +34,15 @@ struct RootView: View {
         .onChange(of: phase) { AppLock.shared.phaseChanged($0) }
         .onOpenURL { url in
             guard let i = InviteLinks.read(url.absoluteString) else { return }
-            if code.isEmpty { invite = PendingInvite(name: i.name, code: i.code); return }
+            if code.isEmpty { invite = i; return }
             if i.code == code { Nav.shared.toast("You're already in \(groupName)"); return }
-            linkInvite = PendingInvite(name: i.name, code: i.code) // already in a group: ask first
+            linkInvite = i // already in a group: ask first
         }
     }
 }
 
-struct PendingInvite: Equatable, Identifiable { let name: String; let code: String; var id: String { code } }
+/// An invite link that was read: the group's name and code, and the admins it names (`pins`), kept only once the user joins with it.
+struct PendingInvite: Equatable, Identifiable { let name: String; let code: String; var pins = ""; var id: String { code } }
 
 // MARK: - Setup
 
@@ -56,6 +57,8 @@ struct SetupView: View {
     @State private var groupName = ""
     @State private var code = ""
     @State private var result: (String, String, String, Bool)?
+    @State private var invited: PendingInvite? // the invite link the code in the join form came from
+    @State private var pins = ""               // the admins named by the invite the user is joining with
     @FocusState private var focus: Field?
     @FocusState private var codeFocus: Bool
     enum Field { case name, group }
@@ -71,7 +74,7 @@ struct SetupView: View {
             } else if let invite {
                 form(title: "You're invited", subtitle: "Join \(invite.name) to message each other without internet.", back: false) {
                     nameField
-                    Button("Join \(invite.name)") { next(cleanName, invite.name, invite.code, false) }
+                    Button("Join \(invite.name)") { next(cleanName, invite.name, invite.code, false, pins: invite.pins) }
                         .buttonStyle(PrimaryButton()).disabled(cleanName.isEmpty)
                 }
             } else {
@@ -86,9 +89,9 @@ struct SetupView: View {
     }
 
     /// Before the last step: what DarkProof will ask for, so the questions that follow make sense.
-    private func next(_ n: String, _ g: String, _ c: String, _ created: Bool) {
+    private func next(_ n: String, _ g: String, _ c: String, _ created: Bool, pins named: String = "") {
         focus = nil; codeFocus = false
-        result = (n, g, c, created)
+        result = (n, g, c, created); pins = named
         before = mode
         withAnimation(.easeOut(duration: 0.2)) { mode = .ready }
     }
@@ -135,10 +138,10 @@ struct SetupView: View {
     private var join: some View {
         form(title: "Join a group", subtitle: "Scan your friend's invite QR code, or point the iPhone Camera at it. Or type their code.") {
             nameField
-            CodeEntry(code: $code, groupName: $groupName, focusCode: $codeFocus)
+            CodeEntry(code: $code, groupName: $groupName, invited: $invited, focusCode: $codeFocus)
             Button("Join") {
                 let g = clean(groupName, Invite.maxGroupName)
-                next(cleanName, g.isEmpty ? "Group" : g, cleanCode, false)
+                next(cleanName, g.isEmpty ? "Group" : g, cleanCode, false, pins: InviteLinks.pins(invited, for: cleanCode))
             }
             .buttonStyle(PrimaryButton()).disabled(cleanName.isEmpty || !Invite.isGeneratedCode(cleanCode))
             if cleanName.isEmpty && !code.isEmpty {
@@ -156,7 +159,7 @@ struct SetupView: View {
                 permission("bell.fill", "Notifications", "Tells you when your group writes or someone needs help.")
             }
             Text("Please tap Allow each time. You can change this later in Settings.").scaledFont(15).foregroundStyle(Theme.dim)
-            Button("Continue") { if let r = result { done(r.0, r.1, r.2, r.3) } }.buttonStyle(PrimaryButton())
+            Button("Continue") { if let r = result { GroupSecrets.shared.joining(r.2, pins: pins); done(r.0, r.1, r.2, r.3) } }.buttonStyle(PrimaryButton())
         }
     }
 
@@ -537,7 +540,14 @@ struct ChatView: View {
                 }
             }
         } else {
-            Button(role: .destructive) { blocking = m } label: { Label("Block \(m.name)", systemImage: "hand.raised") }
+            // While a message is "not verified yet" nobody knows who wrote it: it can be hidden, its sender can't be blocked (`Blocks`).
+            if Blocks.canBlock(m, me: engine.deviceId) {
+                Button(role: .destructive) { blocking = m } label: { Label("Block \(m.name)", systemImage: "hand.raised") }
+            } else {
+                Button(role: .destructive) { Moderation.hide(m.id); engine.moderationChanged(); nav.toast("Hidden on this phone") } label: {
+                    Label("Hide this message", systemImage: "eye.slash")
+                }
+            }
             if m.isPublic {
                 Button(role: .destructive) {
                     Moderation.report(m.id); engine.moderationChanged()
@@ -594,7 +604,8 @@ struct ChatView: View {
                             let joins = toPublic ? [] : engine.groupLines(code)
                             ForEach(Array(list.enumerated()), id: \.element.id) { i, m in
                                 let prev = i > 0 ? list[i - 1] : nil
-                                ForEach(joins.filter { $0.ts > (prev?.ts ?? .min) && $0.ts <= m.ts }) { j in GroupLine(text: j.text) }
+                                // By position: two lines can have the same time and text ("Someone joined" twice), so GroupEvent.id can repeat.
+                                ForEach(Array(joins.filter { $0.ts > (prev?.ts ?? .min) && $0.ts <= m.ts }.enumerated()), id: \.offset) { _, j in GroupLine(text: j.text) }
                                 if prev == nil || !ChatTime.sameDay(prev!.ts, m.ts) {
                                     Text(ChatTime.dayTitle(m.ts)).scaledFont(13, .semibold).foregroundStyle(Theme.dim)
                                         .padding(.horizontal, 12).padding(.vertical, 5).background(Theme.tile, in: Capsule())
@@ -602,7 +613,7 @@ struct ChatView: View {
                                 }
                                 row(m, prev: prev, first: i == 0)
                             }
-                            ForEach(joins.filter { $0.ts > (list.last?.ts ?? .min) }) { j in GroupLine(text: j.text) }
+                            ForEach(Array(joins.filter { $0.ts > (list.last?.ts ?? .min) }.enumerated()), id: \.offset) { _, j in GroupLine(text: j.text) }
                             Color.clear.frame(height: 1).id("bottom")
                                 .onAppear { atBottom = true; newBelow = 0; markRead() }
                                 .onDisappear { atBottom = false }
@@ -672,8 +683,9 @@ struct ChatView: View {
         .confirmationDialog("Block \(blocking?.name ?? "")?", isPresented: Binding(get: { blocking != nil }, set: { if !$0 { blocking = nil } }),
                             titleVisibility: .visible, presenting: blocking) { m in
             Button("Block", role: .destructive) {
-                Moderation.block(m.sender, name: m.name); engine.moderationChanged(); blocking = nil
-                nav.toast("\(m.name) is blocked on this phone")
+                let done = engine.block(m) // in the channel the message came in; refused if it isn't checked any more
+                blocking = nil
+                if done { nav.toast("\(m.name) is blocked on this phone") }
             }
         } message: { _ in
             Text("You won't see their messages, places or check-ins on this phone. You can unblock them in Settings.")
@@ -710,9 +722,11 @@ struct ChatView: View {
         let showReaders: () -> Void = {
             if case .delivered(let r) = delivery { readers = ReaderList(id: m.id, readers: r) }
         }
+        // Check-ins, reports and "Are you safe?" are group messages: an Everyone post that looks like one is plain text (`ChatCard`).
+        let card = ChatCard.of(m)
         VStack(alignment: mine ? .trailing : .leading, spacing: 3) {
         Group {
-            if m.isPublic, let place = Place.of(m.text) {
+            if case .place(let place) = card {
                 let shared = SharedPlace(id: m.id, place: place, by: mine ? "you" : m.name, ts: m.ts)
                 VStack(alignment: .trailing, spacing: 4) {
                     PlaceRow(shared: shared, me: loc.location?.spot, now: Date())
@@ -720,18 +734,18 @@ struct ChatView: View {
                         .onTapGesture { if place.spot != nil { findingPlace = shared } }
                     if let delivery { StatusLine(time: nil, delivery: delivery).padding(.horizontal, 6) }
                 }
-            } else if let c = CheckIn.of(m.text) {
+            } else if case .checkIn(let c) = card {
                 VStack(alignment: .trailing, spacing: 4) {
                     CheckInRow(checkIn: c, name: mine ? nil : m.name, time: time, battery: CheckIn.battery(in: m.text),
                                needs: CheckIn.needs(in: m.text), people: CheckIn.people(in: m.text), spot: CheckIn.spot(in: m.text))
                     if let delivery { StatusLine(time: nil, delivery: delivery).padding(.horizontal, 6).onTapGesture(perform: showReaders) }
                 }
-            } else if let v = Vouch.of(m.text) {
+            } else if case .vouch(let v) = card {
                 VStack(alignment: .trailing, spacing: 4) {
                     VouchRow(vouch: v, by: mine ? "you" : m.name, time: time)
                     if let delivery { StatusLine(time: nil, delivery: delivery).padding(.horizontal, 6).onTapGesture(perform: showReaders) }
                 }
-            } else if let a = AreYouSafe.of(m.text) {
+            } else if case .ask(let a) = card {
                 AskRow(ask: a, from: mine ? nil : m.name, time: time, delivery: delivery,
                        canAnswer: !mine && a.isFor(myName) && !answered(after: m.ts), sending: engine.checkInSending != nil) { c in
                     if c == .safe { let e = engine; e.checkIn(.safe) { nav.toast(e.queuedToast("“I'm safe”")) } }
@@ -825,7 +839,12 @@ struct Bubble: View {
             if let name { Text(name).scaledFont(13, .semibold).foregroundStyle(Theme.dim).padding(.horizontal, 6) }
             if let photo, let ui = PhotoShrinker.received(photo) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Image(uiImage: ui).resizable().scaledToFit().frame(maxWidth: 250)
+                    // The sender chooses the picture: the row keeps its shape between 1:3 and 3:1 and crops the rest
+                    // (Photo.shape), so one a pixel wide and very tall can't make a row hundreds of screens high.
+                    Color.clear.aspectRatio(CGFloat(Photo.shape(width: Double(ui.size.width), height: Double(ui.size.height))), contentMode: .fit)
+                        .overlay { Image(uiImage: ui).resizable().scaledToFill() }
+                        .clipped()
+                        .frame(maxWidth: 250)
                     if !text.isEmpty {
                         Text(text).scaledFont(17).foregroundStyle(mine ? Color.black : Theme.text)
                             .fixedSize(horizontal: false, vertical: true)

@@ -160,10 +160,13 @@ the rekey. Phones then follow only the new door, and the saved group, its invite
 - Through an old door a phone reads only a rival removal: one numbered the same as the removal it followed, from that
   same door, by an admin of the epoch before. Old doors are kept as long as their epoch, a week.
 - A join request through the old door is ignored. A phone still joining with that code sees the removal go by, and
-  the app tells it to ask for a new invite.
+  the app tells it to ask for a new invite, if its invite names the admin who made the removal. With a typed code it
+  can't tell that removal from one signed by anyone who has the code, so it goes on asking.
 - Anything numbered above a removal that came through the old door is dropped when the removal arrives: it was made
   by someone who hadn't heard, or by the person removed.
-- Messages and receipts from a removed member dated after the removal aren't shown.
+- Messages and receipts from a removed member aren't shown, unless the phone had accepted them before the removal
+  reached it and they are dated before it. The date alone can't decide: the sender writes it (FORMAT.md, "Removals and
+  the code").
 - The removed phone sees "You were removed", keeps what it has, and stops writing to the group or introducing itself.
 
 ### Forward secrecy, honestly

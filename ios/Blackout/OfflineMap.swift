@@ -31,7 +31,7 @@ final class OfflineMap: NSObject, ObservableObject {
         c.httpMaximumConnectionsPerHost = 4
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
         c.httpAdditionalHeaders = ["User-Agent": "DarkProof/\(v) (iOS; +https://github.com/DEV-ENT/DarkProof)"]
-        var offline = UserDefaults.standard.bool(forKey: "tor")
+        var offline = TorSetting.isOn() // on unless turned off: a switch nobody touched has no saved value
         #if DEBUG
         if CommandLine.arguments.contains("noInternet") { offline = true } // test the saved map
         #endif
@@ -70,7 +70,7 @@ final class OfflineMap: NSObject, ObservableObject {
     /// Saves the map around `c`, replacing any saved area.
     func download(around c: Spot) {
         if case .downloading = state { return }
-        if UserDefaults.standard.bool(forKey: "tor") { state = .failed("Turn off Connect through Tor to download the map: the map server would see your address."); return }
+        if TorSetting.isOn() { state = .failed("Turn off Connect through Tor to download the map: the map server would see your address."); return }
         let b = Self.bounds(around: c)
         guard Self.tileCount(b) <= Self.maxTiles else { state = .failed("This area needs too many map tiles."); return }
         let region = MLNTilePyramidOfflineRegion(styleURL: Self.styleURL, bounds: b, fromZoomLevel: 0, toZoomLevel: Self.maxZoom)

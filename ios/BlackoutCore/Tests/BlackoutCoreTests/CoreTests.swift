@@ -154,8 +154,9 @@ final class CoreTests: XCTestCase {
     func testRestoredSeenIdsAreNotDeliveredAgain() {
         var got: [String] = []
         let r = MeshRouter(send: { _, _ in }, deliver: { got.append($0.id) })
-        r.restore([], seenIds: [MeshRouter.key(pkt(m1))])
-        r.receive(from: "peer", pkt(m1))
+        let p = pkt(m1)
+        r.restore([], seenIds: [MeshRouter.key(p)]) // the same packet: id, header time and content
+        r.receive(from: "peer", p.withTtl(3))
         XCTAssertEqual(got, [])
         r.receive(from: "peer", pkt("00000000000000b2"))
         XCTAssertEqual(got, ["00000000000000b2"])

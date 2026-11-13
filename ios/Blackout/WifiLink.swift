@@ -40,6 +40,12 @@ final class WifiLink {
     private var note = ""
     private var listenGen = 0, browseGen = 0 // ignore state updates of a listener or browser already replaced
     private var listenRetry = 2.0, browseRetry = 2.0
+    private var open: [ObjectIdentifier: NWConnection] = [:] // every connection from its start to its end, also before its HELLO
+    private var waiting: [(conn: NWConnection, address: String)] = [] // connections that dialed in and haven't said HELLO yet, oldest first
+    private var stopGen = 0                 // counts stop(): a connection begun before the last one never becomes a link
+    private var rotatedAt = Date.distantPast
+    /// The listener and the links to discovered phones never use the mobile network (spec "Wi-Fi networks").
+    private static var lanOnly: NWParameters { let p = NWParameters.tcp; p.prohibitedInterfaceTypes = [.cellular]; return p }
 
     init(nodeId: String, router: MeshRouter, onStatus: @escaping (String?) -> Void) {
         self.nodeId = nodeId; self.router = router; self.onStatus = onStatus
@@ -73,12 +79,14 @@ final class WifiLink {
     func stop() {
         q.async {
             self.running = false
-            self.listenGen += 1; self.browseGen += 1
+            self.listenGen += 1; self.browseGen += 1; self.stopGen += 1
             self.listener?.cancel(); self.listener = nil
             self.browser?.cancel(); self.browser = nil
             self.found = [:]
             self.stopManualLocked()
             for (_, l) in self.links { l.conn.cancel() }
+            for c in self.open.values { c.cancel() } // also the connections still being set up: none becomes a link afterwards
+            self.waiting = []
             self.report()
         }
     }
@@ -105,17 +113,29 @@ final class WifiLink {
         q.async {
             guard let l = self.links[peer] else { return }
             let n = b.count + 4
-            // A phone that stopped reading: what is waiting for it would pile up here until iOS ended the app.
-            if self.queued[peer, default: 0] + n > Self.maxQueuedLink || self.queuedAll + n > Self.maxQueuedAll { l.conn.cancel(); return }
+            // A phone that stopped reading: what is waiting for it would pile up here until iOS ended the app. When all
+            // links together have too much waiting, the links that hold the most are closed, not the one this packet is
+            // for: that one may be reading as it should.
+            if self.queued[peer, default: 0] + n > Self.maxQueuedLink { self.cut(peer); return }
+            while self.queuedAll + n > Self.maxQueuedAll, let top = self.queued.max(by: { $0.value < $1.value })?.key {
+                self.cut(top)
+                if top == peer { return }
+            }
             self.queued[peer, default: 0] += n; self.queuedAll += n
             l.conn.send(content: Self.frame(b), completion: .contentProcessed { _ in
                 self.q.async {
+                    guard let have = self.queued[peer] else { return } // the link was cut: its bytes are off the total already
                     self.queuedAll -= n
-                    let left = self.queued[peer, default: n] - n
-                    self.queued[peer] = left > 0 ? left : nil
+                    self.queued[peer] = have > n ? have - n : nil
                 }
             })
         }
+    }
+
+    /// Closes a link for what is waiting to go out to it. That no longer counts toward the total.
+    private func cut(_ peer: String) {
+        queuedAll -= queued.removeValue(forKey: peer) ?? 0
+        if let l = links.removeValue(forKey: peer) { router.peerDown(peer); l.conn.cancel() }
     }
 
     // MARK: - Listening and discovery
@@ -128,13 +148,17 @@ final class WifiLink {
         let gen = listenGen
         listener?.cancel(); listener = nil
         let l: NWListener
-        do { l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!) }
+        do { l = try NWListener(using: Self.lanOnly, on: NWEndpoint.Port(rawValue: port)!) }
         catch {
-            guard port != 0, let any = try? NWListener(using: .tcp) else { note = "can't listen"; relisten(gen); return }
+            guard port != 0, let any = try? NWListener(using: Self.lanOnly) else { note = "can't listen"; relisten(gen); return }
             l = any
         }
         l.service = NWListener.Service(name: nodeId, type: Self.serviceType)
-        l.newConnectionHandler = { [weak self] c in self?.run(c, dialed: false) }
+        l.newConnectionHandler = { [weak self] c in
+            guard let self, self.running else { c.cancel(); return }
+            self.admit(c)
+            self.run(c, dialed: false, local: true)
+        }
         l.stateUpdateHandler = { [weak self] state in
             guard let self, gen == self.listenGen else { return }
             switch state {
@@ -188,22 +212,45 @@ final class WifiLink {
         browser = b
     }
 
+    /// A connection that dialed in waits for its HELLO. At most 16 wait, 4 of them from one address: over that, one
+    /// that is still waiting gives way (that address's oldest, else the oldest of the address with the most, else the
+    /// oldest of all), so connections that say nothing can't use up what the app may hold open.
+    private func admit(_ c: NWConnection) {
+        let a = Self.address(c.endpoint)
+        switch LinkLimits.giveWay(waiting.map(\.address), address: a, max: LinkLimits.waiting, perAddress: LinkLimits.waitingPerAddress) {
+        case .room: break
+        case .full: waiting.removeFirst().conn.cancel()
+        case .giveWay(let i): waiting.remove(at: i).conn.cancel()
+        }
+        waiting.append((c, a))
+    }
+
     private func discovered(_ results: Set<NWBrowser.Result>) {
         var now: [String: NWEndpoint] = [:]
-        for r in results {
+        for r in results where now.count < LinkLimits.found { // a device can announce any number of names: only so many are remembered
             if case let .service(name, _, _, _) = r.endpoint, name != nodeId { now[name] = r.endpoint }
         }
         found = now
         dialFound()
     }
 
-    /// Only the smaller node id connects to a discovered phone (spec), once at a time.
+    /// For deciding whether to dial `address` (`Self.address`): `node` counts as linked only through a link whose other
+    /// end is that address. A node id in a HELLO proves nothing (spec/FORMAT.md, "Node ids prove nothing"), so a link
+    /// from elsewhere that only claims a phone's id must not stop this phone from dialing the real one.
+    private func linked(_ node: String, at address: String) -> Bool {
+        links.values.contains { $0.node == node && Self.address($0.conn.endpoint) == address }
+    }
+
+    /// Only the smaller node id connects to a discovered phone (spec), once at a time, and only while it has no link
+    /// to that phone's service: one from elsewhere may only claim its node id. At most 8 are dialed at once, in a new
+    /// order each time, never over the mobile network, and only a phone on the local network gets a HELLO (`onLan`).
     private func dialFound() {
         guard running else { return }
-        for (node, endpoint) in found where nodeId < node && byNode[node] == nil && !dialing.contains(node) {
+        for (node, endpoint) in found.shuffled() where nodeId < node && !linked(node, at: Self.address(endpoint)) && !dialing.contains(node) {
+            guard dialing.count < LinkLimits.dials else { break }
             dialing.insert(node)
-            let c = NWConnection(to: endpoint, using: .tcp)
-            run(c, dialed: true) { [weak self] in self?.dialing.remove(node) }
+            let c = NWConnection(to: endpoint, using: Self.lanOnly)
+            run(c, dialed: true, local: true, ended: { [weak self] in self?.dialing.remove(node) })
         }
     }
 
@@ -214,10 +261,11 @@ final class WifiLink {
         }
     }
 
-    /// While the phone at that address is linked another way (it dialed this phone), it isn't dialed again.
+    /// While the phone at that address is linked another way (it dialed this phone from that address), it isn't dialed
+    /// again. A link from another address that claims its node id doesn't count.
     private func dialManual(_ g: Int, _ host: String, _ port: UInt16) {
         guard g == manualGen, let p = NWEndpoint.Port(rawValue: port) else { return }
-        if let n = manualNode, byNode[n] != nil {
+        if let n = manualNode, linked(n, at: Self.address(.hostPort(host: NWEndpoint.Host(host), port: p))) {
             q.asyncAfter(deadline: .now() + Self.retryDelay) { [weak self] in self?.dialManual(g, host, port) }
             return
         }
@@ -233,15 +281,20 @@ final class WifiLink {
 
     // MARK: - One link
 
-    /// Runs one connection: HELLO both ways, then packets. `dialed`: this phone opened it. `hello` gets the other
-    /// side's node id; `ended` runs once when the connection closes or fails.
-    private func run(_ c: NWConnection, dialed: Bool, failed: (() -> Void)? = nil, hello: ((String) -> Void)? = nil,
+    /// Runs one connection: HELLO both ways, then packets. `dialed`: this phone opened it. `local`: the other end must
+    /// be on the local network (every connection but one to an address the user typed). `hello` gets the other side's
+    /// node id; `ended` runs once when the connection closes or fails.
+    private func run(_ c: NWConnection, dialed: Bool, local: Bool = false, failed: (() -> Void)? = nil, hello: ((String) -> Void)? = nil,
                      ended: (() -> Void)? = nil) {
         var id: String?, linkNode: String?
         var finished = false
+        let gen = stopGen
+        open[ObjectIdentifier(c)] = c
         func finish() {
             guard !finished else { return }
             finished = true
+            open[ObjectIdentifier(c)] = nil
+            waiting.removeAll { $0.conn === c }
             if let id {
                 links.removeValue(forKey: id)
                 if let n = linkNode, byNode[n] == id { // unless a newer link replaced it
@@ -257,19 +310,22 @@ final class WifiLink {
             guard let self else { return }
             switch state {
             case .ready:
+                // Stopped while this connection was being made, or its other end isn't on this network: no HELLO, no link.
+                guard gen == self.stopGen, !local || self.onLan(c) else { c.cancel(); return }
                 self.note = ""
                 c.send(content: Self.frame(Self.hello + Data(self.nodeId.utf8)), completion: .contentProcessed { _ in })
                 self.q.asyncAfter(deadline: .now() + Self.helloWait) { if id == nil && !finished { c.cancel() } } // no HELLO in time
                 self.readHello(c) { node in
-                    guard let node, node != self.nodeId, !finished else { c.cancel(); return }
+                    guard let node, node != self.nodeId, !finished, gen == self.stopGen else { c.cancel(); return }
+                    self.waiting.removeAll { $0.conn === c }
                     hello?(node)
-                    guard self.links.count < Self.maxLinks || self.makeRoom() else { c.cancel(); return }
+                    guard self.makeRoom(for: Self.host(c)) else { c.cancel(); return }
                     let now = Date()
                     var samePhone = true
                     if let old = self.byNode[node], let o = self.links[old] {
                         // Node ids aren't proof of anything: from another address this may be someone pretending, so the
                         // link that's there stays and this one runs beside it (the router sees each packet once).
-                        samePhone = Self.address(o.conn) == Self.address(c)
+                        samePhone = Self.address(o.conn.endpoint) == Self.address(c.endpoint)
                         if samePhone {
                             // spec "Restarts and duplicate links": both phones keep the same link
                             let ageMs = Int64(now.timeIntervalSince(o.since) * 1000)
@@ -283,7 +339,8 @@ final class WifiLink {
                     id = peer; linkNode = node
                     self.links[peer] = (node, c, dialed, now)
                     if samePhone { self.byNode[node] = peer }
-                    self.router.peerUp(peer)
+                    // Every link from one address counts against one allowance in the router, however many node ids it sends.
+                    self.router.peerUp(peer, sender: Self.prefix + "@" + Self.host(c))
                     self.report()
                     self.readFrames(c, peer)
                 }
@@ -295,18 +352,56 @@ final class WifiLink {
         c.start(queue: q)
     }
 
-    private static func address(_ c: NWConnection) -> String {
-        if case .hostPort(let host, _) = c.endpoint { return "\(host)" }
-        return "\(c.endpoint)"
+    /// Where a link's other end is: the host of an address (whatever the port: a phone that dials in comes from another
+    /// one), or the whole endpoint for a phone found by Bonjour, whose address isn't known before it is dialed.
+    private static func address(_ e: NWEndpoint) -> String {
+        if case .hostPort(let host, _) = e { return "\(host)" }
+        return "\(e)"
     }
 
-    /// At the limit: a link at random, among those over a minute old, makes room, so nobody can hold every place by just staying.
-    private func makeRoom() -> Bool {
-        let now = Date()
-        guard let l = links.filter({ now.timeIntervalSince($0.value.since) > 60 }).randomElement() else { return false }
-        links.removeValue(forKey: l.key)
-        router.peerDown(l.key)
-        l.value.conn.cancel()
+    /// Where a connection's other end is, once it is connected: the address it reached (for a phone found by Bonjour
+    /// too), as text.
+    private static func host(_ c: NWConnection) -> String { address(c.currentPath?.remoteEndpoint ?? c.endpoint) }
+
+    private static func bytes(_ e: NWEndpoint?) -> [UInt8]? {
+        guard case .hostPort(let host, _)? = e else { return nil }
+        switch host {
+        case .ipv4(let a): return [UInt8](a.rawValue)
+        case .ipv6(let a): return [UInt8](a.rawValue)
+        default: return nil
+        }
+    }
+
+    /// Whether a connection's other end is on a network this phone is on (spec "Wi-Fi networks": nothing leaves that
+    /// network): a private or link-local address, or one in the same network as this phone's end of the connection
+    /// (`LinkLimits.local`). Not another app on this phone, and not a host out on the internet, whatever a Bonjour
+    /// answer says. An address that can't be read doesn't count.
+    private func onLan(_ c: NWConnection) -> Bool {
+        let path = c.currentPath
+        guard let remote = Self.bytes(path?.remoteEndpoint ?? c.endpoint) else { return false }
+        #if DEBUG
+        // Debug builds also take loopback: the Simulator test (README) comes in that way.
+        if remote == [127, 0, 0, 1] || remote == [UInt8](repeating: 0, count: 15) + [1] { return true }
+        #endif
+        return LinkLimits.local(remote, mine: Self.bytes(path?.localEndpoint))
+    }
+
+    /// A place for one more link from `address`. One address holds at most 8: its own oldest makes room. With every
+    /// place taken, the address that holds the most gives up its oldest. If nobody holds more than one, a link at random
+    /// gives way, at most once in 30 s and whatever its age, so nobody can hold every place: not by just staying, and
+    /// not by making its links anew to keep them young.
+    private func makeRoom(for address: String) -> Bool {
+        let all = links.sorted { $0.value.since < $1.value.since }
+        let gone: String
+        switch LinkLimits.giveWay(all.map { Self.host($0.value.conn) }, address: address, max: Self.maxLinks, perAddress: LinkLimits.perAddress) {
+        case .room: return true
+        case .giveWay(let i): gone = all[i].key
+        case .full:
+            let now = Date()
+            guard now.timeIntervalSince(rotatedAt) * 1000 >= Double(LinkLimits.rotateMs), let l = all.randomElement() else { return false }
+            rotatedAt = now; gone = l.key
+        }
+        if let l = links.removeValue(forKey: gone) { router.peerDown(gone); l.conn.cancel() }
         return true
     }
 

@@ -156,14 +156,14 @@ class NostrTest {
         assertNull(o.answer("r1", Nostr.Ok("ev1", false, "blocked: not in web of trust")))
         assertFalse(o.isSent(p1.id))
         assertEquals(p1.id, o.answer("r2", Nostr.Ok("ev1", true, "")))  // sent once one relay took it
-        assertTrue(o.isSent(p1.id)); assertTrue(o.changed); assertEquals(listOf(p1.id), o.sentList()); assertFalse(o.changed)
+        assertTrue(o.isSent(p1.id)); assertTrue(o.changed); assertEquals(listOf(MeshRouter.key(p1)), o.sentList()); assertFalse(o.changed) // saved as the very packet, not its id alone
         o.offer(p1, mine = true); assertNull(o.next(bridged = true))      // never twice
 
         // #x lookup: a relay copy with other contents doesn't count
         val batch = o.toCheck(50); assertEquals(listOf(pkt(2, 0).id), batch.map { it.id })
         o.fromRelay(Packet(batch[0].id, batch[0].ts, 9, byteArrayOf(99)))
         assertEquals(emptyList<String>(), o.checked(batch))
-        val (p2, own2) = o.next(bridged = true)!!; assertEquals(batch[0].id, p2.id); assertFalse(own2)
+        val (p2, own2) = o.next(bridged = true)!!; assertEquals(batch[0].id, p2.id); assertTrue(own2) // an older own packet goes up with the own ones once looked up
 
         // every relay refused: queued again, at most 3 tries
         o.posted("ev2", p2, own2, setOf("r1"))
@@ -179,7 +179,7 @@ class NostrTest {
         // a relay copy with the same contents (any ttl) means it's there
         val p4 = pkt(4, t - 10 * 60_000); o.offer(p4, mine = false)
         val b2 = o.toCheck(50); o.fromRelay(p4.withTtl(2))
-        assertEquals(listOf(p4.id), o.checked(b2)); assertTrue(o.isSent(p4.id))
+        assertEquals(emptyList<String>(), o.checked(b2)); assertTrue(o.isSent(p4.id)) // sent, but someone else's: nothing to show as "Sent"
         val p5 = pkt(5, t - 1_000); o.fromRelay(p5); o.offer(p5, mine = true); assertNull(o.next(bridged = true)) // came from relays
     }
 

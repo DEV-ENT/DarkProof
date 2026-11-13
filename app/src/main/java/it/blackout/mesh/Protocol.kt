@@ -161,8 +161,34 @@ data class Vouch(val subject: String, val status: CheckIn, val needs: Set<Need> 
             return Vouch(name, status, needs, CheckIn.peopleIn(text), Spot.last(text))
         }
 
-        /** How the People list matches names: case and spacing don't matter ("grandma " is "Grandma"). */
-        fun key(name: String) = words(name).lowercase(Locale.ROOT)
+        /**
+         * How names are matched (the People list, "Are you safe?", checked people; spec "Reports about others"): case and
+         * spacing don't matter ("grandma " is "Grandma"), and neither does anything that draws the same: characters that
+         * draw nothing are left out, and compatibility forms count as the letters they stand for (NFKC). Otherwise a name
+         * with a zero-width space in it would look like a checked person's and not match it.
+         */
+        fun key(name: String): String {
+            val low = nfkc(name).lowercase(Locale.ROOT)
+            val seen = StringBuilder(low.length); var i = 0
+            while (i < low.length) { val c = low.codePointAt(i); i += Character.charCount(c); if (!drawsNothing(c)) seen.appendCodePoint(c) }
+            val s = nfkc(seen.toString()); val sb = StringBuilder(s.length); var space = false; i = 0
+            while (i < s.length) {
+                val c = s.codePointAt(i); i += Character.charCount(c)
+                if (isSpace(c)) space = sb.isNotEmpty() else { if (space) sb.append(' '); space = false; sb.appendCodePoint(c) }
+            }
+            return sb.toString()
+        }
+
+        private fun nfkc(s: String) = if (s.all { it.code < 0x80 }) s else java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFKC)
+
+        /** White space in a name key: Unicode's White_Space, and the blank Braille pattern. */
+        private fun isSpace(c: Int) = c in 0x09..0x0D || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 || c in 0x2000..0x200A ||
+            c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x2800 || c == 0x3000
+
+        /** Left out of a name key: control characters and Unicode's Default_Ignorable_Code_Point (zero-width, direction marks, variation selectors, fillers, tags). */
+        private fun drawsNothing(c: Int) = !isSpace(c) && (c < 0x20 || c in 0x7F..0x9F || c == 0xAD || c == 0x34F || c == 0x61C || c in 0x115F..0x1160 ||
+            c in 0x17B4..0x17B5 || c in 0x180B..0x180F || c in 0x200B..0x200F || c in 0x202A..0x202E || c in 0x2060..0x206F || c == 0x3164 ||
+            c in 0xFE00..0xFE0F || c == 0xFEFF || c == 0xFFA0 || c in 0xFFF0..0xFFFB || c in 0x1BCA0..0x1BCA3 || c in 0x1D173..0x1D17A || c in 0xE0000..0xE0FFF)
 
         /** One line, no "·" (it separates the parts), at most MAX_NAME characters. */
         internal fun cleanName(s: String): String {
@@ -248,31 +274,100 @@ object Photo {
     const val PLACEHOLDER = "📷 Photo"
     fun text(caption: String) = caption.trim().let { if (it.isEmpty()) PLACEHOLDER else "📷 $it" }
     fun caption(text: String) = if (text == PLACEHOLDER) "" else text.removePrefix("📷 ")
+
+    /**
+     * The shape the screens give a received picture: its width over its height, kept between 1:3 and 3:1; what doesn't
+     * fit is cropped, or left empty around it. The sender chooses the picture, and one a pixel wide and very tall asked
+     * for a row higher than a layout can be, which ended the app each time the row was drawn. Same as the iPhone's.
+     */
+    fun shape(width: Int, height: Int): Float = if (width <= 0 || height <= 0) 1f else (width.toFloat() / height).coerceIn(1f / 3, 3f)
 }
 
 /** Delivery receipts: the ids of confirmed messages, separated by spaces, at most 200 per receipt. */
 object Receipt {
     const val MAX_IDS = 200
     fun text(ids: List<String>) = ids.joinToString(" ")
-    fun ids(text: String) = text.split(" ").filter { id -> id.length == 16 && id.all { it in '0'..'9' || it in 'a'..'f' } }
+    /** The message ids a receipt confirms: its first [MAX_IDS]. Whatever follows them is not read. */
+    fun ids(text: String): List<String> =
+        text.splitToSequence(' ').filter { id -> id.length == 16 && id.all { it in '0'..'9' || it in 'a'..'f' } }.take(MAX_IDS).toList()
     fun batches(ids: List<String>) = ids.chunked(MAX_IDS)
 }
 
 /** Someone who confirmed getting a message. */
 data class Reader(val id: String, val name: String, val ts: Long)
 
-/** Who got which message, built from opened receipts. */
+/**
+ * Who got which of this phone's own group messages, built from checked receipts (spec "Delivery receipts").
+ * A receipt counts for a message only if this phone wrote that message ([sent]) in the group whose receipt key opened
+ * the receipt: a member of one saved group can't confirm a message of another, and ids that are no message of this
+ * phone's take no memory.
+ */
 class Deliveries {
+    private val groups = HashMap<String, String>()                  // this phone's own group messages: id -> group id
     private val byMessage = HashMap<String, MutableList<Reader>>()
     /** A copy: receipts keep arriving on other threads while the screen reads it. */
     fun readers(messageId: String): List<Reader> = byMessage[messageId]?.toList().orEmpty()
-    fun add(r: Message) {
+
+    /** This phone wrote [messageId] in the group whose id is [group]. */
+    fun sent(group: String, messageId: String) { groups.putIfAbsent(messageId, group) }
+
+    /**
+     * A checked receipt opened with a receipt key of the group whose id is [group]. A reader counts once per message,
+     * with the time and name of their earliest receipt for it.
+     */
+    fun add(group: String, r: Message) {
         for (id in Receipt.ids(r.text)) {
+            if (groups[id] != group) continue
             val list = byMessage.getOrPut(id) { mutableListOf() }
             val i = list.indexOfFirst { it.id == r.sender }
-            if (i >= 0) list[i] = Reader(r.sender, r.name, min(list[i].ts, r.ts)) else list += Reader(r.sender, r.name, r.ts)
+            if (i < 0) list += Reader(r.sender, r.name, r.ts) else if (r.ts < list[i].ts) list[i] = Reader(r.sender, r.name, r.ts) else continue
             list.sortBy { it.ts }
         }
+    }
+
+    /** The messages [ids] left the store. */
+    fun forget(ids: Collection<String>) { for (id in ids) { groups.remove(id); byMessage.remove(id) } }
+}
+
+/**
+ * Blocked people (spec "Blocking"). A block is saved as "<channel>|<sender id>": the channel is [EVERYONE] for the
+ * Public channel and the group's id for a group, because a member id means a person only inside its channel. On the
+ * Public channel anyone can write under any id until that id's key is known, so the sender of an unchecked message
+ * can't be blocked at all (that message can be hidden): else a stranger could get a group member hidden by posting
+ * under their id.
+ */
+object Blocks {
+    const val EVERYONE = "everyone"
+    fun key(channel: String, sender: String) = "$channel|$sender"
+
+    /** Whether the sender of [m] can be blocked: someone else's message whose signature checked. [me]: this phone's mark for its own. */
+    fun canBlock(m: Message, me: String) = m.verified && m.sender != me
+
+    /**
+     * True if [blocked] hides what [sender] writes in [channel] (null: a group whose id isn't known). An entry without a
+     * channel was saved before blocks had one: it still hides that id everywhere, as it did when the user made it.
+     */
+    fun hides(blocked: Set<String>, channel: String?, sender: String): Boolean =
+        sender in blocked || (channel != null && key(channel, sender) in blocked)
+}
+
+/** People whose emoji the user compared (spec "Person emoji"), saved as "<group id>|<member id>|<name key>". */
+object Checked {
+    fun entry(group: String, id: String, name: String) = "$group|$id|${Vouch.key(name)}"
+
+    /** The name key of a saved entry of [group], made again: entries saved by older versions have the older key. */
+    private fun nameOf(entry: String, group: String) = Vouch.key(entry.removePrefix("$group|").substringAfter('|'))
+
+    /** True if [name] belongs to a checked person of [group] but [id] is another key: a reinstall, or someone using their name. */
+    fun newKey(checked: Collection<String>, group: String, id: String, name: String): Boolean {
+        val key = Vouch.key(name)
+        return checked.any { it.startsWith("$group|") && !it.startsWith("$group|$id|") && nameOf(it, group) == key }
+    }
+
+    /** [checked] once the user has compared [id]'s emoji in [group]: this key is [name]'s from now on (an older one for the name goes). */
+    fun marked(checked: Collection<String>, group: String, id: String, name: String): Set<String> {
+        val key = Vouch.key(name)
+        return checked.filterNot { it.startsWith("$group|") && (it.startsWith("$group|$id|") || nameOf(it, group) == key) }.toSet() + entry(group, id, name)
     }
 }
 
@@ -332,14 +427,71 @@ data class Person(
 }
 
 /**
- * What the on-device AI sees, sized for its 4,096-token window (about 4 characters per token): the group summary, then
- * the newest turns that fit, starting with a question. That leaves room for the instructions, the question and a
- * 1,024-token answer.
+ * What the on-device AI sees, sized for its 4,096-token window: the app's instructions (about 350 tokens), the group
+ * summary, then the newest turns that fit, starting with a question, the question and a 1,024-token answer.
+ * The summary is other people's words, and they choose what it costs: a token is never less than one byte of UTF-8,
+ * and digits, signs and rare letters cost a token a byte. So it is measured in bytes, the most it can cost, and the
+ * earlier conversation (the user's own, about 4 characters per token) gets what is left. Same sizes as the iPhone's.
  */
 object AiContext {
     const val MAX_HISTORY_CHARS = 4_000
-    const val MAX_SITUATION_CHARS = 4_000
+    /** The whole summary (situation in Screens.kt). */
+    const val MAX_SITUATION_BYTES = 2_000
+    /** "Catch me up": the group's messages of the last hours, which go with half a summary. */
+    const val MAX_CATCH_UP_BYTES = 1_500
     const val MAX_TURNS = 12
+    /** Tokens the window leaves beside the app's instructions and the answer. */
+    const val ROOM_TOKENS = 4_096 - 350 - 1_024
+
+    /** Characters of earlier conversation that fit beside [bytes] bytes of summary and question. */
+    fun historyChars(bytes: Int): Int = (4L * (ROOM_TOKENS - bytes)).coerceIn(0L, MAX_HISTORY_CHARS.toLong()).toInt()
+
+    /**
+     * Text from other people, for the assistant: one line, at most [max] UTF-16 units, whole characters only, and it
+     * can't close the <data> block around it.
+     */
+    fun field(s: String, max: Int = 40): String {
+        val sb = StringBuilder(); var space = false
+        for (c in s) if (c.isWhitespace()) space = sb.isNotEmpty() else {
+            if (space) sb.append(' ')
+            space = false; sb.append(when (c) { '<' -> '‹'; '>' -> '›'; else -> c })
+        }
+        return Cut.units(sb.toString(), max)
+    }
+
+    private fun utf8(codePoint: Int) = when { codePoint < 0x80 -> 1; codePoint < 0x800 -> 2; codePoint < 0x10000 -> 3; else -> 4 }
+
+    /** The start of [s] that fits [maxBytes] bytes of UTF-8, whole characters only. */
+    fun head(s: String, maxBytes: Int): String {
+        var n = 0; var i = 0
+        while (i < s.length) {
+            val cp = s.codePointAt(i); n += utf8(cp)
+            if (n > maxBytes) break
+            i += Character.charCount(cp)
+        }
+        return s.substring(0, i)
+    }
+
+    /** The end of [s] that fits [maxBytes] bytes of UTF-8, whole characters only. */
+    fun tail(s: String, maxBytes: Int): String {
+        var n = 0; var i = s.length
+        while (i > 0) {
+            val cp = s.codePointBefore(i); n += utf8(cp)
+            if (n > maxBytes) break
+            i -= Character.charCount(cp)
+        }
+        return s.substring(i)
+    }
+
+    /**
+     * A person's check-in as the summary says it. A report about someone names who reported it and never reads
+     * "checked in" (see [Person]): the assistant must not take it for the person's own word. [ago] words a time.
+     */
+    fun status(p: Person, ago: (Long) -> String): String {
+        val c = p.checkIn ?: return "has not checked in"
+        val how = p.reportedBy?.let { "reported by ${field(it)}" } ?: "checked in"
+        return "${if (c == CheckIn.SAFE) "safe" else "NEEDS HELP"} ($how ${ago(p.checkInTs)})"
+    }
 
     fun <T> fit(turns: List<T>, text: (T) -> String, isQuestion: (T) -> Boolean,
                 maxChars: Int = MAX_HISTORY_CHARS, maxTurns: Int = MAX_TURNS): List<T> {
@@ -436,7 +588,19 @@ object Invite {
     fun pin(pub: ByteArray): String = java.security.MessageDigest.getInstance("SHA-256").digest(pub).take(16).joinToString("") { "%02x".format(it) }
 
     /** Whether a phone joining with [pins] may take a new key made by [maker]. With no pins (a typed code) there is nothing to check against. */
-    fun allows(pins: String, maker: ByteArray) = pins.isEmpty() || pin(maker) in pins.chunked(PIN_CHARS)
+    fun allows(pins: String, maker: ByteArray) = pins.isEmpty() || names(pins, maker)
+
+    /** Whether [pins] name [maker]. No pins name nobody: a removal that shuts a joining phone out has to come from someone named. */
+    fun names(pins: String, maker: ByteArray) = pin(maker) in pins.chunked(PIN_CHARS)
+
+    /**
+     * The admins kept for each code once the user has chosen to join [code] with an invite that names [pins] ("" for a
+     * typed code or a link that names nobody). They are fixed at that moment: for a code among [groups], the ones this
+     * phone has saved, nothing changes, so a link read later can neither replace nor push out the admins a pending join
+     * trusts. What was kept for a code that is no longer saved goes.
+     */
+    fun joinPins(saved: Map<String, String>, groups: Collection<String>, code: String, pins: String): Map<String, String> =
+        if (code in groups) saved else saved.filterKeys { it in groups } + (if (pins.isEmpty()) emptyMap() else mapOf(code to pins))
 
     /**
      * The group code someone typed or pasted, cleaned up: the code of an invite link; a generated code typed in lower

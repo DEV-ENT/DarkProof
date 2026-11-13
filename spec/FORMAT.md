@@ -74,7 +74,11 @@ have the same person in them, or match a person to a phone they see over Bluetoo
 - **Member id:** the first 8 bytes of SHA-256(public key) as 16 lowercase hex chars. It goes in the `sender` field
   of the member's messages, receipts and introductions in that group.
 - Posts from the Wi-Fi board (Android) carry `web-` and the host phone's Public member id, and are signed with the
-  host phone's Public member key: readers know they came through that phone, not who typed them.
+  host phone's Public member key: readers know they came through that phone, not who typed them. For forwarding they
+  are other people's packets, not the host phone's own: on the relays they wait their turn with the packets it passes
+  on, and together they count as one link's share of the packets it keeps for passing on (see "A full queue"). The
+  board takes at most 10 posts a minute in all, fewer than the 13 packets a minute a phone passes on to the relays,
+  and at most 4 of them from one visitor's address, so one visitor can't use up everyone's.
 - Vectors: `kind: member` (public key → member id and emoji).
 
 ## Signatures
@@ -87,13 +91,32 @@ group, inside the encryption, so nobody else in the group can write under anothe
 - **Signed message:** the ASCII bytes of `darkproof-sig-v1`, then the **context** (32 bytes), the packet id (8 bytes),
   `ts` (8 bytes, big-endian) and the body. Context = HMAC-SHA256(the key the packet is sealed with, the ASCII bytes of
   `darkproof-sig-context-v1`). A signed body can't be moved to another group, kind of packet, id or time.
+  A packet sealed with a message key signs a different message, with the epoch's outer key for the context (see
+  "Message keys").
 - **Checking:** the reader takes the public key of the `sender` member id (`web-` removed) from that group's
   introductions or the keys it saved, then:
   - the signature checks → the message is that member's;
   - it doesn't → the packet is dropped like one it can't open: stored and passed on, never shown;
   - no public key known yet → shown with "not verified yet", and checked again when the introduction arrives.
+- **The sender field:** a message or receipt whose `sender` is not a member id (16 lowercase hex chars), or `web-` and
+  one, is dropped like a packet the reader can't open: no key could ever be known for it. Each app marks the user's own
+  messages with an id of its own that is never sent; a received `sender` equal to that id is dropped the same way,
+  whatever its shape. Only the phone's own member id is shown as its own, and that packet's signature is then checked
+  with the phone's own key. So nothing received can pass for written on this phone.
+- **Waiting for a key:** what a phone keeps to check later, for a message shown as "not verified yet" or for a receipt:
+  - It belongs to one packet, not to an id. Several packets can carry one id (see "The same message again"). When
+    an introduction arrives, a waiting check marks or removes a message only if it was kept for the very packet that
+    message is shown from; a packet that got no row in the chat doesn't wait at all. Packets are told apart
+    by their id together with SHA-256 of the signed digest and the signature.
+  - `web-` in front of the sender doesn't count: a Wi-Fi board post waits for its host phone's introduction.
+  - Each group and the Public channel have room of their own, 1,000 packets each. When a channel's room is full its
+    oldest goes, and what waited for a message goes when that message leaves the phone. Public channel packets, which
+    anyone can write under ids that are never introduced, therefore can't keep a group's messages from being checked.
+  - A message that no longer waits stays "not verified yet" until the phone next reads its store (when the app
+    starts, at the latest), which checks every stored packet again.
 - Phones save the public keys they learn, per group (at most 500 per group, the most recently seen), so messages stay
-  checked after the introductions expire.
+  checked after the introductions expire. Of people who aren't in the group they keep at most 20 (see "Joining"). An
+  introduction that brings nothing new, such as one read again from the store, is not saved again.
 - Size: a signature adds 64 bytes. Over MeshCore (163 bytes) a check-in still fits with a short name and no position.
 
 ## Introductions
@@ -103,7 +126,8 @@ A member's public key travels in an introduction, an ordinary packet in the grou
 `darkproof-intro-v1`, 32-byte output. Apps that can't open it relay it like any other packet.
 
 - Sealed with the door's introduction key, whatever the epoch.
-- Body: `sender` = the member id, `name` = the display name, `text` = empty, 4th field = the byte `0x03`, the 33-byte
+- Body: `sender` = the member id, `name` = the display name (empty on the Public channel: nothing reads it there, and
+  a post carries its sender's name itself), `text` = empty, 4th field = the byte `0x03`, the 33-byte
   compressed signing key, the 65-byte uncompressed encryption key and the 1184-byte ML-KEM-768 key (see "Sealing for one
   member"). The Public channel uses the byte `0x02` and leaves out the ML-KEM key; in a group that is refused. Signed like
   every packet, with the signing key.
@@ -112,9 +136,12 @@ A member's public key travels in an introduction, an ordinary packet in the grou
 - A member's encryption keys are replaced only by an introduction with a later `ts`, so an old one played back can't
   bring back a key they have deleted.
 - An introduction from someone who isn't in the current epoch is that phone's request to join (see "Joining").
-- A phone sends its introduction to a group (and to the Public channel) when it first uses it, then whenever its last
+- A phone sends its introduction to a group when it first uses it, then whenever its last
   one there is more than 3 days old: at app start and before it writes. So a member's introduction is always among
-  the packets of the last 7 days that new phones receive.
+  the packets of the last 7 days that new phones receive. To the Public channel it sends one, under the same 3-day
+  rule, only before its user writes there (or someone posts through its Wi-Fi board), and at app start only while its
+  newest post there is less than 7 days old, so readers can still check that post. A phone whose user never posts on
+  the Public channel never announces itself there.
 - Vectors: `kind: signed` (a signed message and its introduction, with fixed IVs and a fixed signature). The
   `signed-intro` vector checks sealing and signing; its 4th field is the older 34-byte shape, without the encryption key.
 
@@ -152,11 +179,30 @@ secret** that changes. spec/DESIGN-v0.6-groups.md has the reasoning; this sectio
   mailbox, signature context, headers), and each sender's message keys (see "Message keys").
 - **Reading and writing:** a phone reads with every epoch it holds and writes with the current epoch. A phone with no epoch
   can't write; what it tries to send waits until it is let in.
+- **Only members write in an epoch:** a message or receipt sealed with an epoch's keys is read only if its `sender` (a
+  `web-` in front doesn't count) is in the member list that came with that epoch. For a message sealed with a message
+  key this is the rule "Whose number"; for one sealed with the outer key, and for a receipt, the phone looks the
+  sender up in the list. Every member holds the outer key, and so does someone removed since: without this, a packet
+  under an id nobody was let in with, or under a key someone only introduced through the door, would be shown (as
+  "not verified yet", or as checked) with any name. An epoch kept only to read with (see "Accepting a new key")
+  decides nothing with its list but still reads by it, and that list is whatever its maker wrote. So the sender also
+  has to be in the member list of an epoch the phone holds that isn't kept only to read with. Anything else is dropped
+  like a packet whose signature doesn't check: stored and passed on, never shown.
 - **Current epoch:** the highest number. For the same number: a removal beats anything else; then the removal whose
-  maker comes first in the admin list of the epoch before; then the smallest SHA-256 of the secret.
-- **Keeping:** a phone holds at most 64 epochs, dropping the lowest first. An epoch is deleted 7 days after a newer one replaced it. The current one stays, however old. Stored
+  maker comes first in the admin list of the epoch before; then a key made by an admin of the epoch before, ahead of
+  one made by a member who isn't (a member picks their key's secret, and so its hash); then the smallest SHA-256 of
+  the secret. Two keys with the same secret, number and standing: the smallest maker id, then the smallest new code.
+  "The epoch before" is as in "Accepting a new key"; a phone still joining goes by the admin list of the key that
+  lets it in.
+- **One secret, several keys:** an epoch is its secret together with its number, its maker and, for a removal, the new
+  code and the person removed. A new key that carries a secret the phone already holds under another of these is a
+  separate epoch, judged by the same rules as any other; only the same key read again is ignored. Whoever was given a
+  secret can send it on in a key of their own, so the first key to bring a secret must not keep out the others.
+- **Keeping:** a phone holds at most 64 epochs. Over that, one kept only to read with (see "Accepting a new key") goes first, the last of them in the order of "Current epoch"; if there is none, the lowest epoch. Of those kept only to read with, a phone holds at most 4 from one maker, dropping the last of that maker's in the same order: a member can make as many as the hourly limits allow, and they must not push out the epochs before the current one. An epoch is deleted 7 days after a newer one replaced it, and with it every epoch of the same number that lost to it. The current one stays, however old. Stored
   packets that nothing can open any more and that are older than 7 days are deleted too, so a group's messages last one
-  to two weeks on a phone.
+  to two weeks on a phone. A newer epoch replaced it at that epoch's date or when this phone got it, whichever is
+  later: the date is whatever its maker wrote, and one long past must not delete the epoch before it at once. A phone
+  that was away therefore keeps an epoch up to 7 days after it came back.
 - **Door id:** HMAC-SHA256(door key, the ASCII bytes of `darkproof-group-id-v1`), first 16 bytes. A phone keeps the id
   of the first code it had for its member keys and saved public keys, even after the group's code changes.
 
@@ -179,7 +225,13 @@ empty, 4th field:
 
 - **Several packets:** a new key goes in 1, 3 or 10 packets for at most 10, 30 or 100 members, parts spread evenly, each
   packet with its own id and the whole member list. A phone needs only the packet with its part and ignores the others.
-- A part for someone not in the member list is refused.
+  With k packets, packet i (from 0) holds the parts of the members at places i, i + k, i + 2k, … of the member list, in
+  that order.
+- A packet whose parts aren't exactly those of one such packet is refused by every phone: a part for someone not in the
+  member list, a part missing, or parts out of order. Up to 10 members that means a part for each of them, so a maker
+  can't list someone and give them none.
+- A packet that lists more than 100 admins or more than 100 members, or carries more than 10 parts, isn't read at all:
+  the lists are read before the signature can be checked, and anyone with the code can seal such a packet.
 - A box holds the 32-byte epoch secret, followed in a removal by the group's new code in UTF-8, which has to be in the
   generated form (see "Typed codes"). Any other shape is refused.
 - HPKE `info` = the ASCII bytes of `darkproof-rekey-v1` ‖ the id of the door it travels through (16 bytes). `aad` =
@@ -195,34 +247,89 @@ epoch if there is none:
   than 10 minutes ahead, or more than 100 members.
 - **A phone with no epoch** accepts the first one that includes it. If the invite it joined with names admins, the
   maker has to be one of them; if not, the first key it sees has to be trusted (see "Invites"). A removal that doesn't
-  include it means its code no longer works, under the same condition.
+  include it means its code no longer works, if the invite names admins and the removal's maker is one of them: from
+  then on the phone accepts no new key through that code, and it remembers this when it restarts. Otherwise the person
+  removed, whom an invite made earlier still names, could let it into a group of their own. With a typed code, or a
+  link that names nobody, such a removal is ignored: anyone who has the code can sign one, and it must not be able to
+  shut the phone out of the group it is joining.
+- **Someone a removal took out** decides nothing afterwards and adds nothing, if that removal won its number. A new
+  key of theirs that isn't a removal is refused, whatever its number and whichever door it comes through. The epoch
+  before the removal lists them for another week, and a key numbered below the removal, through the old door, would
+  otherwise be kept to read with: its secret and date are theirs to choose, so it could outlive the removal, and then
+  nothing on the phone says that its maker was removed. A removal of theirs is refused when it is numbered one above
+  that removal, and also, through the current door, when it is numbered below it: they may have learnt the new code.
+  Numbered below it through the old door, seniority decides (see "Through an old door"). The cost: a key they made
+  before they were removed, which reaches a phone only after the removal, isn't taken there, so that phone can't read
+  what others wrote with it.
 - **Only admins of the epoch before** may let someone in, leave a member out or make a removal. Anyone else's new key has
   exactly the same members as the epoch before, and its maker has to be one of them. A removal needs the epoch before it to
   be held. A removal may not include the person it removes.
+- **Several epochs before:** when a phone holds rivals with that number, the first of them (see "Current epoch") gives the
+  members, and an admin of any of them counts as an admin, with their best place as their seniority. A rival that lost
+  doesn't count once a removal that won its number, the same or a higher one, took its maker out: through an old door
+  that person can still send one.
 - **The admin list** changes only if an admin of the epoch before made the new key. Otherwise it stays as it was,
   whatever the packet says.
 - **At most one per member per hour**, compared by the dates of the keys held, and at most 4 per member in the last hour
   as they arrive on this phone, since a key's date is whatever its maker wrote. Neither applies to admins.
 - **Numbered below the current epoch:** kept only to read with, and only from someone who is a member of an epoch this
   phone holds. Unless it is a removal, its member list isn't kept; unless an admin made it, its admins are those of the
-  epoch before. Such an epoch decides nothing: "the epoch before" a later key is one with a member list, else the current
-  epoch.
+  epoch before. Such an epoch decides nothing, neither who is an admin nor how senior they are: "the epoch before" a later
+  key is one with a member list, else the current epoch. It isn't taken at all once it is past its week (see
+  "Keeping"): a newer epoch replaced it more than 7 days ago, counted like there with its date.
 - **Through an old door** (a code the group has moved on from): only a removal with the same number as the removal this
-  phone followed out of that door, or a new key numbered below that removal.
+  phone followed out of that door, or a new key numbered below that removal. A removal numbered below it is accepted
+  only if its maker comes before the maker of every removal the phone holds with a higher number, in the admin list
+  of the epoch before it. It then wins like a rival that beat the removal followed (see "Removals and the code").
+  Otherwise an admin who is being removed could send a key and then a removal of their own one number higher, and
+  phones that got those first would never take the removal. Without the seniority, someone removed could pick a lower
+  number and undo their own removal.
+- **A part that doesn't open:** a new key that isn't a removal, through the current door, that lists this phone and
+  passes the rules above, but whose part for this phone doesn't open or isn't 32 bytes, when the others may be writing
+  with it: it is numbered above the current epoch, or the same and wouldn't lose to it whatever the hashes. The other
+  phones can't see that. This phone waits a random 0–3 s and then, like a phone that was away (see "The weekly key, and
+  coming back"), makes a new key of its own and shows that it is rejoining; an hour later it makes one more, because
+  the first can have the same number as the key it couldn't open and lose to it. It makes neither once a key that
+  settles it has arrived: a higher-numbered one, or one of the same number that beats the unopened key whatever the
+  hashes. If it made a key in the last hour it waits for its hourly check.
+- **Trying a part:** opening a part is a key agreement in the phone's secure hardware. Once 4 parts from one maker
+  haven't opened in the last hour, by the phone's clock, it tries no more of that maker's for that hour and treats
+  them as parts that don't open. A phone with no epoch can't tell who is in the group: it stops at 16 from all makers
+  together.
 - Phones read their stored packets again after each new epoch, so a new key refused because an earlier one hadn't
-  arrived is accepted when it does.
+  arrived is accepted when it does. A part is opened once: a phone remembers the parts it has opened (the last 512,
+  each named by SHA-256 of the part and of the key's maker, number, date and kind) and keeps that list across
+  restarts, saved after the epochs. So a stored new key read again costs no key agreement, and never brings back an
+  epoch the phone has deleted.
 
 ### Removals and the code
 
-- A removal carries the group's new code in each box. It travels through the door the group had until then.
-- A phone follows a removal's code if it's the newest removal, or a late one that beat the removal it had followed.
+- A removal carries the group's new code in each box. It travels through the door the group had until then. A phone
+  ignores a removal whose new code is the code of another group it has saved: followed, it would put this group in
+  that group's place on the phone.
+- A phone follows a removal's code if it's the newest removal, or a late one that beat the removal it had followed:
+  a rival with the same number, or a more senior admin's removal with a lower number (see "Through an old door").
   Epochs numbered above it are then dropped. Door id, member keys and saved messages stay; the invite changes.
 - Old doors are kept as long as the epoch that came through them, for rival removals only. Introductions and messages
   through an old door are ignored.
+- A code the group has moved on from isn't a second group. On a phone that has the group saved under its new code,
+  joining with the old code (an old invite) or writing to it leads to that group, and the old code isn't saved: only
+  one set of keys reads and writes a group's epochs.
 - The removed phone stops writing to the group and introducing itself. It can be told by mistake by a removal that
-  loses; a more senior removal that includes it undoes that.
-- Messages and receipts from a removed member dated after the winning removal aren't shown.
-- **Two admins at once:** each removal numbered the same counts unless its maker was removed by a more senior one.
+  loses; a more senior removal that includes it undoes that: one with the same number, or one with a lower number
+  whose maker comes before the maker of the removal that removed it, in the admin list of the epoch before the lower
+  one. A phone named by a removal that wins this way from a lower number is removed.
+- **What the person removed wrote:** once a phone holds the winning removal, it shows nothing from that member that
+  it sees for the first time, whatever date the packet carries. The date is the sender's to write, and the person
+  removed still has the keys of the epochs before, which phones read with for another week: dated a minute before
+  the removal, anything written in that week would otherwise be shown, confirmed and alerted like a member's. What
+  the phone had accepted before stays, unless it is dated after the removal: that is a message it reads from its own
+  copy (see "Message keys"), or a message or receipt that was waiting for its sender's public key. So after a
+  restart, of that member, a phone shows the messages it has a copy of; their receipts, and messages sealed with the
+  outer key, have no copy and no longer count. The cost: a message they really wrote before the removal, which reaches
+  a phone only after the removal did, isn't shown there. A phone can't tell it from one written afterwards.
+- **Two admins at once:** each removal numbered the same counts unless its maker was removed by a more senior one, or
+  it lost and its maker is no longer an admin of the current epoch (a phone can't tell when a late one was made).
   People a counted removal took out who are still in the current epoch are removed by the next admin's phone that
   sees it, after a random 0–3 s unless another did. An admin's next new key also keeps admins added by a rival that
   didn't win.
@@ -234,18 +341,28 @@ epoch if there is none:
   the request, with that person's emoji. It isn't answered automatically: an admin chooses to let them in, which makes a
   new key that includes them, up to 100 members, or turns them down, which is remembered. While no admin is in reach,
   nobody can join.
+- Anyone with the code can introduce as many made-up keys as they like. A phone therefore keeps the keys of at most 20
+  people who aren't in the group and are asking: introduced in the last 7 days, not in the current epoch, not turned
+  down on this phone. A key it doesn't know yet from someone who is in no member list it holds is not kept while those
+  20 places are taken; a request that is waiting is never pushed out by a later one. An admin's phone shows at most
+  those 20 and alerts at most once a minute per group.
 - Creating a group makes epoch 1 at once, with the creator as its only member and admin. Groups saved before v0.6 count
   as created on each phone.
 
 ### The weekly key, and coming back
 
 - A phone makes a new key with the same members when the current epoch is 7 days old plus a random delay of up to 6
-  hours, checked at start and hourly.
+  hours, checked at start and hourly. The 7 days count from the epoch's date or from when this phone got it, whichever
+  is later, so a key dated in the past isn't due at once.
 - Past the 6 hours it does so at once, and shows that it is rejoining until a new key or a message from someone else
-  arrives.
+  arrives. While it is, a removal it can't follow tells it that the group has a new code only if it came through the
+  door the phone has for the group and its maker is an admin of the phone's current epoch whom no removal has taken
+  out: anyone who has the code can sign a removal.
 - A member who sees a new key made after its current epoch but numbered below it, from a member, through the current
   door, knows that phone is behind. It waits a random 0–3 s and, unless another did and it hasn't made a key in the last
-  hour, makes a new key for everyone.
+  hour, makes a new key for everyone. A key dated more than 10 minutes ahead doesn't count, and one member's keys
+  count once an hour by the phone's clock. "Another did" means the phone's current epoch is no longer the one it had
+  when the key came, whatever that key's date: the date is its maker's to write.
 
 ## Message keys
 
@@ -258,12 +375,28 @@ Each group message has its own key, which a phone deletes once the message has b
 - **Packet:** `cipher` = IV (12) ‖ header (3, masked) ‖ AES-256-GCM ciphertext ‖ tag. The header is the sender's position in
   the epoch's member list (1 byte) and the message number (2 bytes), XORed with the first 3 bytes of HMAC-SHA256(outer key,
   the ASCII bytes of `darkproof-header-v1` ‖ IV). Associated data: `<id hex>|<ts decimal>` followed by the unmasked header.
-  Plaintext and signature as in "Encryption".
+  Plaintext as in "Encryption".
+- **Signed message:** the ASCII bytes of `darkproof-sig-mk-v1`, then the context of the epoch's outer key (32 bytes, see
+  "Signatures"), the packet id (8 bytes), `ts` (8 bytes, big-endian), the unmasked header (3 bytes: position, then number)
+  and the body. Every member of an epoch can derive every member's message keys, and the associated data proves only
+  that. With the position and number signed, a member can't take a message someone signed and seal it again under that
+  person's unused numbers: the copy opens, but its signature no longer checks, so no key is deleted. The tag differs
+  from `darkproof-sig-v1` so that a signature can't be moved between a packet sealed with a message key and one sealed
+  with the outer key either.
 - **Whose number:** a packet opens only if the position in its header is the sender's own place in the member list (a `web-`
   in front of the id doesn't count), so a member can't seal a packet under someone else's number and sign it as themselves.
+- **Without a message key:** a sender whose numbers have run out seals with the outer key, as in "Encryption". Such a
+  packet is read only from a member of that epoch (see "Only members write in an epoch").
 - **Deleting:** a leaf is deleted once the signature has checked, never before, so a member who forges a packet under someone
   else's number can't destroy that number's key. Deleting replaces the node above it with its other branches, so nothing kept
   can derive a deleted leaf. A sender deletes the leaf as soon as it has sealed the message.
+- **The same message again:** a phone alerts and sends a receipt only for a message it wasn't showing yet. Messages
+  are told apart by their packet id together with the first 8 bytes of the signed digest, without the signature: the
+  same signed message sealed again, or carrying the other signature that checks for it, is the same message. A packet
+  under an id that is taken (see "The same packet") that brings a message already shown, or that names this phone as
+  its sender, is not kept and changes nothing on screen. Any other is a message of its own: it is kept and shown, and
+  a receipt names it by its packet id. So whoever sends a message of their own first under someone's id doesn't keep
+  the real one off the screen. This holds on the Public channel too.
 - **This phone's copy:** the app can no longer re-read a message from its packet, so it keeps a copy sealed with a key that stays
   on the phone. The copy goes when the packet goes or when the epoch is deleted, so history lasts as long as before.
 - **What this protects:** someone who records traffic and later takes a phone's keys can't open a message that phone has already
@@ -271,7 +404,7 @@ Each group message has its own key, which a phone deletes once the message has b
   still be opened with those keys. As in Signal's groups, a thief who keeps the keys can follow later messages of that
   epoch until the next new key.
 - Receipts, introductions and new keys don't use message keys. The Public channel doesn't either.
-- Vectors: `kind: message-key`.
+- Vectors: `kind: message-key` (`signed_message` is the signed message above for that packet).
 
 ## Person emoji
 
@@ -284,7 +417,9 @@ really that person's.
 - When the emoji match, the user marks the person **checked**: the phone saves that public key for the person.
 - **New key:** when someone writes under the same name as a checked person (the name key of "Reports about others")
   but with another member id, apps warn that this is a new key: either the person reinstalled DarkProof or reset
-  their phone, or someone else is using their name.
+  their phone, or someone else is using their name. A name that differs from a checked one only in characters that
+  draw nothing, or in a compatibility form of its letters, has the same key and warns too. A checked person saved
+  with an older form of the key is matched by making that key again.
 
 ## Link ids
 
@@ -320,6 +455,9 @@ darkproof://join?name=<group name>&code=<group code>&admins=<pins>
   knows, the first 16 bytes of SHA-256 of their 33-byte public key, in lower-case hex, run together. A phone that joined with
   such a link ignores new keys from anyone else while it has no epoch, so someone who knows the code can't pose as the group.
   Once it has an epoch the usual rules apply. An `admins` item that isn't in this form counts as none.
+- The admins are those of the invite the user chose to join with, kept when the phone first saves that code. Reading a
+  link keeps nothing, and a link for a code the phone already has changes nothing, so a link opened later can't replace
+  or push out the admins a pending join trusts.
 - A typed code, or a link without `admins`, can't name anyone: that phone trusts the first new key that includes it.
 - An admin appointed after the invite was made isn't named in it. A phone joining with that invite waits until a named
   admin lets it in or makes a new key.
@@ -408,6 +546,10 @@ sharing.
 A person's status is their most recent check-in, and so is their battery level. Their position is the one in their
 most recent check-in that carried a position.
 
+Check-ins, reports about others and "Are you safe?" requests are group messages. On the Public channel, where anyone
+can post, both apps show a text of one of these forms as plain text: no check-in card, no entry in the People list,
+no alert and no one-tap answers.
+
 ### Needs and head count
 
 A "needs help" check-in may say what is needed, and a check-in of either kind how many people it speaks for:
@@ -446,9 +588,20 @@ Anyone can check in for someone who has no phone or no signal, for example a gra
 - The reporter is the message's sender. The text does not repeat it.
 - A report does not start with `✅` or `🆘`, so no app, old or new, takes it for the sender's own check-in. Older apps show
   it as text.
-- **People list:** reports are kept by name: the name with runs of white space made one space, trimmed and in lower
-  case. The latest report for a name wins (its status, needs and count); its position stays until a newer report has
-  one. Reports sent by this phone count too. Apps show such an entry as that person's status "reported by" the sender,
+- **Name key:** how apps match names (the People list, "Are you safe?", checked people). Names that draw the same
+  have the same key:
+  1. the name in NFKC, then in lower case;
+  2. without the code points that draw nothing: the control characters U+0000–001F and U+007F–009F that aren't white
+     space, and Unicode's Default_Ignorable_Code_Point (zero-width characters, direction marks, variation selectors,
+     fillers, tags): U+00AD, U+034F, U+061C, U+115F–1160, U+17B4–17B5, U+180B–180F, U+200B–200F, U+202A–202E,
+     U+2060–206F, U+3164, U+FE00–FE0F, U+FEFF, U+FFA0, U+FFF0–FFFB, U+1BCA0–1BCA3, U+1D173–1D17A, U+E0000–E0FFF;
+  3. in NFKC again (an accent left next to its letter joins it);
+  4. with runs of white space made one space, and none at either end. White space is U+0009–000D, U+0020, U+0085,
+     U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F, U+3000 and the blank Braille pattern U+2800.
+
+  Look-alike letters of another script are not made equal. Vectors: `kind: name-key`.
+- **People list:** reports are kept by name key. The latest report for a name wins (its status, needs and count); its
+  position stays until a newer report has one. Reports sent by this phone count too. Apps show such an entry as that person's status "reported by" the sender,
   never as the person's own check-in. When a group member whose current name has the same key has their own check-in
   at least as new as the latest report, the report is not shown.
 - Vectors: `kind: vouch`.
@@ -538,6 +691,13 @@ When a phone gets a new group message from someone else, it confirms it with a r
     `738e7a99ea6284081ccd3d830969a9cb6ad62fd6161f1adedf4d34f13677e479`.
 - Plaintext: a signature (see "Signatures"), then `sender` = the reader's member id in the group, `name` = the reader's display name, `text` = the ids of the
   confirmed messages (16 lowercase hex chars each), separated by single spaces, at most 200 per receipt.
+- A receipt counts only if its `sender` is in the member list of the epoch whose receipt key opened it (see "Only
+  members write in an epoch"), and not from someone removed (see "What the person removed wrote").
+- A receipt confirms a message only if this phone wrote that message in the group whose receipt key opened the
+  receipt. A member of one saved group can't confirm a message sent to another, and ids that are no message of this
+  phone's are not kept.
+- A reader counts the first 200 ids of a receipt and reads nothing after them.
+- A reader counts once per message, with the time and name of their earliest receipt for it.
 - Phones confirm only group messages: not Public channel messages, and not their own. Each message is confirmed
   at most once, when it first arrives. A receipt goes out 2 s after the last message to confirm arrived, or 10 s after
   the first, whichever comes first, plus a random 0–20 s, so a burst of messages (a phone catching up) shares one receipt per group.
@@ -548,32 +708,65 @@ When a phone gets a new group message from someone else, it confirms it with a r
 ## Forwarding rules
 
 - **Flooding:** each packet goes to every connected peer except the one it came from.
-- **Deduplication:** a packet whose id has already been seen is ignored.
+- **Deduplication:** a packet already seen (see "The same packet" below) is not shown or stored again. It is forwarded
+  again only if it comes with more hops left than the copy the phone holds (next rule).
 - **TTL:** forwarded copies carry `ttl - 1`, and only if the received ttl is greater than 1. New messages start at ttl 16.
   A received packet with ttl above 16 (decoding accepts up to 64) is stored and forwarded as if it had ttl 16.
+  The ttl is not authenticated, so the first copy to arrive doesn't decide how far a packet goes: when a packet the
+  phone still holds for passing on arrives again with a higher ttl, the phone keeps the higher ttl, in its store too,
+  and forwards the packet again to every connected peer except the one that copy came from. A copy with the same or a
+  lower ttl is ignored. The ttl must rise each time, so one packet is forwarded again at most 15 times.
 - **Time:** a packet whose `ts` is more than 7 days old, or more than 10 minutes ahead of the receiver's clock, is
   dropped: not stored, shown or forwarded (it is not marked as seen, so it can come again later). Packets saved on the
   phone that are more than 10 minutes in the future are removed when the app reads its store.
-- **Passing on:** up to 500 packets, the newest of the last 7 days. All of them are sent to every newly connected peer.
+- **Passing on:** up to 500 packets, the newest of the last 7 days. All of them are sent to every newly connected
+  peer, except the packets that peer brought itself: it has them, and what came from the relays must not go back up
+  (see "Publish"). A packet another peer has since brought with a higher ttl does go to it.
 - **Storage on the phone:** every packet seen is saved, so messages are still there after a restart. The store is
   trimmed when the app starts, and whenever it grows 10% past its cap: packets older than 7 days that no saved group
-  can read, Public messages beyond the newest 2,000, and then, while the store holds more than 40 MB (encoded packet
-  sizes) or 20,000 packets: first packets no saved group can read, oldest first, then the oldest Public messages, and
-  only then the oldest messages and receipts of the saved groups.
+  can read or that are door packets (next rule), Public packets beyond 2,000 (while one sender holds more than 500 of
+  them, that sender's oldest go first, otherwise the oldest of all; the senders whose signature the phone can't check
+  count together as one sender, and so do all introductions; the phone's own go last), and then, while the store
+  holds more than 40 MB (encoded packet sizes) or 20,000 packets: first packets no saved group can read, oldest first,
+  then door packets, then the oldest Public messages, and only then the oldest messages and receipts of the saved
+  groups.
+- **Door packets:** an introduction or a new key that came through a saved group's door is that group's own, kept like
+  its messages, only if this phone wrote it or it is signed by someone in the group: in the member list of an epoch
+  the phone holds that isn't kept only to read with, and not taken out by a removal that won. The door opens with the
+  code alone, so any other is a door packet. Door packets have a room of their own inside the cap, 4 MB and 1,000
+  packets for all saved groups together: beyond it their oldest go, at each trim, and the store is also trimmed when
+  they reach twice that room. They never push out a message.
 - **Sent:** a phone remembers (up to 2,000) which of its own messages it has handed to another phone, a radio or a
   relay, so "Sent" survives a restart.
 
-- **The same packet** means the same id and the same content (the first 8 bytes of SHA-256 of `cipher`). Packets with one
-  id and different content are different packets, however many there are, so junk sent first under an id can't stop the
-  real packet; the limits on links are what bound them. In the store, a packet a phone can read replaces one it can't
-  under the same id.
-- **A full queue:** while one link holds more than a quarter of what is stored, its own oldest packets go first.
+- **The same packet** means the same id, the same `ts` and the same content (the first 8 bytes of SHA-256 of `ts`, 8
+  bytes big-endian, followed by `cipher`). The encryption is bound to `ts`, so a copy with another `ts` can't be opened:
+  it is a different packet, like one with other content. The ttl is not part of it. Packets with one id and a different
+  `ts` or content are different packets, however many there are, so junk sent first under an id can't stop the real
+  packet; the limits on links are what bound them. In the store, the first packet kept under an id goes by that id,
+  and any other packet with that id is kept too, under its id and content together (the key above): none replaces
+  another, so junk sent first under an id doesn't keep the real packet out of the store either. The queue in front of
+  a LoRa radio tells packets apart the same way: the same packet goes over the radio once, whatever its ttl, and junk
+  under its id doesn't keep it off. So do the queues for the relays, and what a phone remembers as posted there (see
+  "Publish"): junk under an id neither takes the real packet's place nor counts as it.
+- **A full queue:** while one sender holds more than a quarter of what is stored, its own oldest packets go first. A
+  sender is whoever is at the other end of a link: the IP address on a Wi-Fi network and the device on Bluetooth LE
+  (its Bluetooth address; on the iPhone, the identifier iOS gives it), so all links from one address share one
+  quarter, at once or one after another; on the other transports, the link. The packets a phone held before a
+  restart count together as one sender's, except those a relay brought. Otherwise, while the packets the phone
+  didn't write itself hold more than half of what is stored, the oldest of those goes first: no number of links
+  pushes out the phone's own packets.
 - **Limits on links:** a packet with fewer than 98 bytes of `cipher` is junk and is dropped. A phone takes at most 3,000 new
-  packets a minute from one link (relays have their own limit, see "Limits on relays").
+  packets a minute from one sender (see "A full queue"; relays have their own limit, see "Limits on relays"): closing a
+  link and opening another doesn't start a new minute. A copy that is forwarded again because of its higher ttl counts
+  as one of them.
 - **Keys tried:** a phone tries a packet only with the keys whose mailbox is the first 2 bytes of its id.
 - **Node ids prove nothing:** a link claiming the id of a phone already linked doesn't replace that link, unless it comes
-  from the same address (Wi-Fi) or was made at the same moment (Bluetooth). At the link limit, a link at random among
-  those over a minute old gives way, so that nobody can hold every place.
+  from the same address (Wi-Fi) or was made at the same moment (Bluetooth). Nor does the first link under an id keep
+  the phone itself out: a later link from another address (Wi-Fi), or one the other side dialed over another
+  connection (Bluetooth), runs beside it. At the link limit, a link at random gives way, whatever its age and at most
+  once in 30 s, so that nobody can hold every place, neither by staying nor by making its links anew; on Wi-Fi, the
+  address that holds the most links gives up its oldest first.
 
 ## Transports
 
@@ -618,46 +811,89 @@ of any packet, so a phone can bridge packets it cannot open. Packets from older 
 - **Content:** the packet (0xB3 encoding) in standard base64.
 - **Date:** `created_at` is the current time rounded down to a multiple of 1024 seconds (about 17 minutes).
 - **One set of links per group:** each saved group has its own connection to each relay, its own key and its own
-  subscriptions, and so does the Public channel. A group's links start up to 8 s apart at random. A packet goes up on
-  the links of the group it belongs to; a packet this phone only passes on goes up with the Public channel's. Without Tor,
-  relays still see the same internet address on all of them. With Tor, the default, each group has its own circuits.
+  subscriptions, and so does the Public channel. A group's links start up to 8 s apart at random. A packet this phone
+  wrote (a message, receipt, introduction or new key) goes up on the links of its group; every packet it only passes
+  on goes up with the Public channel's, whatever mailbox its id names. A sender chooses the id, so the mailbox of
+  someone else's packet must never pick the links and key: a neighbour could send junk under a mailbox and see, from
+  the key it comes back under, whether the phone holds that mailbox. Nothing a phone sends on one group's links may
+  let a relay match them to its other links. Without Tor, relays still see the same internet address on all of them.
+  With Tor, the default, each group has its own circuits.
 - **Key:** a new random secp256k1 key every time the app starts, for each group, so relays can't link sessions or groups
   by key. The signature (BIP-340) only satisfies the relays: who wrote a message is inside the encrypted packet.
-- **Mailboxes of a link:** its group's door and epoch mailboxes, or the Public channel's (`9576`).
+- **Mailboxes of a link:** its group's door and epoch mailboxes, or the Public channel's (`9576`). A link takes only
+  packets of these mailboxes, and packets its own `#x` lookup named while that lookup is open (see "Publish"). Any
+  other packet a relay sends on it is dropped: a relay chooses what it sends, and a packet planted on one group's link
+  must not be passed on, or named on another link.
+- **Subscription ids:** the id of a live subscription is `live` and 8 random bytes in hex, that of a lookup `have` and
+  8 random bytes in hex, new each time and for each group's links; catch-up ids count up on each link (`cu1`, `cu2`,
+  …). No id is made from a clock or anything else the links of one phone share.
 - **Subscribe:** on each relay link, one live subscription for all of them,
   `["REQ", <id>, {"kinds": [3871], "#t": ["dp1-<mailbox>", …, "dp1-9576"], "since": now - 604800, "limit": 1}]`
   (`since` a week back so events from phones with a slow clock still match; stored events come from the catch-up).
+  When a group's mailboxes change, only that group's links close the subscription and open a new one; the other
+  groups' links send nothing, so the change doesn't show on all of a phone's links at the same moment.
 - **Catch-up:** then, one mailbox at a time (groups first), `["REQ", <id>, {"kinds": [3871], "#t": ["dp1-<mailbox>"],
-  "since": S, "limit": 500}]`, closed after its `EOSE`. When it returns 500 events, an older page follows with
+  "since": S, "limit": 500}]`, closed after its `EOSE`. When it returns 500 events, whatever they carry (an event
+  with no packet in it counts too: anyone can post one under a mailbox's tag), an older page follows with
   `"until"` = the oldest `created_at` received (that value minus 1 if it equals the previous `until`), up to 4 pages
   for a group mailbox and 1 for `9576`. S = the time this phone last caught up that mailbox on that relay minus 25
   minutes (events are dated up to 17 minutes back, and clocks differ), but at most 7 days back. That time, saved on the phone per relay and mailbox, becomes the
   time a catch-up that ended with `EOSE` was started, and then follows the `created_at` of live events (never past
   the phone's clock). A catch-up refused with `CLOSED`, or without `EOSE` within 20 s, moves on and is tried on the
-  next link.
+  next link. If the last page of a group mailbox was still full, the mailbox was not read to the end. The phone then
+  also saves what it left out: the events from S to the `until` an older page would have had. On each later link, once
+  the new events are fetched, it asks for that with `"since"` and `"until"` (never more than 7 days back), with the
+  pages that link has left, until a page comes back with fewer than 500 events. For `9576` nothing is saved: its
+  newest page is all a phone reads.
 - **Publish:** at most one event every 1.5 s, newest packet first, to every connected relay that isn't resting.
-  Packets written on this phone (messages and its receipts, known by their ids) in the last 40 minutes go first, after a random 0–8 s. All
+  Packets written on this phone (messages and its receipts: the very packets it wrote, see "The same packet", never
+  another packet sent under one of their ids) in the last 40 minutes go first, after a random 0–8 s. All
   others (bridging, and older own packets, which may have gone up before the app was killed) wait a random 0–30 s, so
   phones that got the same packet at the same moment don't all find it missing, and are then looked up with
   `["REQ", <id>, {"kinds": [3871], "#x": [<up to 50 packet ids>], "limit": <count>}]`; a packet counts as there only if
-  a relay returns an event whose packet has the same `ts` and cipher (the ttl may differ). The others are posted, at
-  most one every 4.5 s. A packet older than 7 days is never posted (checked again right before posting). Packets that
-  came from relays never go back up. Delivery receipts are sent too.
+  a relay returns an event whose packet has the same `ts` and cipher (the ttl may differ), and only if that event is
+  one the packet's recipients get: it has the `t` tag of the packet's own mailbox, no `expiration` earlier than its
+  `created_at` + 604800, and a `created_at` no more than 25 minutes before the packet's `ts` (in seconds). Anyone can
+  post a copy in an event that no subscription returns: for a packet the phone wrote or got from another peer, such
+  a copy counts for nothing, whichever way it arrives, and the phone posts the packet. The others are posted, at
+  most one every 4.5 s. A phone's own older packets are looked up before anything it passes on and, if no relay has
+  them, go up with its own packets. For the rest, the links that brought them take turns, in the lookups and in
+  posting, each link's newest packet first: one link's packets, whatever `ts` they carry, can't take every turn. A packet older than 7 days is never posted (checked again right before posting). A packet
+  whose first copy a relay brought never goes back up, whatever event it came in, unless another peer later brings it
+  with a higher ttl. This holds after a restart too: a phone remembers which of its packets came from a relay first
+  (see "The same packet"), the 1,000 with the newest `ts`, and the 500 it passes on again are its newest, so none of
+  those is forgotten. Delivery receipts are sent too.
 - **Sent:** a packet counts as on the relays (and, for an own message, as "Sent") only when a relay answers
   `["OK", <event id>, true, …]` (or `false` with a reason starting `duplicate`), or the lookup found it. If every relay
   it went to refuses it, or none accepts it within 30 s, it is queued again, up to 3 tries; after that it waits until
   the relays link again. Each phone remembers up to 3,000 packets it saw accepted.
-- **Queues:** at most 500 own packets, 5,000 to look up and 2,000 to post; when a queue is full, a newer packet
-  replaces the oldest one.
+- **Queues:** at most 500 own packets, 5,000 to look up and 2,000 to post, and at most 8 MiB (encoded packet sizes)
+  in each of the last two; when a queue is full, a newer packet
+  replaces the oldest one, except that a packet the phone wrote never gives way to one it only passes on, and that
+  while the packets one link brought are more than a quarter of a queue, that link's oldest goes first (as in "A full
+  queue"). Two packets with one id are two entries.
 - **Throttling:** a relay that refuses an event with a reason starting `rate` (`rate-limited:`, `rate limited`),
   `blocked` or `banned` gets no more events from this phone for 10 minutes (it keeps the subscription). With every
   relay resting, packets wait in the queue.
 - **Limits on relays:** a relay must answer the WebSocket upgrade with 101 straight away (no 1xx before it). One message
-  is at most 1 MiB, and its JSON at most 16 levels deep; a link that sends more is cut or the message ignored. Each relay gets at most 6,000 messages a minute (`OK`, `EOSE` and `CLOSED` aside), across its
+  is at most 1 MiB, and its JSON at most 16 levels deep; a link that sends more is cut or the message ignored. Android
+  uses no WebSocket extension, so no message is compressed: an extension a relay names in its answer is not taken up,
+  and a frame with a reserved bit set (RSV1 marks a compressed message, whose size says nothing about what it inflates
+  to) ends the link. A group's links hold one link to each relay: a second one is never opened beside it, and nothing
+  that arrives on a link the phone no longer holds is taken. Each relay gets at most 6,000 messages a minute (`OK`,
+  `EOSE` and `CLOSED` aside), across its
   links. Once a link goes over, the phone's saved catch-up time for that relay stops moving, so what was dropped is fetched on the next
-  link. Relays can't be trusted with any of this: event ids and signatures aren't checked, because nothing relies on them.
+  link. An event whose `id` or `pubkey` is not 64 lowercase hex characters is ignored. Relays can't be trusted with
+  any of this: when events arrive, their ids and signatures aren't checked, because packets don't rely on them. Only a
+  report does (next).
 - **Reports:** a reported Public message is hidden on the phone, and a NIP-56 report (kind 1984, tags
-  `["e", <event id>, "other"]` and `["p", <author>]`) goes to the relays.
+  `["e", <event id>, "other"]` and `["p", <author>]`) goes to the relays. It names an event that carried the very
+  packet the phone shows (see "The same packet") and that its author signed, never what a relay's frame merely claims.
+  For packets of mailbox `9576`, a phone remembers the events whose `id` is the SHA-256 of their own fields (NIP-01)
+  and whose `sig` is 128 lowercase hex characters: for each packet, the first such event from each relay, for up to
+  2,000 packets. An event that carries another packet under the same packet id is kept apart and never stands in.
+  When the report is made, the first remembered event whose signature checks (BIP-340) is named; until there is one,
+  the report waits.
 
 ### Tor
 
@@ -674,6 +910,9 @@ so relays can't tell from the exit address that two groups share a phone.
 - **Check:** before linking to any relay, the app fetches `https://check.torproject.org/api/ip` through Tor and goes
   on only if the answer has `"IsTor": true`; otherwise it asks again (every 15 s on Android, 5 s on the iPhone, while
   Tor starts). It asks again whenever all relays are lost.
+- **Switching:** turning the relays off, or Tor on or off, ends every relay link made under the old setting, and none
+  is made under it afterwards, whatever the app was doing at that moment (a resubscribe after a key change, a
+  reconnect).
 - Tested 2026-11-06 and 2026-11-09: no connection from either app to a relay or to the check went around Tor.
 - **Relays through Tor:** `wss://relay.damus.io`, `wss://relay.primal.net`, `wss://nostr.oxtr.dev`,
   `wss://relay.ditto.pub`, `wss://relay.nostr.net`, `wss://nostr.data.haus`. nos.lol and nostr.mom don't answer Tor
@@ -693,6 +932,18 @@ pin its SHA-256) and the same rules:
 - It matches a list entry exactly, or starts with an entry that ends in `*`. Only whole words match, so "Scunthorpe"
   and "puttanesca" stay as written.
 
+### Blocking
+
+Each app lets its user block a sender and hide a message. Both stay on the phone; nothing is sent.
+
+- A block is kept for one channel: the Public channel, or one group (by its group id, which stays when the group's
+  code changes). It hides that sender id's messages, places, check-ins and alerts in that channel only. A member id
+  means a person only inside its channel, and on the Public channel anyone can write under any id whose key the phone
+  doesn't have yet.
+- Only the sender of a message whose signature checked can be blocked. A message shown as "not verified yet" can be
+  hidden, but not its sender: otherwise someone could get a group member hidden by posting under that member's id.
+- A block saved before blocks had a channel still hides that sender id everywhere.
+
 ## Wi-Fi networks
 
 Phones on the same Wi-Fi network connect over TCP: a router with no internet, a phone hotspot, a community network or a
@@ -702,6 +953,12 @@ long-range rooftop link. Nothing leaves that network.
   port the device listens on (7777 when it is free). The iPhone lists `_darkproof._tcp` in `NSBonjourServices`.
 - **Who connects:** for a discovered device, only the device with the smaller node id connects (comparing bytes), and it
   tries again every 10 s while there is no link. An address the user typed is always connected, and redialed every 5 s.
+- **Only the local network:** a discovered device is linked only at an address on the local network: private or
+  link-local (10/8, 172.16/12, 192.168/16, 169.254/16, fe80::/10, fc00::/7) or in the same subnet as the phone's
+  own address, never loopback (debug builds take it, for tests on a computer), whatever address the DNS-SD answer
+  names. A phone takes incoming connections only from such addresses.
+  The iPhone's listener and its links to discovered devices never use the mobile network. An address the user typed
+  is dialed wherever it is. At most 8 discovered devices are dialed at once, and at most 256 are remembered.
 - **Frames:** a 4-byte big-endian length (1–16,064), then the frame. The first frame in each direction is HELLO: the
   ASCII bytes `DPW1`, then the node id in UTF-8 (1–64 bytes). Every later frame is one packet. A link whose first frame
   is not a HELLO, or whose HELLO carries the receiver's own node id, is closed.
@@ -712,9 +969,16 @@ long-range rooftop link. Nothing leaves that network.
     either side knowing).
 
   Each link is its own peer for forwarding, so all stored packets go to the new link. A phone doesn't redial a typed
-  address while the phone that answered there is linked another way.
-- **Limits:** at most 32 links. A frame longer than the limit closes the link, and so does a missing HELLO 10 s after
-  connecting.
+  address while the phone that answered there is linked another way from that address. Node ids prove nothing: a link
+  from another address that carries the same node id doesn't count, neither here nor for the 10 s retry of a
+  discovered device (on the iPhone, where a discovered device's address isn't known before it is dialed: only a link
+  this phone dialed to that device counts).
+- **Limits:** at most 32 links, 8 of them from one address (one more takes the place of that address's oldest). At
+  most 16 incoming connections wait for their HELLO, 4 of them from one address; one more takes the place of one
+  that is still waiting. A frame longer than the limit closes the link, and so does a missing HELLO 10 s after
+  connecting. A phone that stops reading is cut when 12 MiB wait for it; when 32 MiB wait for all links together, the
+  links with the most waiting are cut, not the one the next packet is for. Turning Wi-Fi networks off closes every
+  link and every connection still being set up.
 - **iPhone:** the listener and the Bonjour browser start again after any failure (after 2 s, doubling up to 30 s),
   and when the app comes back to the foreground.
 
@@ -735,7 +999,9 @@ little-endian. Source: github.com/meshcore-dev/MeshCore, `examples/companion_rad
 - **Receiving:** the radio pushes `83` when something is queued; the phone sends `0A` until the reply is `0A`. Channel
   data arrives as `1B <snr> 00 00 <idx> <path_len> <type:u16> <len> <packet>`; only `type` `0xFF44` on the DarkProof
   slot is read. Other frames are skipped.
-- **Pacing:** as for Meshtastic: only packets from the last 30 minutes, one every 20 s, no delivery receipts.
+- **Pacing:** as for Meshtastic: only packets from the last 30 minutes, one every 20 s, no delivery receipts. At most
+  20 packets wait. The packets a phone wrote itself go first, and one it only passes on never takes the place of one
+  of them: when the queue is full, the oldest packet passed on makes room.
 
 ## Bluetooth LE
 
@@ -809,15 +1075,25 @@ Two devices may connect to each other twice, once in each direction. When a devi
 
 Both sides reach the same decision. Either side may close the other link.
 
+This is for two links made at the same moment (less than 10 s apart). After that, the link that is there stays: a
+device closes a later link that it dialed itself, or that reached it over the same radio connection. A later link
+that the other side dialed over another connection is not closed for its node id: it runs beside the first, since it
+may be the real phone and the first one someone who only says its id. If both lead to one phone, that phone closes
+the link it dialed.
+
 ### Limits
 
 - At most 6 links per device. At the limit, a new link takes the place of the oldest link whose other side hasn't sent
-  HELLO after 5 s, if there is one; otherwise it is refused.
+  HELLO after 5 s, if there is one; otherwise of a link at random, at most once in 30 s (see "Node ids prove
+  nothing"), and else it is refused.
 - A link whose other side sends no HELLO within 10 s of the link opening (central: notifications enabled; peripheral:
   the central subscribed) is closed, and so is a central link still being set up 30 s after dialing. An iPhone cannot
   disconnect a central: it stops serving it, and the link no longer counts toward the limit.
-- Each link's send queue holds at most 1 MiB and 1,000 frames. Beyond that, the oldest PACKET frames not yet started
-  are dropped (the neighbour gets stored packets again on its next link); HELLO frames are never dropped.
+- Each link's send queue holds at most 1 MiB and 1,000 frames. The stored packets go to a new link oldest first and
+  only as far as the queue has room (983,040 bytes and 500 packets); the rest, and every later packet in its turn,
+  follow as frames leave the queue, so a store larger than the queue is passed on whole. Should the queue still run
+  over, the oldest PACKET frames not yet started are dropped (the neighbour gets stored packets again on its next
+  link); HELLO frames are never dropped.
 
 ## History
 
@@ -836,6 +1112,11 @@ Both sides reach the same decision. Either side may close the other link.
   Later the same day: ML-KEM required (iOS 26 or later), joining needs an admin, Tor on by default with a circuit per group,
   blurred times, and a key per message. Then: a packet's position has to be its sender's own, and invites name the admins
   who can let a phone in.
+- `0xB3`, 2026-11-13: a message sealed with a message key signs its position and number too, under the tag
+  `darkproof-sig-mk-v1`. Phones on an earlier build and on this one drop each other's group messages (they open, the
+  signature doesn't check); receipts, introductions, new keys and the Public channel are unchanged. Also new rules,
+  with the same bytes: only members write in an epoch, nothing new is shown from someone removed, and someone removed
+  adds no keys.
 
 ## Apple peer-to-peer (iPhone to iPhone)
 

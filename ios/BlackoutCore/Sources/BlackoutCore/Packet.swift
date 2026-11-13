@@ -71,7 +71,12 @@ public struct Packet: Equatable, Sendable {
 }
 
 enum Hex {
-    static func encode(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined() }
+    private static let digits = Array("0123456789abcdef".utf8)
+    static func encode(_ d: Data) -> String {
+        var out = [UInt8](); out.reserveCapacity(d.count * 2)
+        for b in d { out.append(digits[Int(b >> 4)]); out.append(digits[Int(b & 15)]) }
+        return String(decoding: out, as: UTF8.self)
+    }
     static func decode(_ s: String) -> Data {
         var d = Data(); var i = s.startIndex
         while let j = s.index(i, offsetBy: 2, limitedBy: s.endIndex), i < s.endIndex {

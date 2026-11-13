@@ -17,6 +17,15 @@ final class SharedVectorsTests: XCTestCase {
         v["lat"].map { Spot(lat: Double($0)!, lon: Double(v["lon"]!)!, accuracy: v["accuracy"].map { Int($0)! }) }
     }
 
+    /// Names that draw the same have one key, on both phones (spec "Reports about others").
+    func testNameKeys() {
+        XCTAssertEqual(of("name-key").count, 16)
+        for v in of("name-key") {
+            let name = String(decoding: Hex.decode(v["name_hex"]!), as: UTF8.self)
+            XCTAssertEqual(Hex.encode(Data(Vouch.key(name).utf8)), v["key_hex"], v["name_hex"]!)
+        }
+    }
+
     func testVectorCounts() {
         XCTAssertEqual(of("code-normalize").count, 13)
         XCTAssertEqual(of("invite").count, 2)

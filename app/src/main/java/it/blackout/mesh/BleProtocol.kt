@@ -45,6 +45,28 @@ object BleProtocol {
         return a.size - b.size
     }
 
+    /** Two links made less than this apart were made at the same moment: the two phones dialed each other. */
+    const val SAME_TIME_MS = 10_000L
+    /** What this phone does about a link whose node id another of its links already carries. */
+    enum class Twin { BOTH_STAY, CLOSE_NEW, CLOSE_OLD }
+    /**
+     * A second link with a node id this phone already has a link with (spec "Duplicate links"). Two phones that
+     * dialed each other at the same moment keep the link the smaller node id dialed. Otherwise the link that is there
+     * stays. What happens to the new one depends on who made it: a link this phone dialed is closed, the phone is
+     * linked already. A link the other side dialed stays beside the first one, unless it comes from the same device:
+     * node ids prove nothing, so it may be the real phone, and the link that was there first the one that only says
+     * its id. If the two do lead to one phone, that phone closes the link it dialed.
+     * [newCentral], [oldCentral]: this phone dialed that link. [apartMs]: the time between the making of the two.
+     * [sameDevice]: both have the same Bluetooth address (one radio connection, used in both directions).
+     */
+    fun twin(myId: String, remoteId: String, newCentral: Boolean, oldCentral: Boolean, apartMs: Long, sameDevice: Boolean): Twin = when {
+        newCentral != oldCentral && apartMs < SAME_TIME_MS -> // dialed each other at the same moment
+            if (newCentral == keepMyCentralLink(myId, remoteId)) Twin.CLOSE_OLD else Twin.CLOSE_NEW
+        newCentral -> if (apartMs < SAME_TIME_MS) Twin.CLOSE_OLD else Twin.CLOSE_NEW // dialed twice in a moment: the newer; else it is linked already
+        sameDevice -> Twin.CLOSE_NEW
+        else -> Twin.BOTH_STAY
+    }
+
     /** A link whose other side sends no HELLO this long after the link opened is closed (spec "Limits"). */
     const val HELLO_WAIT_MS = 10_000L
     /** A central link still being set up this long after dialing is closed. */
@@ -72,13 +94,15 @@ object BleProtocol {
     /**
      * Frames waiting to go out on one link, cut into chunks as they are sent. Over [maxBytes] or [maxFrames], the
      * oldest PACKET frames not yet started are dropped (the neighbour gets stored packets again on its next link);
-     * HELLO frames are never dropped.
+     * HELLO frames are never dropped. The router fills the queue only as far as it has room ([ROOM_BYTES],
+     * [freed]), so in normal use nothing is dropped here.
      */
     class Outbox(private val maxBytes: Int = MAX_QUEUE_BYTES, private val maxFrames: Int = MAX_QUEUE_FRAMES) {
         private val frames = ArrayDeque<Pair<ByteArray, Boolean>>() // frame, is HELLO
         private var pos = 0          // bytes of the first frame already sent
         private var peeked = 0       // length of the chunk handed out by peek()
         var bytes = 0; private set
+        private var freedBytes = 0; private var freedPackets = 0 // PACKET frames that left the queue since freed()
         val isEmpty get() = frames.isEmpty()
         val count get() = frames.size
 
@@ -87,9 +111,15 @@ object BleProtocol {
             while (bytes > maxBytes || frames.size > maxFrames) {
                 // the first frame may be half sent: never cut a frame in the middle of the stream
                 val i = ((if (pos > 0 || peeked > 0) 1 else 0) until frames.size).firstOrNull { !frames[it].second } ?: break
-                bytes -= frames.removeAt(i).first.size
+                val gone = frames.removeAt(i).first.size
+                bytes -= gone; freedBytes += gone - HEAD; freedPackets++
             }
         }
+        /**
+         * The room that opened since the last call, for [MeshRouter.room]: the bytes of the packets (without the frame
+         * header) that went out whole or were dropped, and how many they were.
+         */
+        fun freed(): Pair<Int, Int> = (freedBytes to freedPackets).also { freedBytes = 0; freedPackets = 0 }
         /** The next chunk of at most [size] bytes, without taking it: call [commit] once it went out. */
         fun peek(size: Int): ByteArray? {
             val f = frames.firstOrNull()?.first ?: return null
@@ -100,12 +130,16 @@ object BleProtocol {
         fun commit() {
             val f = frames.firstOrNull()?.first ?: return
             pos += peeked; peeked = 0
-            if (pos >= f.size) { frames.removeFirst(); bytes -= f.size; pos = 0 }
+            if (pos >= f.size) { val hello = frames.removeFirst().second; bytes -= f.size; pos = 0; if (!hello) { freedBytes += f.size - HEAD; freedPackets++ } }
         }
-        fun clear() { frames.clear(); bytes = 0; pos = 0; peeked = 0 }
+        fun clear() { frames.clear(); bytes = 0; pos = 0; peeked = 0; freedBytes = 0; freedPackets = 0 }
     }
     const val MAX_QUEUE_BYTES = 1 shl 20  // 1 MiB: about a minute of Bluetooth LE
     const val MAX_QUEUE_FRAMES = 1_000
+    private const val HEAD = 3            // a frame's type and length
+    /** What a link tells the router its queue takes ([MeshRouter.peerUp]): under the queue's own limits, so HELLOs fit too. */
+    const val ROOM_BYTES = MAX_QUEUE_BYTES - (1 shl 16)
+    const val ROOM_PACKETS = MAX_QUEUE_FRAMES / 2
 
     /** Rebuilds frames from chunks. Throws IllegalArgumentException on a malformed stream: the caller disconnects. */
     class Reader {

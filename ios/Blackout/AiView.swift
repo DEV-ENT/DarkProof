@@ -106,16 +106,17 @@ struct AiView: View {
         var situation = Situation.text(engine: engine, groupName: groupName, me: LocationService.shared.location?.spot)
         var after: String?
         if question == Self.catchUp {
-            // The group's messages of the last 6 hours (not Everyone), within what the model can read at once (about
-            // 4 characters per token). Shown as the short question; the messages go with what the app knows.
+            // The group's messages of the last 6 hours (not Everyone), within what the model can read at once whatever
+            // they are written in (AiContext). Shown as the short question; the messages go with half of what the app knows.
             let since = Int64(Date().timeIntervalSince1970 * 1000) - 6 * 3_600_000
             let recent = groupMessages.filter { $0.ts >= since }.suffix(40)
             guard !recent.isEmpty else { Nav.shared.toast("Nothing from \(groupName) in the last 6 hours"); return }
             let h = recent.map { "\(ChatTime.stamp($0.ts)) \($0.sender == engine.deviceId ? "The user" : $0.name.aiSafe()): \($0.text.aiSafe(300))" }
                 .joined(separator: "\n")
             after = "Say who is safe, who is asking for help and what is missing. Do not make anything up."
-            situation += "\nAll group messages of the last 6 hours, oldest first:\n"
-                + String(h.suffix(Int(ai.selected.context) * 2))
+            situation = AiContext.head(situation, bytes: AiContext.maxSituationBytes / 2)
+                + "\nAll group messages of the last 6 hours, oldest first:\n"
+                + AiContext.tail(h, bytes: AiContext.maxCatchUpBytes)
         }
         ai.send(question, situation: situation, after: after)
     }

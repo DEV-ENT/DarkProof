@@ -96,10 +96,13 @@ class HybridTest {
     }
 
     @Test fun theMemberListIsSeparateFromTheParts() {
-        val r = Rekey(6, now, ByteArray(33), listOf(anna), null, listOf(ben to ByteArray(4)), members = listOf(anna, ben))
+        val members = (1..11).map { "%016x".format(it) }; val share = Rekey.split(members)[1]           // a key for 11 goes in 3 packets
+        val r = Rekey(6, now, ByteArray(33), listOf(members[0]), null, share.map { it to ByteArray(4) }, members = members)
         val back = Rekey.decode(r.encode())!!
-        assertEquals(listOf(anna, ben), back.members); assertEquals(listOf(ben), back.parts.map { it.first })
+        assertEquals(members, back.members); assertEquals(share, back.parts.map { it.first })
         assertEquals(Rekey.TYPE, r.encode()[0])
+        // Up to 10 members it is one packet with a part for each: listing someone and giving them none is refused.
+        assertNull(Rekey.decode(Rekey(6, now, ByteArray(33), listOf(anna), null, listOf(ben to ByteArray(4)), members = listOf(anna, ben)).encode()))
     }
 
     @Test fun aPartForSomeoneNotInTheListIsRefused() {

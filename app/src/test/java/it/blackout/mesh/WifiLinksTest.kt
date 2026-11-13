@@ -105,6 +105,44 @@ class WifiLinksTest {
         assertEquals(0, a.wifi.linkCount())
     }
 
+    /**
+     * A device at another address on the network sends a HELLO with node-x's id and then stays idle. When the real link
+     * to node-x dropped, that link stood in for node-x, and node-a never dialed the address its user had typed again
+     * (audit of 2026-11). The other address is 127.0.0.2 where the computer has it, else the IPv6 loopback.
+     */
+    @Test fun aLinkThatOnlyClaimsAPhonesIdDoesNotStopThisPhoneFromDialingIt() {
+        val a = node("group-code", "node-a"); val x = node("group-code", "node-x")
+        val pa = a.wifi.listen(0); val px = x.wifi.listen(0)
+        a.wifi.connectManually("127.0.0.1", px)
+        waitFor("real link") { a.wifi.linkCount() == 1 && x.wifi.linkCount() == 1 }
+        assertTrue(a.wifi.linkedAt("node-x", "127.0.0.1"))
+
+        val claim = listOf("127.0.0.2" to "127.0.0.1", "::1" to "::1").firstNotNullOfOrNull { (from, to) ->
+            val s = Socket()
+            try { s.bind(java.net.InetSocketAddress(java.net.InetAddress.getByName(from), 0)); s.connect(java.net.InetSocketAddress(to, pa), 5_000); s }
+            catch (_: java.io.IOException) { s.close(); null }
+        }
+        org.junit.Assume.assumeTrue("this computer has no second loopback address", claim != null)
+        claim!!.use { s ->
+            val inp = DataInputStream(s.getInputStream()); val out = DataOutputStream(s.getOutputStream())
+            inp.readFully(ByteArray(inp.readInt()))                   // node-a's HELLO
+            val hello = "DPW1node-x".toByteArray()
+            out.writeInt(hello.size); out.write(hello); out.flush()   // "I am node-x", then nothing more
+            waitFor("the claiming link is taken, beside the real one") { a.wifi.linkCount() == 2 }
+
+            x.wifi.stop()                                             // the real link drops...
+            waitFor("real link gone") { a.wifi.linkCount() == 1 && x.wifi.linkCount() == 0 && x.wifi.port == 0 }
+            assertEquals(setOf("node-x"), a.wifi.nodes())            // the claim is all that is left under that id
+            assertFalse(a.wifi.linkedAt("node-x", "127.0.0.1"))      // and it doesn't count for the typed address
+            waitFor("node-x listens again on its port") { x.wifi.listen(px) == px } // ...and node-x is back
+            val sent = a.say("while someone claims to be node-x")
+            waitFor("node-a dialed the typed address again") { x.wifi.linkCount() == 1 && x.got.any { it.id == sent.id } }
+            assertEquals(2, a.wifi.linkCount())                      // the idle link is still there, and stopped nothing
+            Thread.sleep(6_000)                                       // one more redial period: the real link is counted, so no third link
+            assertEquals(2, a.wifi.linkCount()); assertEquals(1, x.wifi.linkCount())
+        }
+    }
+
     @Test fun stopClosesEverything() {
         val a = node("group-code", "node-a"); val b = node("group-code", "node-b")
         b.wifi.connectManually("127.0.0.1", a.wifi.listen(0))

@@ -88,7 +88,8 @@ public enum Meshtastic {
     }
 }
 
-/// LoRa has very little bandwidth: only recent messages that fit, one at a time. Same rules as the Android LoraQueue.
+/// LoRa has very little bandwidth: only recent messages that fit, one at a time. The packets this phone wrote go
+/// first, and a packet it only passes on never takes the place of one of them. Same rules as the Android LoraQueue.
 public final class LoraQueue: @unchecked Sendable { // state guarded by `lock`
     public static let maxAgeMs: Int64 = 30 * 60_000
     public static let intervalMs: Int64 = 20_000
@@ -96,7 +97,8 @@ public final class LoraQueue: @unchecked Sendable { // state guarded by `lock`
     private let now: () -> Int64
     private let lock = NSLock()
     private var q: [Packet] = []
-    private var sent: [String] = []
+    private var own: [Packet] = [] // written on this phone
+    private var sent: [String] = [] // MeshRouter.key, as the router tells packets apart: junk under an id can't keep the real packet off the radio
     private var sentSet = Set<String>()
     private var last: Int64 = 0
 
@@ -106,19 +108,25 @@ public final class LoraQueue: @unchecked Sendable { // state guarded by `lock`
         self.maxBytes = maxBytes; self.now = now
     }
 
-    public func offer(_ p: Packet) {
+    /// `mine`: this very packet was written on this phone.
+    public func offer(_ p: Packet, mine: Bool = false) {
         lock.lock(); defer { lock.unlock() }
-        guard p.ts >= now() - Self.maxAgeMs, p.encode().count <= maxBytes, sentSet.insert(p.id).inserted else { return }
-        sent.append(p.id)
+        guard p.ts >= now() - Self.maxAgeMs, p.encode().count <= maxBytes else { return }
+        let k = MeshRouter.key(p)
+        guard sentSet.insert(k).inserted else { return }
+        sent.append(k)
         if sent.count > 1000 { sentSet.remove(sent.removeFirst()) }
-        if q.count >= Self.maxQueue { q.removeFirst() }
-        q.append(p)
+        // Full: the oldest packet passed on makes room. With only own packets waiting, the oldest of them does, for another own one.
+        if q.count + own.count >= Self.maxQueue {
+            if !q.isEmpty { q.removeFirst() } else if mine { own.removeFirst() } else { return }
+        }
+        if mine { own.append(p) } else { q.append(p) }
     }
 
     public func next() -> Packet? {
         lock.lock(); defer { lock.unlock() }
-        guard !q.isEmpty, now() - last >= Self.intervalMs else { return nil }
+        guard !(q.isEmpty && own.isEmpty), now() - last >= Self.intervalMs else { return nil }
         last = now()
-        return q.removeFirst()
+        return own.isEmpty ? q.removeFirst() : own.removeFirst()
     }
 }

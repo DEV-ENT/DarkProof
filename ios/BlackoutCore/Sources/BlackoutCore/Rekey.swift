@@ -45,23 +45,31 @@ public struct Rekey: Equatable, Sendable {
         let b = [UInt8](e); var i = 0
         func take(_ n: Int) -> [UInt8]? { guard i + n <= b.count else { return nil }; defer { i += n }; return Array(b[i..<(i + n)]) }
         func int64() -> Int64? { take(8).map { $0.reduce(Int64(0)) { $0 << 8 | Int64($1) } } }
-        guard let t = take(1)?.first, t == type || t == removalType, let epoch = int64(), let made = int64(), let maker = take(33), let na = take(1) else { return nil }
+        // The counts are checked as they are read: this runs before the signature is checked, on a packet anyone with the
+        // code can seal, and a list as long as the packet allows would cost far more to read than it did to write.
+        guard let t = take(1)?.first, t == type || t == removalType, let epoch = int64(), let made = int64(), let maker = take(33), let na = take(1),
+              Int(na[0]) <= Keyring.maxMembers else { return nil }
         var admins: [String] = []
         for _ in 0..<Int(na[0]) { guard let a = take(8) else { return nil }; admins.append(Hex.encode(Data(a))) }
-        guard let ans = take(8), let nm = take(2) else { return nil }
+        guard let ans = take(8), let nm = take(2), Int(nm[0]) << 8 | Int(nm[1]) <= Keyring.maxMembers else { return nil }
         var members: [String] = []
         for _ in 0..<(Int(nm[0]) << 8 | Int(nm[1])) { guard let m = take(8) else { return nil }; members.append(Hex.encode(Data(m))) }
-        guard let np = take(2) else { return nil }
+        guard let np = take(2), Int(np[0]) << 8 | Int(np[1]) <= partsPerPacket else { return nil }
         var parts: [(String, Data)] = []
         for _ in 0..<(Int(np[0]) << 8 | Int(np[1])) {
             guard let id = take(8), let n = take(2), let box = take(Int(n[0]) << 8 | Int(n[1])) else { return nil }
             parts.append((Hex.encode(Data(id)), Data(box)))
         }
-        guard i == b.count, parts.allSatisfy({ members.contains($0.0) }) else { return nil }
+        guard i == b.count, whole(members, parts.map(\.0)) else { return nil }
         let a = Hex.encode(Data(ans))
         if t == removalType && a == "0000000000000000" { return nil }
         return Rekey(epoch: epoch, made: made, maker: Data(maker), admins: admins, answers: a == "0000000000000000" ? nil : a, parts: parts, removal: t == removalType, members: members)
     }
+
+    /// True if a packet that lists `members` carries parts for exactly the people one packet of that key holds (`split`):
+    /// all of them up to `partsPerPacket` members, else every 3rd or 10th. Every phone can check this, so a maker can't
+    /// list someone and quietly give them no part: only an admin may leave a member out, and has to say so.
+    public static func whole(_ members: [String], _ parts: [String]) -> Bool { split(members).contains(parts) }
 
     /// What is sealed for each member: the epoch secret, then after a removal the group's new code.
     public static func box(_ secret: Data, code: String?) -> Data { secret + Data((code ?? "").utf8) }

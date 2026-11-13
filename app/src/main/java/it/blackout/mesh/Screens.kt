@@ -53,7 +53,7 @@ import java.util.Locale
 /** A chat row: a day header or a message. */
 private sealed class ChatRow(val key: String) {
     class Day(val label: String, key: String) : ChatRow(key)
-    class Msg(val m: Message, val firstOfRun: Boolean) : ChatRow(m.id)
+    class Msg(val m: Message, val firstOfRun: Boolean, key: String) : ChatRow(key)
     /** "Marco joined" (v0.6): from the group's epochs, not a message. */
     class Event(val text: String, key: String) : ChatRow(key)
 }
@@ -73,14 +73,15 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
     val joined = remember(tick, everyone, g) { if (everyone) emptyList() else MeshEngine.groupLines(g.code) }
     val rows = remember(shown, joined) {
         val out = ArrayList<ChatRow>(shown.size + 8); var day = -1
+        val keys = RowKeys() // no key twice, or the list ends the app: two events can have the same time and text, and a day can come up again
         val events = joined.sortedBy { it.first }.toMutableList()
-        fun dayRow(ts: Long) { val d = dayOf(ts); if (d != day) { day = d; out += ChatRow.Day(dayLabel(ctx, ts), "day-$d") } }
-        fun eventsUpTo(ts: Long) { while (events.isNotEmpty() && events[0].first <= ts) { val e = events.removeAt(0); dayRow(e.first); out += ChatRow.Event(e.second, "event-${e.first}-${e.second}") } }
+        fun dayRow(ts: Long) { val d = dayOf(ts); if (d != day) { day = d; out += ChatRow.Day(dayLabel(ctx, ts), keys.unique("day-$d")) } }
+        fun eventsUpTo(ts: Long) { while (events.isNotEmpty() && events[0].first <= ts) { val e = events.removeAt(0); dayRow(e.first); out += ChatRow.Event(e.second, keys.unique("event-${e.first}-${e.second}")) } }
         shown.forEachIndexed { i, m ->
             eventsUpTo(m.ts)
             val d = dayOf(m.ts)
             dayRow(m.ts)
-            out += ChatRow.Msg(m, i == 0 || out.lastOrNull() is ChatRow.Event || shown[i - 1].sender != m.sender || CheckIn.of(shown[i - 1].text) != null || dayOf(shown[i - 1].ts) != d)
+            out += ChatRow.Msg(m, i == 0 || out.lastOrNull() is ChatRow.Event || shown[i - 1].sender != m.sender || CheckIn.of(shown[i - 1].text) != null || dayOf(shown[i - 1].ts) != d, keys.unique(m.id))
         }
         eventsUpTo(Long.MAX_VALUE)
         out
@@ -181,6 +182,7 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
 /**
  * One message: a check-in, a report about someone, an "are you safe?" question (with one-tap answers when it is for
  * me), a place, or text and photo. Hold it to copy the text, and someone else's to block them or report it (Everyone).
+ * While a message is "not verified yet" nobody knows who wrote it: it can be hidden, but its sender can't be blocked.
  */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -197,11 +199,15 @@ private fun MessageRow(m: Message, firstOfRun: Boolean, delivery: Delivery?, myN
     var confirmBlock by remember { mutableStateOf(false) }
     val hold = Modifier.combinedClickable(onLongClick = { menu = true }, onClick = {}, onLongClickLabel = "Message options")
     if (confirmBlock) Confirm("Block ${m.name}?", "You won't see their messages, places or check-ins on this phone. You can unblock them in Settings.", "Block", danger = true,
-        onYes = { confirmBlock = false; Moderation.block(ctx, m.sender, m.name); moderated() }, onNo = { confirmBlock = false })
+        onYes = { confirmBlock = false; Moderation.block(ctx, m); moderated() }, onNo = { confirmBlock = false })
     // Shown under the message held (anchored to the Box around it).
     val options: @Composable () -> Unit = { DropdownMenu(menu, { menu = false }, containerColor = Theme.card) {
         DropdownMenuItem(text = { Txt("Copy text", 16) }, onClick = { menu = false; copyText(ctx, "Message", if (m.photo != null) Photo.caption(m.text) else m.text) })
-        if (!me) DropdownMenuItem(text = { Txt("Block ${m.name}", 16) }, onClick = { menu = false; confirmBlock = true })
+        if (Blocks.canBlock(m, MeshEngine.deviceId)) DropdownMenuItem(text = { Txt("Block ${m.name}", 16) }, onClick = { menu = false; confirmBlock = true })
+        else if (!me) DropdownMenuItem(text = { Txt("Hide this message", 16) }, onClick = {
+            menu = false; Moderation.hide(ctx, m.id); moderated()
+            Toast.makeText(ctx, "Hidden on this phone", Toast.LENGTH_SHORT).show()
+        })
         if (!me && m.public) DropdownMenuItem(text = { Txt("Report this message", 16, color = Theme.help) }, onClick = {
             menu = false; Moderation.hide(ctx, m.id); NostrReports.report(ctx, m.id); moderated()
             Toast.makeText(ctx, "Reported and hidden on this phone", Toast.LENGTH_SHORT).show()
@@ -287,7 +293,8 @@ private fun MessageRow(m: Message, firstOfRun: Boolean, delivery: Delivery?, myN
                 Column(Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(22.dp)).background(bubble)) {
                     m.photo?.let { jpeg ->
                         val img = remember(m.id) { decodePhoto(jpeg)?.asImageBitmap() }
-                        if (img != null) Image(img, "Photo", Modifier.fillMaxWidth().aspectRatio(img.width.toFloat() / img.height.coerceAtLeast(1))
+                        // The sender chooses the picture: its shape is kept within what a row can be laid out as (Photo.shape).
+                        if (img != null) Image(img, "Photo", Modifier.fillMaxWidth().aspectRatio(Photo.shape(img.width, img.height))
                             .clickable { open(Sheet.ViewPhoto(jpeg)) }, contentScale = ContentScale.Crop)
                     }
                     val text = if (m.photo != null) Photo.caption(m.text) else m.text
@@ -393,7 +400,7 @@ fun PlacesTab(s: AppState, messages: List<Message>, open: (Sheet) -> Unit) {
         var center by remember { mutableStateOf<Spot?>(null) }
         val people = remember(messages) { Person.all(messages, MeshEngine.deviceId) }
         val pins = remember(all, people) {
-            all.mapNotNull { sh -> sh.place.spot?.let { Pin(sh.place.kind.word + if (sh.place.note.isNotEmpty()) ": " + sh.place.note.take(40) else "", it, sh.ts, if (sh.old) "#6B6B6B" else "#FFFFFF") } } +
+            all.mapNotNull { sh -> sh.place.spot?.let { Pin(sh.place.kind.word + if (sh.place.note.isNotEmpty()) ": " + Cut.units(sh.place.note, 40) else "", it, sh.ts, if (sh.old) "#6B6B6B" else "#FFFFFF") } } +
                 people.mapNotNull { p -> p.spot?.let { Pin(p.name, it, p.spotTs, when (p.checkIn) { CheckIn.HELP -> "#FF453B"; CheckIn.SAFE -> "#33D64A"; null -> "#949494" }) } }
         }
         Column(Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -598,7 +605,7 @@ fun SendPhotoSheet(jpeg: ByteArray, close: () -> Unit) {
     var caption by remember { mutableStateOf("") }
     val img = remember(jpeg) { decodePhoto(jpeg)?.asImageBitmap() }
     SheetPage("Send photo", close) {
-        if (img != null) Image(img, "Photo", Modifier.fillMaxWidth().aspectRatio(img.width.toFloat() / img.height).clip(RoundedCornerShape(22.dp)), contentScale = ContentScale.Crop)
+        if (img != null) Image(img, "Photo", Modifier.fillMaxWidth().aspectRatio(Photo.shape(img.width, img.height)).clip(RoundedCornerShape(22.dp)), contentScale = ContentScale.Crop)
         Txt("${jpeg.size / 1000} KB, small enough to hop phone to phone.", 14, color = Theme.dim)
         InputField("Caption", caption, { caption = it.take(200) }, "Bridge is out", keyboard = KeyboardOptions(KeyboardCapitalization.Sentences))
         Txt("Only your group can see it. Phones without the newest DarkProof show “📷 Photo” instead.", 14, color = Theme.dim)
@@ -610,7 +617,7 @@ fun SendPhotoSheet(jpeg: ByteArray, close: () -> Unit) {
 fun ViewPhotoSheet(jpeg: ByteArray, close: () -> Unit) {
     val img = remember(jpeg) { decodePhoto(jpeg)?.asImageBitmap() }
     SheetPage("Photo", close) {
-        if (img != null) Image(img, "Photo", Modifier.fillMaxWidth().aspectRatio(img.width.toFloat() / img.height).clip(RoundedCornerShape(16.dp)), contentScale = ContentScale.Fit)
+        if (img != null) Image(img, "Photo", Modifier.fillMaxWidth().aspectRatio(Photo.shape(img.width, img.height)).clip(RoundedCornerShape(16.dp)), contentScale = ContentScale.Fit)
     }
 }
 
@@ -624,9 +631,7 @@ fun situation(g: SavedGroup, messages: List<Message>, me: Spot? = null): String 
     lines += "Group \"${ai(g.name)}\": ${people.size} other ${if (people.size == 1) "person" else "people"} have written; $phones phone(s) in range right now."
     for (p in people.take(15)) {
         val parts = ArrayList<String>()
-        parts += when (p.checkIn) {
-            CheckIn.SAFE -> "safe (checked in ${ago(p.checkInTs)})"; CheckIn.HELP -> "NEEDS HELP (checked in ${ago(p.checkInTs)})"; null -> "has not checked in"
-        }
+        parts += AiContext.status(p) { ago(it) } // a report says who reported it, never "checked in"
         parts += "last heard ${ago(p.lastTs)}"
         p.battery?.let { parts += "battery $it%" }
         p.spot?.let { sp ->
@@ -654,15 +659,16 @@ fun situation(g: SavedGroup, messages: List<Message>, me: Spot? = null): String 
             lines += "- $who, ${ago(m.ts)}: ${ai(text, 160)}"
         }
     }
-    return lines.joinToString("\n")
+    // Other people's words fill most of it, so it has a size the model's window always holds (AiContext).
+    return AiContext.head(lines.joinToString("\n"), AiContext.MAX_SITUATION_BYTES)
 }
 
 /** Text from other people, for the assistant: one line, short, and it can't close the <data> block around it. */
-private fun ai(s: String, max: Int = 40) = s.replace(Regex("\\s+"), " ").replace("<", "‹").replace(">", "›").trim().take(max)
+private fun ai(s: String, max: Int = 40) = AiContext.field(s, max)
 
 /** The assistant's instructions and the group's situation, like the iPhone. */
 fun aiSystem(g: SavedGroup, messages: List<Message>, me: Spot? = null) =
-    LocalAi.instructions + "\n\n" + LocalAi.situationIntro + "\n<data>\n" + situation(g, messages, me).take(AiContext.MAX_SITUATION_CHARS) + "\n</data>"
+    LocalAi.instructions + "\n\n" + LocalAi.situationIntro + "\n<data>\n" + situation(g, messages, me) + "\n</data>"
 
 private const val CATCH_UP = "Catch me up on the last 6 hours"
 
@@ -684,9 +690,8 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
         val recent = messages.filter { !it.public && it.ts >= System.currentTimeMillis() - 6 * 3_600_000L }.takeLast(40)
         if (recent.isEmpty()) { Toast.makeText(ctx, "Nothing from ${g.name} in the last 6 hours", Toast.LENGTH_LONG).show(); return }
         val h = recent.joinToString("\n") { "${clock(ctx, it.ts)} ${if (it.sender == MeshEngine.deviceId) "You" else ai(it.name)}: ${ai(it.text, 300)}" }
-        val half = AiContext.MAX_SITUATION_CHARS / 2
-        LocalAi.ask(CATCH_UP, LocalAi.instructions + "\n\n" + LocalAi.situationIntro + "\n<data>\n" + situation(g, messages, Locator.lastKnown(ctx)).take(half) +
-            "\nAll group messages of the last 6 hours, oldest first:\n" + h.takeLast(half) + "\n</data>\nSay who is safe, who is asking for help and what is missing. Do not make anything up.")
+        LocalAi.ask(CATCH_UP, LocalAi.instructions + "\n\n" + LocalAi.situationIntro + "\n<data>\n" + AiContext.head(situation(g, messages, Locator.lastKnown(ctx)), AiContext.MAX_SITUATION_BYTES / 2) +
+            "\nAll group messages of the last 6 hours, oldest first:\n" + AiContext.tail(h, AiContext.MAX_CATCH_UP_BYTES) + "\n</data>\nSay who is safe, who is asking for help and what is missing. Do not make anything up.")
     }
     var menu by remember { mutableStateOf(false) }
     val typing = WindowInsets.isImeVisible

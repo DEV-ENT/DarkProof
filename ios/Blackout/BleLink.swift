@@ -93,8 +93,9 @@ final class BleLink: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDele
         let now = Date()
         if let stale = links.values.filter({ $0.remote == nil && now.timeIntervalSince($0.createdAt) >= Self.stale })
             .min(by: { $0.createdAt < $1.createdAt }) { drop(stale); return true }
-        // Every place taken by a phone that said HELLO: one at random gives way now and then, so nobody can hold them all by just staying.
-        guard now.timeIntervalSince(rotatedAt) >= 30, let l = links.values.filter({ now.timeIntervalSince($0.createdAt) >= 60 }).randomElement() else { return false }
+        // Every place taken by a phone that said HELLO: one at random gives way now and then, whatever its age, so nobody
+        // can hold them all: not by just staying, and not by making its own links anew to keep them young.
+        guard now.timeIntervalSince(rotatedAt) >= 30, let l = links.values.filter({ $0.up }).randomElement() else { return false }
         rotatedAt = now
         drop(l)
         return true
@@ -267,7 +268,15 @@ final class BleLink: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDele
     /// Queues a frame; the queue is capped (BleProtocol.Outbox): the oldest packet frames go first, HELLO never.
     private func enqueue(_ l: Link, _ frame: Data, hello: Bool = false) {
         l.out.add(frame, hello: hello)
+        freed(l)
         pump(l)
+    }
+
+    /// Tells the router how much room opened in the link's queue (packets sent whole, or dropped at the cap): it sends
+    /// the next stored packets only as far as they fit (MeshRouter.room), so a long store doesn't push itself out.
+    private func freed(_ l: Link) {
+        let f = l.out.freed()
+        if f.packets > 0 && l.up { router.room(l.id, bytes: f.bytes, packets: f.packets) }
     }
 
     /// Central role: one write in flight, the next after its response.
@@ -283,6 +292,7 @@ final class BleLink: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDele
             guard let m = pm, let central = l.central, let txc = tx else { return }
             while let c = l.out.peek(l.chunk), m.updateValue(c, for: txc, onSubscribedCentrals: [central]) { l.out.commit() }
         }
+        freed(l)
     }
 
     private func onChunk(_ l: Link, _ chunk: Data) {
@@ -312,16 +322,22 @@ final class BleLink: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDele
     private func hello(_ l: Link, _ remote: String) {
         l.remote = remote
         if l.isCentral { nodeOf[l.key] = remote }
-        if let other = links.values.first(where: { $0 !== l && $0.remote == remote }) { // spec: "Duplicate links"
-            let keepCentral = BleProtocol.keepMyCentralLink(myId: nodeId, remoteId: remote)
-            // Only two links made at the same moment are really a duplicate. A later one claiming the same phone could be
-            // anyone: node ids prove nothing, so the link that's up stays. A dead one goes by its own disconnect.
-            let loser = abs(l.createdAt.timeIntervalSince(other.createdAt)) >= 10 ? l : other.isCentral == l.isCentral ? other : (l.isCentral == keepCentral ? other : l)
-            drop(loser)
-            if loser === l { return }
+        // spec: "Duplicate links". Only two links made at the same moment are surely a duplicate. Node ids prove
+        // nothing: whoever said a phone's id first must not keep that phone from linking. So a later link the other side
+        // dialed stays beside the link that's there (BleProtocol.twin); if both do lead to one phone, that phone closes
+        // the one it dialed, and a dead one goes by its own disconnect.
+        for other in links.values.filter({ $0 !== l && $0.remote == remote }) {
+            let apart = Int64(abs(l.createdAt.timeIntervalSince(other.createdAt)) * 1000)
+            switch BleProtocol.twin(myId: nodeId, remoteId: remote, newCentral: l.isCentral, oldCentral: other.isCentral,
+                                    apartMs: apart, sameDevice: l.key == other.key) {
+            case .closeNew: drop(l); return
+            case .closeOld: drop(other)
+            case .bothStay: break
+            }
         }
         l.up = true
-        router.peerUp(l.id)
+        // All links of one device count against one allowance in the router; the stored packets come as the queue has room.
+        router.peerUp(l.id, sender: Self.prefix + "@" + l.key.uuidString, roomBytes: BleProtocol.roomBytes, roomPackets: BleProtocol.roomPackets)
         report()
     }
 

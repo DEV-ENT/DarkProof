@@ -50,7 +50,7 @@ final class MeshCoreLink: NSObject, CBCentralManagerDelegate, CBPeripheralDelega
     }
 
     /// Called by the router: only recent packets that fit, paced by LoraQueue.
-    func offer(_ p: Packet) { queue.offer(p) }
+    func offer(_ p: Packet, mine: Bool = false) { queue.offer(p, mine: mine) }
 
     /// Reports MeshCore radios in range for 15 seconds. `found` is called on the main thread.
     func scan(found: @escaping (UUID, String) -> Void) {
