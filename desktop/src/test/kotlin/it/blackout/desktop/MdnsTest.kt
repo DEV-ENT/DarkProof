@@ -135,6 +135,8 @@ class MdnsTest {
             val end = System.currentTimeMillis() + 25_000
             while (System.currentTimeMillis() < end && (small.links.linkCount() != 1 || big.links.linkCount() != 1)) Thread.sleep(100)
             if (small.links.linkCount() != 1 || big.links.linkCount() != 1) org.junit.Assert.fail("the two didn't link: ${small.links.linkCount()} and ${big.links.linkCount()} links" + why(small, big))
+            Thread.sleep(6_000) // more answers come, from every network this computer is on: the one link has to stay the one link
+            if (small.links.linkCount() != 1 || big.links.linkCount() != 1) org.junit.Assert.fail("the link didn't stay one link: ${small.links.linkCount()} and ${big.links.linkCount()} links" + why(small, big))
             assertEquals(setOf("9999bbbb0002"), small.links.nodes()); assertEquals(setOf("1111aaaa0001"), big.links.nodes())
         } finally { small.stop(); big.stop(); it.blackout.mesh.WifiLink.discovery = before }
     }
@@ -167,5 +169,30 @@ class MdnsTest {
             run("-R", "beef00000002", TEST, "local", "7804")
             await("this finder to find what Apple's Bonjour registered") { seen.any { it.first == "beef00000002" && it.third == 7804 } }
         } finally { mine.stop(); procs.forEach { it.destroy() } }
+    }
+
+    /** A device on two networks answers from two addresses: it gets one link, at one of them, and keeps it. */
+    @Test fun aDeviceHeardAtTwoAddressesGetsOneLink() {
+        val linked = HashSet<Pair<String, String>>() // node, host
+        val f = FoundDevices("1111", 256) { n, h -> (n to h) in linked }
+        assertEquals("10.0.0.2" to 7777, f.heard("9999", "10.0.0.2", 7777, 1_000))        // first answer: connect there
+        assertNull(f.heard("9999", "172.16.0.2", 7777, 1_200))                              // its other address, while that connection is being made: wait
+        linked += "9999" to "10.0.0.2"
+        repeat(20) { i -> assertNull(f.heard("9999", if (i % 2 == 0) "172.16.0.2" else "10.0.0.2", 7777, 2_000L + i * 500)) } // linked: answers from either address change nothing
+        assertEquals(emptyList<Pair<String, Int>>(), f.unlinked(20_000))
+        linked.clear()                                                                      // the link drops
+        assertEquals("172.16.0.2" to 7777, f.heard("9999", "172.16.0.2", 7777, 30_000))    // now its other address is tried
+        assertEquals(listOf("172.16.0.2" to 7777), f.unlinked(40_000))                      // and retried while there is no link
+        // a link from elsewhere that only claims the node id doesn't count
+        linked += "9999" to "203.0.113.9"; assertEquals(listOf("172.16.0.2" to 7777), f.unlinked(50_000))
+        f.gone("9999"); assertEquals(emptyList<Pair<String, Int>>(), f.unlinked(60_000))
+    }
+
+    @Test fun onlyTheSmallerNodeIdConnectsAndOnlySoManyAreKept() {
+        val f = FoundDevices("5555", 3) { _, _ -> false }
+        assertNull("a larger id waits to be connected to", f.heard("1111", "10.0.0.2", 7777, 0)); assertNull("never itself", f.heard("5555", "10.0.0.3", 7777, 0))
+        for (i in 1..3) assertNotNull(f.heard("900$i", "10.0.1.$i", 7777, 0))
+        assertNull("a fourth isn't kept", f.heard("9004", "10.0.1.4", 7777, 0)); assertNotNull("one that is kept still is", f.heard("9001", "10.0.1.1", 7777, 0))
+        assertEquals(3, f.unlinked(10_000).size)
     }
 }

@@ -3,6 +3,7 @@ package it.blackout.mesh
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import it.blackout.desktop.FoundDevices
 import it.blackout.desktop.Mdns
 import org.json.JSONObject
 
@@ -53,7 +54,7 @@ class WifiLink(c: Context, private val nodeId: String, router: () -> MeshRouter?
     private val debug = System.getenv("DARKPROOF_DEBUG") == "1"
     val links = WifiLinks(nodeId, router, changed) { WifiLinks.onLan(it) || (debug && it.isLoopbackAddress) }
     private val h = Handler(Looper.getMainLooper())
-    private val found = HashMap<String, Pair<String, Int>>() // node id -> host, port (main thread)
+    private val found = FoundDevices(nodeId, LinkLimits.FOUND) { node, host -> links.linkedAt(node, host) } // main thread
     private var finder: Mdns? = null
     var running = false; private set
 
@@ -63,7 +64,7 @@ class WifiLink(c: Context, private val nodeId: String, router: () -> MeshRouter?
         val port = links.listen()
         if (port == 0) return
         val type = discovery ?: return
-        finder = Mdns(nodeId, port, found = { node, host, p -> h.post { onFound(node, host, p) } }, gone = { node -> h.post { found.remove(node) } }, type = type).also { it.start() }
+        finder = Mdns(nodeId, port, found = { node, host, p -> h.post { onFound(node, host, p) } }, gone = { node -> h.post { found.gone(node) } }, type = type).also { it.start() }
         h.postDelayed(::retry, 10_000)
     }
 
@@ -76,19 +77,15 @@ class WifiLink(c: Context, private val nodeId: String, router: () -> MeshRouter?
         links.stop()
     }
 
-    /** Only the smaller node id connects (spec), and not to itself. */
-    private fun wanted(node: String) = node != nodeId && nodeId < node
-
     private fun onFound(node: String, host: String, port: Int) {
-        if (!running || !wanted(node) || (found.size >= LinkLimits.FOUND && node !in found)) return
-        found[node] = host to port
-        if (!links.linkedAt(node, host)) links.dial(host, port)
+        if (!running) return
+        found.heard(node, host, port, System.currentTimeMillis())?.let { (at, p) -> links.dial(at, p) }
     }
 
-    /** Every 10 s, dials the devices it found that have no link. Only a link to the address it would dial counts: one from elsewhere may only claim that device's node id. */
+    /** Every 10 s, dials the devices it found that have no link. */
     private fun retry() {
         if (!running) return
-        found.filter { (node, at) -> wanted(node) && !links.linkedAt(node, at.first) }.values.shuffled().forEach { (host, port) -> links.dial(host, port) }
+        found.unlinked(System.currentTimeMillis()).forEach { (at, p) -> links.dial(at, p) }
         h.postDelayed(::retry, 10_000)
     }
 }
