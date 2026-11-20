@@ -49,6 +49,7 @@ object Here {
     val tile = false
     val ai = true             // llama.cpp beside the app (Llama.kt), with the dark room's kind of models
     val allModels = true      // every AI model is listed and says what it needs: the person decides which to download
+    val aiSwitches get() = LocalAi.switches() // think first, and the graphics card where this copy can use one
     val scan = false          // no camera scanning: a code is typed, or an invite link pasted
     val background = false    // the app passes messages on only while its window is open
     val tabBar = false        // no tabs along the bottom: a rail and a sidebar at the side

@@ -28,16 +28,15 @@ class RealAiTest {
     @Test fun realModelsAnswer() {
         val which = System.getenv("DARKPROOF_REAL_AI"); val home = System.getenv("DARKPROOF_REAL_AI_HOME"); val program = System.getenv("DARKPROOF_AI_ENGINE")
         assumeTrue("only when asked for", !which.isNullOrBlank() && !home.isNullOrBlank() && !program.isNullOrBlank())
-        val before = Llama.command; val thinkingBefore = Llama.THINKING
-        Llama.command = { listOf(File(program!!).absolutePath) }
-        System.getenv("DARKPROOF_AI_THINKING")?.toIntOrNull()?.let { Llama.THINKING = it } // to compare how much thinking helps
+        val before = Llama.command; val think = System.getenv("DARKPROOF_AI_THINK") == "1" // "think first", to compare
+        Llama.command = { graphics -> if (graphics) null else listOf(File(program!!).absolutePath) }
         val c = Context(File(home!!))
         try {
-            LocalAi.reset(c, LocalAi.offered)
+            LocalAi.reset(c, LocalAi.offered); LocalAi.chooseThinkFirst(think)
             for (i in which!!.split(",").map { it.trim().toInt() }) {
                 val m = LocalAi.all[i]; val out = StringBuilder()
                 fun say(s: String) { out.appendLine(s); println(s) }
-                say("# ${m.title}"); say("${m.id}, ${"%.2f".format(m.bytes / 1e9)} GB. Engine: ${Llama.version()}. Thinking allowed: ${Llama.THINKING} tokens"); say("")
+                say("# ${m.title}"); say("${m.id}, ${"%.2f".format(m.bytes / 1e9)} GB. Engine: ${Llama.version()}. Think first: ${LocalAi.thinkFirst}"); say("")
                 if (LocalAi.states[m.id] != LocalAi.State.Ready) {
                     val t0 = System.currentTimeMillis(); LocalAi.download(m)
                     await("the download of ${m.title}", 25 * 60_000L) { LocalAi.states[m.id].let { it == LocalAi.State.Ready || it is LocalAi.State.Failed } }
@@ -54,9 +53,9 @@ class RealAiTest {
                     say("## $q"); say("(${(System.currentTimeMillis() - t0) / 1000} s${if (a.isError) ", ERROR" else ""})"); say(""); say(a.text); say("")
                 }
                 say("typical seconds per answer, as the app will show it: ${LocalAi.typicalSeconds(m)}")
-                File("build/real-ai-$i-thinking${Llama.THINKING}.md").writeText(out.toString())
+                File("build/real-ai-$i${if (think) "-think-first" else ""}.md").writeText(out.toString())
             }
-        } finally { LocalAi.newConversation(); LocalAi.reset(Context(File(home, "end")), LocalAi.offered); Llama.command = before; Llama.THINKING = thinkingBefore }
+        } finally { LocalAi.newConversation(); LocalAi.reset(Context(File(home, "end")), LocalAi.offered); LocalAi.chooseThinkFirst(false); Llama.command = before }
     }
 
     private fun await(what: String, ms: Long, ok: () -> Boolean) {

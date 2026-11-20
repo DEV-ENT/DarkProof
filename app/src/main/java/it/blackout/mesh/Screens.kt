@@ -710,6 +710,7 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
                     DropdownMenuItem(text = { Txt("New conversation", 16, color = if (canNew) Theme.text else Theme.faint) }, enabled = canNew,
                         onClick = { menu = false; LocalAi.newConversation() })
                     DropdownMenuItem(text = { Txt("AI model: " + (m?.title ?: "none yet"), 16) }, onClick = { menu = false; choose = true })
+                    Here.aiSwitches.forEach { sw -> DropdownMenuItem(text = { Txt(sw.label, 16) }, onClick = { menu = false; sw.flip() }) }
                 }
             }
         }

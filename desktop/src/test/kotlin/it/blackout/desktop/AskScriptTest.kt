@@ -51,7 +51,7 @@ class AskScriptTest {
         server.createContext("/") { x -> x.sendResponseHeaders(200, bytes.size.toLong()); x.responseBody.use { it.write(bytes) } }
         server.start()
         val engineBefore = Llama.command
-        Llama.command = { FakeLlama.command() }
+        Llama.command = { FakeLlama.command() + if (it) listOf("--graphics") else emptyList() }
         LocalAi.reset(a, listOf(AiModel("tiny.gguf", "Tiny", "A stand-in for the tests.", "no licence", "http://127.0.0.1:${server.address.port}/tiny.gguf", bytes.size.toLong(), sha, minMemoryGB = 4)))
         Screen { App(a) }.use { s ->
             try {
@@ -67,6 +67,16 @@ class AskScriptTest {
                 assertTrue(s.has("What dose of ibuprofen?")); assertFalse("what the model thinks is not shown", s.has("The user wants"))
                 assertEquals(2, LocalAi.conversation.size)
                 s.png("build/screen-ask-answer.png")
+                // The menu's two choices. This copy has an engine for the graphics card, so the person was asked once, above the page
+                assertTrue(s.has("Use the graphics card for the AI?")); assertFalse(LocalAi.graphics)
+                s.tap("Use the graphics card"); assertTrue(LocalAi.graphics && LocalAi.graphicsAsked); assertFalse(s.has("Use the graphics card for the AI?"))
+                s.tap("More: new conversation, AI model")
+                assertTrue(s.says("Think first: off (answers start at once)") && s.says("Graphics card: on (faster answers)"))
+                s.tap("Think first: off (answers start at once)"); assertTrue(LocalAi.thinkFirst)
+                s.type("Ask anything", "How were you started?"); s.press(Key.Enter)
+                s.await("the answer from an engine started the new way") { s.has("thinking 768, graphics true, room 2816") }
+                s.tap("More: new conversation, AI model"); s.tap("Graphics card: on (faster answers)"); s.tap("More: new conversation, AI model"); s.tap("Think first: on (better answers, slower)")
+                assertFalse(LocalAi.graphics || LocalAi.thinkFirst)
                 // The model's page, from the menu: in use, and it can be deleted
                 s.tap("More: new conversation, AI model"); s.tap("AI model: Tiny")
                 s.await("the model's page") { s.has("In use") && s.says("Delete") }

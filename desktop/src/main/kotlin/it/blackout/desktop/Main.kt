@@ -38,6 +38,8 @@ import kotlin.system.exitProcess
 
 fun main(args: Array<String>) {
     if ("--self-test" in args) exitProcess(SelfTest.run()) // no window: see SelfTest
+    // A Mac draws the bar along the top of the window itself too, and draws it dark when asked before the first window opens.
+    if (System.getProperty("os.name").orEmpty().startsWith("Mac")) System.setProperty("apple.awt.application.appearance", "NSAppearanceNameDarkAqua")
     val test = "--window-test" in args // the real window, photographed: see WindowTest
     if (test) WifiLink.discovery = null // a test's messages are not for real devices: it neither looks for them nor announces itself
     window(test)

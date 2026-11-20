@@ -101,55 +101,69 @@ tasks.withType<Test>().configureEach {
 }
 
 // The AI engine: llama.cpp's own server program (MIT), one pinned build from its authors' releases, checked by SHA-256
-// before it is unpacked. It is code from outside, so it is fetched only when asked for with -PaiEngine (the build on
-// GitHub asks). Without it the app builds and runs, and its Ask page says this copy has no AI engine.
+// before it is unpacked. It is code from outside, so it is fetched only when asked for with -PaiEngine (the builds on
+// GitHub ask). Without it the app builds and runs, and its Ask page says this copy has no AI engine.
 val aiEngineBuild = "b12590"
-val aiEngines = mapOf( // the computer it is for, to the file's name and SHA-256
-    "windows-x64" to ("llama-$aiEngineBuild-bin-win-cpu-x64.zip" to "e895687489ceed01770fd5101ac377ad77ed41b5b2b7dafc8e1e1bfca613ba62"),
-    "macos-arm64" to ("llama-$aiEngineBuild-bin-macos-arm64.tar.gz" to "c0961e9c1ee87fb17357825a8f4a0a294ce7334093e1295917f71f17977d5ad6"),
+val aiEngines = mapOf( // the computer it is for, to: the folder it gets in the app, the file's name, its SHA-256
+    "windows-x64" to listOf(
+        Triple("llama", "llama-$aiEngineBuild-bin-win-cpu-x64.zip", "e895687489ceed01770fd5101ac377ad77ed41b5b2b7dafc8e1e1bfca613ba62"), // runs on every processor
+        Triple("llama-gpu", "llama-$aiEngineBuild-bin-win-vulkan-x64.zip", "4f11b151fb05e7e0b068893094e8db2406f9a258b3018020d2167c21322803b4"), // uses the graphics card, where it can
+    ),
+    "macos-arm64" to listOf(Triple("llama", "llama-$aiEngineBuild-bin-macos-arm64.tar.gz", "c0961e9c1ee87fb17357825a8f4a0a294ce7334093e1295917f71f17977d5ad6")), // uses the Mac's graphics chip by itself
 )
-val engineRoot = layout.projectDirectory.dir("engine") // engine/<computer>/llama goes into the app as resources/llama
+val engineRoot = layout.projectDirectory.dir("engine") // engine/<computer>/<folder> goes into the app as resources/<folder>
 val fetchAiEngine = tasks.register("fetchAiEngine") {
     val wanted = providers.gradleProperty("aiEngine").isPresent
-    val pick = aiEngines[composeTarget]
-    val into = engineRoot.dir("$composeTarget/llama").asFile
+    val picks = aiEngines[composeTarget].orEmpty()
+    val target = engineRoot.dir(composeTarget).asFile
     val work = layout.buildDirectory.dir("ai-engine").get().asFile
-    onlyIf { wanted && pick != null }
+    onlyIf { wanted && picks.isNotEmpty() }
     doLast {
-        val (name, sha) = pick!!
         fun sha256(f: File): String {
             val md = MessageDigest.getInstance("SHA-256")
             f.inputStream().use { i -> val b = ByteArray(1 shl 16); while (true) { val n = i.read(b); if (n < 0) break; md.update(b, 0, n) } }
             return md.digest().joinToString("") { "%02x".format(it) }
         }
-        val archive = File(work, name)
-        if (!archive.isFile || sha256(archive) != sha) {
-            work.mkdirs()
-            uri("https://github.com/ggml-org/llama.cpp/releases/download/$aiEngineBuild/$name").toURL().openStream().use { i -> archive.outputStream().use { i.copyTo(it) } }
-        }
-        check(sha256(archive) == sha) { "$name is not the file that was pinned (SHA-256 ${sha256(archive)})" }
-        val unpacked = File(work, "unpacked"); unpacked.deleteRecursively(); unpacked.mkdirs()
-        if (name.endsWith(".zip")) { // read here: what "tar" is on a Windows computer depends on what else is installed
-            ZipInputStream(archive.inputStream()).use { zip ->
-                while (true) {
-                    val e = zip.nextEntry ?: break
-                    val out = File(unpacked, e.name).canonicalFile
-                    check(out.path.startsWith(unpacked.canonicalPath + File.separator)) { "$name holds a file that would land outside its folder: ${e.name}" }
-                    if (e.isDirectory) out.mkdirs() else { out.parentFile.mkdirs(); out.outputStream().use { zip.copyTo(it) } }
-                }
+        for ((folder, name, sha) in picks) {
+            val archive = File(work, name)
+            if (!archive.isFile || sha256(archive) != sha) {
+                work.mkdirs()
+                uri("https://github.com/ggml-org/llama.cpp/releases/download/$aiEngineBuild/$name").toURL().openStream().use { i -> archive.outputStream().use { i.copyTo(it) } }
             }
-        } else {
-            val tar = ProcessBuilder("tar", "-xzf", archive.path, "-C", unpacked.path).inheritIO().start()
-            check(tar.waitFor() == 0) { "could not unpack $name" }
+            check(sha256(archive) == sha) { "$name is not the file that was pinned (SHA-256 ${sha256(archive)})" }
+            val unpacked = File(work, "unpacked-$folder"); unpacked.deleteRecursively(); unpacked.mkdirs()
+            if (name.endsWith(".zip")) { // read here: what "tar" is on a Windows computer depends on what else is installed
+                ZipInputStream(archive.inputStream()).use { zip ->
+                    while (true) {
+                        val e = zip.nextEntry ?: break
+                        val out = File(unpacked, e.name).canonicalFile
+                        check(out.path.startsWith(unpacked.canonicalPath + File.separator)) { "$name holds a file that would land outside its folder: ${e.name}" }
+                        if (e.isDirectory) out.mkdirs() else { out.parentFile.mkdirs(); out.outputStream().use { zip.copyTo(it) } }
+                    }
+                }
+            } else {
+                val tar = ProcessBuilder("tar", "-xzf", archive.path, "-C", unpacked.path).inheritIO().start()
+                check(tar.waitFor() == 0) { "could not unpack $name" }
+            }
+            val server = unpacked.walkTopDown().firstOrNull { it.name == "llama-server" || it.name == "llama-server.exe" } ?: error("no llama-server in $name")
+            val into = File(target, folder); into.deleteRecursively(); into.mkdirs()
+            // The server, the libraries it loads and the licences; not the other programs of the archive.
+            val libraries: List<File> = if (server.name.endsWith(".exe")) server.parentFile.listFiles().orEmpty().filter { it.name.endsWith(".dll") } else {
+                // A Mac's archive names each library three times over (two of them links). The program says which names it loads.
+                val seen = LinkedHashSet<String>(); val todo = ArrayDeque(listOf(server))
+                while (todo.isNotEmpty()) {
+                    val listed = ProcessBuilder("otool", "-L", todo.removeFirst().path).redirectErrorStream(true).start().inputStream.bufferedReader().readText()
+                    Regex("@rpath/(\\S+)").findAll(listed).forEach { m -> val f = File(server.parentFile, m.groupValues[1]); if (f.exists() && seen.add(f.name)) todo.add(f) }
+                }
+                seen.map { File(server.parentFile, it) }
+            }
+            (listOf(server) + libraries + unpacked.walkTopDown().filter { it.name.startsWith("LICENSE") }).distinct().forEach { f ->
+                val out = File(into, f.name)
+                Files.copy(f.toPath(), out.toPath(), StandardCopyOption.REPLACE_EXISTING) // a link is copied as the file it points to
+                if (f.canExecute() || f == server) out.setExecutable(true)
+            }
+            check(File(into, server.name).isFile && libraries.isNotEmpty()) { "the AI engine was not unpacked from $name" }
         }
-        val server = unpacked.walkTopDown().firstOrNull { it.name == "llama-server" || it.name == "llama-server.exe" } ?: error("no llama-server in $name")
-        into.deleteRecursively(); into.mkdirs()
-        // The server, the libraries beside it and the licences; not the other programs of the archive.
-        val wantedFile = Regex("""(llama-server(\.exe)?|.*\.(dll|dylib|so)(\.\d+)*|LICENSE.*)""")
-        (server.parentFile.listFiles().orEmpty().toList() + unpacked.walkTopDown().filter { it.name.startsWith("LICENSE") }).distinct()
-            .filter { it.name.matches(wantedFile) && Files.isRegularFile(it.toPath()) } // a link to a library is copied as the library
-            .forEach { f -> val out = File(into, f.name); Files.copy(f.toPath(), out.toPath(), StandardCopyOption.REPLACE_EXISTING); if (f.canExecute() || f.name.startsWith("llama-server")) out.setExecutable(true) }
-        check(File(into, server.name).isFile) { "the AI engine was not unpacked" }
     }
 }
 tasks.matching { it.name == "prepareAppResources" }.configureEach { dependsOn(fetchAiEngine) }
@@ -160,13 +174,16 @@ compose.desktop {
         // The app calls into the system itself: Windows for a dark title bar (TitleBar.kt), and the database's own library.
         // Java asks to be told so, and later versions will refuse without it.
         jvmArgs += "--enable-native-access=ALL-UNNAMED"
-        // The installer. It has to be built on the system it is for: .github/workflows/desktop-windows.yml builds the
-        // Windows one on GitHub. It is not signed, so Windows warns before running it.
+        // The installers. Each has to be built on the system it is for: .github/workflows/desktop-windows.yml builds the
+        // Windows one and the Mac one on GitHub. Neither is signed, so the system warns before running it.
         nativeDistributions {
             appResourcesRootDir.set(engineRoot) // the AI engine and its notice (above)
-            targetFormats(org.jetbrains.compose.desktop.application.dsl.TargetFormat.Msi)
+            targetFormats(org.jetbrains.compose.desktop.application.dsl.TargetFormat.Msi, org.jetbrains.compose.desktop.application.dsl.TargetFormat.Dmg)
             packageName = "DarkProof"
-            packageVersion = "0.4.1" // the Android app's versionName (app/build.gradle.kts); Windows wants three numbers
+            // 0.4 is the Android app's version (app/build.gradle.kts). The third number is the build's own: every build made on
+            // GitHub gets the next one, and Windows lets an installer replace an installed DarkProof only if its number is higher.
+            val build = providers.environmentVariable("GITHUB_RUN_NUMBER").orNull?.toIntOrNull() ?: 1
+            packageVersion = "0.4.$build"
             description = "DarkProof: messages when there is no internet"
             vendor = "DarkProof"
             includeAllModules = true // the whole Java runtime: a trimmed one leaves out parts the encryption and the database need
@@ -175,6 +192,23 @@ compose.desktop {
                 iconFile.set(project.file("icons/DarkProof.ico")) // the program's and its shortcuts' icon, drawn by icons/MakeIcon.java
                 perUserInstall = true // installs for the person, with no administrator password
                 upgradeUuid = "47564acc-4ff5-4925-be87-f8f7e3a80ba7" // never change: it is how a newer installer finds and replaces an older DarkProof
+            }
+            // The Mac's disk image, built on a Mac (the "mac" job of the same workflow). Not signed with an Apple
+            // certificate and not checked by Apple, so a Mac asks before opening it the first time.
+            macOS {
+                bundleID = "app.darkproof.desktop"
+                dockName = "DarkProof"
+                packageVersion = "1.4.$build" // a Mac wants a first number of 1 or more
+                iconFile.set(project.file("icons/DarkProof.icns")) // drawn by icons/MakeIcon.java
+                infoPlist {
+                    // A Mac asks the person before a program may look around the local network, and shows them this sentence.
+                    extraKeysRawXml = """
+                        <key>NSLocalNetworkUsageDescription</key>
+                        <string>DarkProof finds phones and computers with DarkProof on your network and passes messages between them.</string>
+                        <key>NSBonjourServices</key>
+                        <array><string>_darkproof._tcp</string></array>
+                    """.trimIndent()
+                }
             }
         }
     }

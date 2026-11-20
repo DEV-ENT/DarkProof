@@ -35,7 +35,7 @@ class AiTest {
     @Volatile private var slow = false
 
     @Before fun start() {
-        Llama.command = { FakeLlama.command() }
+        Llama.command = { graphics -> if (graphics) null else FakeLlama.command() } // a copy with the processor's engine only, unless a test says otherwise
         server = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
         server.createContext("/") { x ->
             val range = x.requestHeaders.getFirst("Range"); asked += x.requestURI.path + " " + (range ?: "whole")
@@ -135,7 +135,7 @@ class AiTest {
         assertEquals(LocalAi.Turn("assistant", "No AI model on this computer yet. Download one first.", true), LocalAi.conversation[1])
         LocalAi.newConversation()
         LocalAi.download(m); await("the model") { LocalAi.selected == m.id }
-        Llama.command = { null }
+        Llama.command = { _ -> null }
         LocalAi.ask("Hello?", LocalAi.instructions)
         await("the error") { !LocalAi.busy && LocalAi.conversation.size == 2 }
         assertEquals(LocalAi.Turn("assistant", "AI error: This copy of DarkProof has no AI engine.", true), LocalAi.conversation[1])
@@ -150,6 +150,39 @@ class AiTest {
         await("it to end", 6_000) { !LocalAi.busy }
         val last = LocalAi.conversation.last().text
         assertTrue(last, last.endsWith("(Stopped.)") && "word60" !in last)
+    }
+
+    @Test fun thinkFirstIsThePersonsChoiceAndIsKept() {
+        val m = model(); val c = fresh(m)
+        LocalAi.download(m); await("the model") { LocalAi.selected == m.id }
+        fun started(): String { LocalAi.newConversation(); LocalAi.ask("How were you started?", LocalAi.instructions); await("the answer") { !LocalAi.busy && LocalAi.conversation.size == 2 }; return LocalAi.conversation[1].text }
+        assertFalse(LocalAi.thinkFirst); assertEquals("thinking 0, graphics false, room 2048", started())
+        assertEquals(listOf("Think first: off (answers start at once)"), LocalAi.switches().map { it.label }) // no graphics engine in this copy: no such choice
+        LocalAi.switches()[0].flip()
+        assertTrue(LocalAi.thinkFirst); assertEquals("Think first: on (better answers, slower)", LocalAi.switches()[0].label)
+        assertEquals("the engine starts anew with the next question, and the thinking gets room of its own", "thinking 768, graphics false, room 2816", started())
+        LocalAi.reset(c, listOf(m)); assertTrue("kept across a restart", LocalAi.thinkFirst)
+        LocalAi.chooseThinkFirst(false); assertEquals("thinking 0, graphics false, room 2048", started())
+    }
+
+    @Test fun theGraphicsCardIsThePersonsChoiceAndFallsBackByItself() {
+        var cardWorks = true
+        Llama.command = { graphics -> FakeLlama.command() + if (!graphics) emptyList() else listOf(if (cardWorks) "--graphics" else "--no-graphics-here") }
+        val m = model(); val c = fresh(m)
+        LocalAi.download(m); await("the model") { LocalAi.selected == m.id }
+        fun started(): String { LocalAi.newConversation(); LocalAi.ask("How were you started?", LocalAi.instructions); await("the answer") { !LocalAi.busy && LocalAi.conversation.size == 2 }; return LocalAi.conversation[1].text }
+        assertTrue(LocalAi.hasGraphicsEngine); assertFalse(LocalAi.graphics); assertFalse(LocalAi.graphicsAsked)
+        assertEquals(listOf("Think first: off (answers start at once)", "Graphics card: off"), LocalAi.switches().map { it.label })
+        assertEquals("thinking 0, graphics false, room 2048", started())
+        LocalAi.chooseGraphics(true); assertTrue(LocalAi.graphicsAsked); assertEquals("Graphics card: on (faster answers)", LocalAi.switches()[1].label)
+        assertEquals("thinking 0, graphics true, room 2048", started())
+        LocalAi.reset(c, listOf(m)); assertTrue("kept across a restart", LocalAi.graphics && LocalAi.graphicsAsked)
+        // A computer whose card the engine can't use: the processor answers, the choice goes back to off, and the person is told
+        cardWorks = false
+        assertEquals("thinking 0, graphics false, room 2048", started())
+        await("the choice to go back to off") { !LocalAi.graphics }
+        await("the note") { Toasts.text == "The graphics card can't be used on this computer. The processor answers instead." }
+        assertEquals("thinking 0, graphics false, room 2048", started())
     }
 
     /** Every model on offer is one exact file: a pinned revision on Hugging Face over HTTPS, with its size and SHA-256. */

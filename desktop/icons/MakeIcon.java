@@ -10,8 +10,9 @@ import javax.imageio.ImageIO;
 
 /**
  * Draws DarkProof's desktop icon from the phones' logo: the white mark on a black tile, as on the phones' home screens.
- * Writes DarkProof.ico (for the Windows installer, the program and its shortcuts) and ../src/main/resources/icon.png
- * (for the window and the taskbar). Run it from this folder after the logo changes: java MakeIcon.java
+ * Writes DarkProof.ico (for the Windows installer, the program and its shortcuts), ../src/main/resources/icon.png
+ * (for the window and the taskbar) and the pictures for a Mac's icon in DarkProof.iconset. Run it from this folder
+ * after the logo changes: java MakeIcon.java, then on a Mac: iconutil -c icns DarkProof.iconset && rm -r DarkProof.iconset
  */
 public class MakeIcon {
     public static void main(String[] a) throws Exception {
@@ -20,6 +21,12 @@ public class MakeIcon {
         int[] sizes = {16, 20, 24, 32, 40, 48, 64, 128, 256};
         List<byte[]> images = new ArrayList<>();
         for (int n : sizes) images.add(n == 256 ? png(tile(logo, n)) : dib(tile(logo, n)));
+        // A Mac's icon: the same tile, a little smaller on a clear ground, as Mac icons are drawn, at the sizes a Mac asks for
+        File set = new File("DarkProof.iconset"); set.mkdirs();
+        for (int n : new int[] {16, 32, 128, 256, 512}) {
+            ImageIO.write(onClearGround(logo, n), "png", new File(set, "icon_" + n + "x" + n + ".png"));
+            ImageIO.write(onClearGround(logo, 2 * n), "png", new File(set, "icon_" + n + "x" + n + "@2x.png"));
+        }
         try (DataOutputStream out = new DataOutputStream(new FileOutputStream("DarkProof.ico"))) {
             ByteBuffer head = ByteBuffer.allocate(6 + 16 * sizes.length).order(ByteOrder.LITTLE_ENDIAN);
             head.putShort((short) 0).putShort((short) 1).putShort((short) sizes.length);
@@ -54,6 +61,15 @@ public class MakeIcon {
             h.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
             h.drawImage(img, 0, 0, next, next, null); h.dispose(); img = s;
         }
+        return img;
+    }
+
+    /** The tile at four fifths of the picture, with clear room around it. */
+    static BufferedImage onClearGround(BufferedImage logo, int n) {
+        int inner = Math.round(n * 0.805f), off = (n - inner) / 2;
+        BufferedImage img = new BufferedImage(n, n, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = img.createGraphics();
+        g.drawImage(tile(logo, inner), off, off, null); g.dispose();
         return img;
     }
 

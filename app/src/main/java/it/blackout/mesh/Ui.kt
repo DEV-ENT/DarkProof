@@ -120,6 +120,9 @@ fun vaultShape(cut: Dp = 42.dp, radius: Dp = 46.dp, small: Dp = 8.dp): Shape = o
     }
 }
 
+/** A choice in the Ask page's menu: [label] says it as it is now, and [flip] changes it. */
+class AiSwitch(val label: String, val on: Boolean, val flip: () -> Unit)
+
 /** Filled capsule tag, e.g. "Here". */
 @Composable fun Chip(text: String, color: Color = Theme.dim) =
     Txt(text, 13, FontWeight.SemiBold, color, Modifier

@@ -14,7 +14,9 @@ import kotlin.system.exitProcess
 /**
  * Stands in for llama.cpp's server program in tests: started the same way, with the same arguments, answering at the
  * same two addresses, with canned answers. It thinks out loud before every answer, as the real models do. A model
- * file whose name starts with "broken" fails to load; a question with "slowly" in it is answered a word at a time.
+ * file whose name starts with "broken" fails to load; a question with "slowly" in it is answered a word at a time;
+ * "How were you started?" is answered with the thinking and the graphics it was started with. Started with
+ * --no-graphics-here it fails the way the graphics card's engine does on a computer without a usable card.
  */
 object FakeLlama {
     /**
@@ -37,6 +39,7 @@ object FakeLlama {
         for (must in listOf("--offline", "--no-webui", "--no-slots", "--reasoning-budget", "-c")) if (must !in args) { System.err.println("error: started without $must"); exitProcess(2) }
         if (arg("--host") != "127.0.0.1") { System.err.println("error: not on this computer only"); exitProcess(2) }
         if (System.getenv().keys.any { it.startsWith("LLAMA_") }) { System.err.println("error: settings from outside reached the engine"); exitProcess(2) }
+        if ("--no-graphics-here" in args) { System.err.println("error: no graphics card this engine can use"); exitProcess(3) }
         if (model.name.startsWith("broken")) { System.err.println("error: failed to load model '${model.name}'"); exitProcess(1) }
         val started = System.currentTimeMillis()
         val server = HttpServer.create(InetSocketAddress(InetAddress.getByName(arg("--host")), arg("--port").toInt()), 0)
@@ -44,13 +47,15 @@ object FakeLlama {
         server.createContext("/health") { x -> if (System.currentTimeMillis() - started > 400) reply(x, 200, "{\"status\":\"ok\"}") else reply(x, 503, "{\"error\":\"loading\"}") }
         server.createContext("/v1/chat/completions") { x ->
             if (x.requestHeaders.getFirst("Authorization") != "Bearer $key") { reply(x, 401, "{\"error\":\"invalid api key\"}"); return@createContext }
-            val messages = JSONObject(String(x.requestBody.readAllBytes())).getJSONArray("messages")
+            val body = String(x.requestBody.readAllBytes())
+            val messages = JSONObject(body).getJSONArray("messages")
             val question = messages.getJSONObject(messages.length() - 1).getString("content")
             val system = messages.getJSONObject(0).getString("content")
             val answer = when {
                 "dose" in question -> "Take 400 mg every six hours with food."
                 "slowly" in question -> (1..60).joinToString(" ") { "word$it" }
                 "forever" in question -> "It goes on and on"
+                "started" in question -> "thinking ${arg("--reasoning-budget")}, graphics ${"--graphics" in args}, room ${JSONObject(body).getInt("max_tokens")}"
                 else -> "You asked: $question | earlier turns: ${messages.length() - 2} | instructions: ${system.length} characters | model: ${model.name}"
             }
             x.responseHeaders.add("Content-Type", "text/event-stream"); x.sendResponseHeaders(200, 0)

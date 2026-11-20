@@ -1,10 +1,16 @@
-# Builds the desktop app (desktop/) on Windows: runs every test there, makes the installer, installs nothing, and
-# checks that the built app starts its engine (DarkProof --self-test) and opens its window with a dark title bar
-# (DarkProof --window-test, which photographs the window). The installer and the pictures are kept with the run for
-# 14 days. A second job opens the window on the older Windows too, which draws title bars its own way.
+# Builds the desktop app (desktop/) for Windows and for the Mac.
+#
+# Windows: runs every test there, makes the installer, checks that the built app starts its engine and the AI engine
+# (DarkProof --self-test), installs the installer over the one people can download from darkproof.app to see that it
+# replaces it, and opens the app's real window to photograph it (DarkProof --window-test). A second job opens the
+# window on the older Windows too, which draws title bars its own way.
+# Mac: makes the disk image on a Mac and checks that the built app starts its engine and the AI engine.
+#
 # -PaiEngine has the build fetch the AI engine (llama.cpp's server, one pinned build, checked by SHA-256: see
-# desktop/build.gradle.kts) into the app; the self-test then checks that it runs on Windows. No model is fetched.
-name: Desktop app for Windows
+# desktop/build.gradle.kts) into the app. No model is fetched. Installers and pictures are kept for 14 days.
+# Every run gives its builds the next build number (0.4.<run>), so a newer installer replaces an older DarkProof.
+# This file's name stays as it is: a workflow under a new name would start counting from 1 again.
+name: Desktop app (Windows and Mac)
 
 on:
   push:
@@ -56,6 +62,38 @@ jobs:
           path: desktop/build/compose/binaries/main/msi/*.msi
           if-no-files-found: error
           retention-days: 14
+      - name: Install it over the installer from darkproof.app (update check)
+        shell: pwsh
+        run: |
+          # The installer people can download today, by its fingerprint: is it replaced, not doubled, by this build's?
+          $old = Join-Path $env:RUNNER_TEMP 'darkproof-public.msi'
+          try { Invoke-WebRequest -Uri 'https://darkproof.app/downloads/darkproof-0.4.1-windows.msi' -OutFile $old } catch { Write-Host "the public installer could not be downloaded ($_): skipping"; exit 0 }
+          $sha = (Get-FileHash $old -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne '1954708b5ef48c0c8ae9c5144148a3461082cb7a8396beba833a2dcd02303c93') { Write-Host "the public installer is another file now ($sha): nothing to compare with, skipping"; exit 0 }
+          $new = Get-ChildItem desktop/build/compose/binaries/main/msi -Filter *.msi | Select-Object -First 1
+          function Installed { Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'DarkProof' } }
+          function Install($file, $log) {
+            $p = Start-Process msiexec -ArgumentList '/i', "`"$file`"", '/qn', '/norestart', '/l*v', "`"$log`"" -PassThru -Wait
+            if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "msiexec ended with $($p.ExitCode) for $file" }
+          }
+          Install $old (Join-Path $env:RUNNER_TEMP 'install-old.log')
+          $before = @(Installed); Write-Host "after the public installer: $($before.Count) DarkProof, version $($before.DisplayVersion)"
+          if ($before.Count -ne 1) { throw 'the public installer did not install one DarkProof' }
+          Install $new.FullName (Join-Path $env:RUNNER_TEMP 'install-new.log')
+          $after = @(Installed); Write-Host "after this build's installer ($($new.Name)): $($after.Count) DarkProof, version $($after.DisplayVersion)"
+          if ($after.Count -ne 1) { throw "there are $($after.Count) DarkProof installed: the new one did not replace the old one" }
+          if ([version]$after[0].DisplayVersion -le [version]$before[0].DisplayVersion) { throw 'the installed DarkProof is not the newer one' }
+          # The installed program itself starts its engine
+          $where = $after[0].InstallLocation
+          $exe = if ($where) { Join-Path $where 'DarkProof.exe' } else { $null }
+          if (-not $exe -or -not (Test-Path $exe)) { $exe = (Get-ChildItem (Join-Path $env:LOCALAPPDATA 'DarkProof') -Recurse -Filter DarkProof.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }
+          if (-not $exe) { throw 'the installed DarkProof.exe was not found' }
+          Write-Host "installed at $exe"
+          $env:DARKPROOF_HOME = Join-Path $env:RUNNER_TEMP 'darkproof-installed-self-test'
+          $p = Start-Process -FilePath $exe -ArgumentList '--self-test' -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "the installed app's self-test did not finish in two minutes" }
+          Get-Content (Join-Path $env:DARKPROOF_HOME 'self-test.txt')
+          if ($p.ExitCode -ne 0) { throw "the installed app's self-test failed with exit code $($p.ExitCode)" }
       - name: Open the built app's window and photograph it (window test)
         shell: pwsh
         run: |
@@ -114,4 +152,31 @@ jobs:
             ${{ runner.temp }}/darkproof-window-test/window-*.png
             ${{ runner.temp }}/darkproof-window-test/window-test.txt
           if-no-files-found: ignore
+          retention-days: 14
+
+  # The Mac's disk image. The tests are run on a Mac before every push; here the app is built and its engines started.
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build the app and its disk image
+        run: ./gradlew -Pdesktop -PaiEngine :desktop:createDistributable :desktop:packageDmg --no-daemon --console=plain
+      - name: Start the built app's engine (self-test)
+        run: |
+          export DARKPROOF_HOME="$RUNNER_TEMP/darkproof-self-test"
+          app=$(find desktop/build/compose/binaries/main/app -maxdepth 1 -name 'DarkProof.app' | head -1)
+          test -n "$app" || { echo 'DarkProof.app was not built'; exit 1; }
+          uname -m; sw_vers -productVersion
+          "$app/Contents/MacOS/DarkProof" --self-test
+      - name: Keep the disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkProof-mac
+          path: desktop/build/compose/binaries/main/dmg/*.dmg
+          if-no-files-found: error
           retention-days: 14

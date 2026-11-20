@@ -18,7 +18,7 @@ class LlamaTest {
     private val dir = Files.createTempDirectory("darkproof-llama").toFile()
     private val before = Llama.command
     private val open = ArrayList<Llama>()
-    @Before fun standIn() { Llama.command = { FakeLlama.command() } }
+    @Before fun standIn() { Llama.command = { FakeLlama.command() + if (it) listOf("--graphics") else emptyList() } }
     @After fun tidy() { open.forEach { it.close() }; Llama.command = before; dir.deleteRecursively() }
     private fun model(name: String) = File(dir, name).also { it.writeText("not a model") }
     private fun start(name: String = "tiny.gguf") = Llama.start(model(name), 8192).also { open += it }
@@ -47,7 +47,7 @@ class LlamaTest {
     }
 
     @Test fun aCopyWithoutAnEngineSaysSo() {
-        Llama.command = { null }
+        Llama.command = { _ -> null }
         try { start(); fail("it started") } catch (e: IOException) { assertEquals("This copy of DarkProof has no AI engine.", e.message) }
         assertEquals(null, Llama.version())
     }

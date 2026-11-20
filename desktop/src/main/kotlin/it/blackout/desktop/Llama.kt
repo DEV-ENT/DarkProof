@@ -27,14 +27,24 @@ import java.util.concurrent.TimeUnit
  */
 internal class Llama private constructor(private val process: Process, internal val port: Int, private val key: String, private val said: Tail) : Closeable {
     companion object {
-        /** The engine program in this copy of the app, or null if this copy has none (a build made without it). */
-        fun program(): File? {
+        /**
+         * The engine program in this copy of the app, or null if this copy has none (a build made without it). On
+         * Windows the app carries two: one that works on every computer's processor, and with [graphics] one that
+         * uses the graphics card and needs a card and a driver it can work with. A Mac's one engine always uses its
+         * graphics chip, so a Mac has no second one.
+         */
+        fun program(graphics: Boolean = false): File? {
             val resources = System.getProperty("compose.application.resources.dir") ?: return null
-            return File(resources, "llama/" + if (TitleBar.onWindows) "llama-server.exe" else "llama-server").takeIf { it.isFile }
+            val program = File(resources, (if (graphics) "llama-gpu/" else "llama/") + if (TitleBar.onWindows) "llama-server.exe" else "llama-server").takeIf { it.isFile } ?: return null
+            // The graphics card's engine needs Vulkan, which comes with a card's driver. Without it Windows would stop
+            // the program with a message box of its own before it says a word, so on such a computer it is not offered.
+            if (graphics && TitleBar.onWindows && !File(program.parentFile, "vulkan-1.dll").isFile &&
+                !File(System.getenv("SystemRoot") ?: "C:\\Windows", "System32\\vulkan-1.dll").isFile) return null
+            return program
         }
 
-        /** The command that starts the engine, without the model and the address. Tests put a stand-in program here. */
-        @Volatile var command: () -> List<String>? = { program()?.let { listOf(it.path) } }
+        /** The command that starts the engine (the one for the graphics card, if asked), without the model and the address. Tests put a stand-in program here. */
+        @Volatile var command: (graphics: Boolean) -> List<String>? = { graphics -> program(graphics)?.let { listOf(it.path) } }
 
         private val http = OkHttpClient.Builder().proxy(Proxy.NO_PROXY) // never through a proxy: the engine is on this computer
             .connectTimeout(5, TimeUnit.SECONDS).readTimeout(QUIET_S, TimeUnit.SECONDS).build()
@@ -43,26 +53,23 @@ internal class Llama private constructor(private val process: Process, internal 
         private val JSON = "application/json".toMediaType()
 
         /**
-         * How many tokens a model may spend thinking before it answers: none. Left to themselves these models think
-         * for a thousand tokens and more before the first word. Tried on real models (2026-11-20, Qwen 3.5 2B and 4B):
-         * the 2B used its whole answer up on thinking and said nothing; the 4B with 768 tokens of thinking answered
-         * better, but only after as long as it takes to write those 768 tokens, which on a computer's processor alone
-         * is a minute or so of nothing on the screen. Tests on real models can set another value to compare.
-         */
-        @Volatile var THINKING = 0
-
-        /**
          * Starts the engine with [model] and waits until the model is loaded. [context] is the most tokens it holds
          * at once: instructions, the conversation, and the answer. Throws with the engine's own last lines if it
          * doesn't come up.
+         *
+         * [thinking] is how many tokens the model may spend thinking before it answers. Left to themselves these
+         * models think for a thousand tokens and more before the first word. Tried on real models (2026-11-20, Qwen
+         * 3.5 2B and 4B): the 2B used its whole answer up on thinking and said nothing; the 4B with 768 tokens of
+         * thinking answered better, but only after as long as it takes to write those tokens. So 0 is the usual
+         * value, and more is the person's choice.
          */
-        fun start(model: File, context: Int): Llama {
-            val base = command() ?: throw IOException("This copy of DarkProof has no AI engine.")
+        fun start(model: File, context: Int, thinking: Int = 0, graphics: Boolean = false): Llama {
+            val base = command(graphics) ?: throw IOException(if (graphics) "This copy of DarkProof has no AI engine for the graphics card." else "This copy of DarkProof has no AI engine.")
             val port = ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use { it.localPort }
             val key = ByteArray(24).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) }
             // --offline: the engine itself never goes to the network. --no-webui, --no-slots: no pages and no view of what is asked.
             val builder = ProcessBuilder(base + listOf("-m", model.path, "--host", "127.0.0.1", "--port", "$port", "--api-key", key, "-c", "$context",
-                "--offline", "--no-webui", "--no-slots", "--reasoning-budget", "$THINKING"))
+                "--offline", "--no-webui", "--no-slots", "--reasoning-budget", "$thinking"))
             builder.environment().keys.removeIf { it.startsWith("LLAMA_") } // its settings come from here, not from what happens to be set on this computer
             File(base.first()).parentFile?.takeIf { it.isDirectory }?.let(builder::directory) // its libraries lie next to it
             builder.redirectErrorStream(true)
@@ -94,8 +101,8 @@ internal class Llama private constructor(private val process: Process, internal 
         }
 
         /** The engine's version line, to check that this copy's engine runs on this computer at all; null if it doesn't. */
-        fun version(): String? = runCatching {
-            val base = command() ?: return null
+        fun version(graphics: Boolean = false): String? = runCatching {
+            val base = command(graphics) ?: return null
             val p = ProcessBuilder(base + "--version").redirectErrorStream(true).also { b -> File(base.first()).parentFile?.takeIf { it.isDirectory }?.let(b::directory) }.start()
             val out = p.inputStream.bufferedReader().readText()
             if (!p.waitFor(30, TimeUnit.SECONDS)) { p.destroyForcibly(); return null }

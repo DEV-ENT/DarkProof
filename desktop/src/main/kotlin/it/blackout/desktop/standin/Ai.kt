@@ -110,9 +110,29 @@ object LocalAi {
     private val downloads = ConcurrentHashMap<String, Call>()
     private val cancelled = ConcurrentHashMap.newKeySet<String>()
 
-    /** The most tokens the engine holds at once, and the most an answer may take. The models think before they answer, which takes room too. */
+    /** The most tokens the engine holds at once, and the most an answer may take. */
     private const val CONTEXT = 8_192
     private const val MAX_ANSWER = 2_048
+    /** "Think first": the most tokens a model may think before it answers (the value tried on real models, see Llama.start). */
+    private const val THINK_TOKENS = 768
+
+    /** The person's choice: the model thinks before it answers. Better answers, and a wait before the first word. */
+    var thinkFirst by mutableStateOf(false); private set
+    /** The person's choice, where this copy has an engine for it: the graphics card does the work. Faster, if the card can. */
+    var graphics by mutableStateOf(false); private set
+    /** Whether the person has been asked about the graphics card: they are asked once, and can change it in the Ask menu. */
+    var graphicsAsked by mutableStateOf(false); private set
+    val hasGraphicsEngine get() = Llama.command(true) != null
+
+    fun chooseThinkFirst(on: Boolean) { thinkFirst = on; prefs.edit().putBoolean("thinkFirst", on).apply() }
+    fun chooseGraphics(on: Boolean) { graphics = on; graphicsAsked = true; prefs.edit().putBoolean("graphics", on).putBoolean("graphicsAsked", true).apply() }
+
+    /** What the Ask page's menu offers besides the model, each said as it is now. The engine starts anew with the next question. */
+    fun switches(): List<AiSwitch> = buildList {
+        add(AiSwitch(if (thinkFirst) "Think first: on (better answers, slower)" else "Think first: off (answers start at once)", thinkFirst) { chooseThinkFirst(!thinkFirst) })
+        if (hasGraphicsEngine) add(AiSwitch(if (graphics) "Graphics card: on (faster answers)" else "Graphics card: off", graphics) { chooseGraphics(!graphics) })
+    }
+    private var engineHow: Pair<Int, Boolean>? = null // the thinking and the graphics the running engine was started with
 
     /** A computer's memory as people know it (8, 16, 32…): computers report a little less than that. */
     fun memoryClass(bytes: Long): Int {
@@ -146,6 +166,7 @@ object LocalAi {
         dir().listFiles()?.filter { (it.name.endsWith(".gguf") || it.name.endsWith(".part")) && it.name !in keep }?.forEach { it.delete() }
         states.clear(); for (m in all) states[m.id] = if (file(m).length() == m.bytes) State.Ready else State.Missing
         selected = prefs.getString("model", null)?.takeIf { states[it] == State.Ready } ?: all.firstOrNull { states[it.id] == State.Ready }?.id
+        thinkFirst = prefs.getBoolean("thinkFirst", false); graphics = prefs.getBoolean("graphics", false); graphicsAsked = prefs.getBoolean("graphicsAsked", false)
         conversation.clear(); busy = false
         runCatching {
             val a = JSONArray(conversationFile.readText())
@@ -308,19 +329,32 @@ object LocalAi {
     private fun generate(m: AiModel, system: String, history: List<Turn>, question: String, onText: (String) -> Unit): Turn {
         loadMs = 0
         try {
-            if (engineModel != m.id || engine?.alive != true) {
+            val how = (if (thinkFirst) THINK_TOKENS else 0) to (graphics && hasGraphicsEngine)
+            if (engineModel != m.id || engine?.alive != true || engineHow != how) {
                 engine?.close(); engine = null; engineModel = null // free the previous model before loading another
                 check(file(m).length() == m.bytes) { "This model file has changed. Remove it and download it again." }
                 // Windows says how much memory is really free; elsewhere the number leaves out what the system would give back.
-                val free = if (TitleBar.onWindows) runCatching { os!!.freeMemorySize }.getOrNull() else null
+                // With the graphics card the model goes into the card's own memory, which this number says nothing about.
+                val free = if (TitleBar.onWindows && !how.second) runCatching { os!!.freeMemorySize }.getOrNull() else null
                 if (free != null && free < m.bytes + 500_000_000)
                     return Turn("assistant", "Not enough free memory on this computer for ${m.title} right now (${"%.1f".format(free / 1e9)} GB free, " +
                         "${"%.1f".format((m.bytes + 500_000_000) / 1e9)} GB needed). Close other programs and try again, or choose a smaller model.", true)
                 val t0 = System.currentTimeMillis()
-                engine = Llama.start(file(m), CONTEXT).also { runCatching { pidFile.writeText(it.pid.toString()) } }; engineModel = m.id
+                var started = how
+                engine = try { Llama.start(file(m), CONTEXT, how.first, how.second) } catch (e: java.io.IOException) {
+                    if (!how.second) throw e
+                    // The graphics card's engine didn't come up: no card it can use, or a driver it can't work with. The processor's always does.
+                    main.post {
+                        chooseGraphics(false)
+                        android.widget.Toast.makeText(app, "The graphics card can't be used on this computer. The processor answers instead.", android.widget.Toast.LENGTH_LONG).show()
+                    }
+                    started = how.first to false
+                    Llama.start(file(m), CONTEXT, how.first, false)
+                }.also { runCatching { pidFile.writeText(it.pid.toString()) } }
+                engineModel = m.id; engineHow = started
                 loadMs = System.currentTimeMillis() - t0
             }
-            val answer = engine!!.chat(system, history.map { it.role to it.text }, question, MAX_ANSWER, onText)
+            val answer = engine!!.chat(system, history.map { it.role to it.text }, question, MAX_ANSWER + how.first, onText) // thinking takes room of its own
             return Turn("assistant", withDoseNote(if (stopped) (answer + "\n\n(Stopped.)").trim() else answer.ifEmpty { "No answer. Try asking in another way." }))
         } catch (t: Throwable) {
             if (engine?.alive != true) { runCatching { engine?.close() }; engine = null; engineModel = null }

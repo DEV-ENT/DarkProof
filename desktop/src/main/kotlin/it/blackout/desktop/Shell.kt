@@ -41,6 +41,7 @@ import it.blackout.mesh.Groups
 import it.blackout.mesh.Ic
 import it.blackout.mesh.Kicker
 import it.blackout.mesh.Links
+import it.blackout.mesh.LocalAi
 import it.blackout.mesh.Logo
 import it.blackout.mesh.MainActivity
 import it.blackout.mesh.MeshEngine
@@ -121,7 +122,11 @@ private fun Panes(s: AppState, a: MainActivity, g: SavedGroup) {
                 when (s.tab) {
                     2 -> Box(Modifier.widthIn(max = PAGE)) { PlacesTab(s, messages) { s.sheet = it } }
                     3 -> Box(Modifier.widthIn(max = PAGE)) { PeopleTab(s, a, g, messages, phones) { s.sheet = it } }
-                    4 -> AskTab(g, messages)
+                    4 -> {
+                        // Asked once, when there is a model to answer and this copy has an engine for the graphics card
+                        if (LocalAi.hasGraphicsEngine && !LocalAi.graphicsAsked && LocalAi.states[LocalAi.selected] == LocalAi.State.Ready) GraphicsQuestion()
+                        Box(Modifier.weight(1f)) { AskTab(g, messages) }
+                    }
                     else -> {
                         PaneTitle(if (s.everyone) "Everyone" else g.name) {
                             if (!s.everyone) Chip("Invite", R.drawable.ic_qr_code_2) { s.sheet = Sheet.Invite }
@@ -137,6 +142,20 @@ private fun Panes(s: AppState, a: MainActivity, g: SavedGroup) {
         }
     }
     Overlays(s, a, g, messages, all)
+}
+
+/** Whether the graphics card should do the AI's work: the person's call, since only they know their computer. */
+@Composable
+private fun GraphicsQuestion() {
+    Column(Modifier.padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 4.dp).fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(Theme.card).padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Txt("Use the graphics card for the AI?", 17, FontWeight.Bold)
+        Txt("Answers come faster if this computer has a graphics card the AI can use. If it can't use it, DarkProof goes back to the processor by itself. You can change this later in this page's menu.", 14, color = Theme.dim)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Chip("Use the graphics card", R.drawable.ic_auto_awesome) { LocalAi.chooseGraphics(true) }
+            Chip("Not now", R.drawable.ic_close) { LocalAi.chooseGraphics(false) }
+        }
+    }
 }
 
 /** A hairline between panes: on black, panes are told apart by a line, not by shades of grey. */
