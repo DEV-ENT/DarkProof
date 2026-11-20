@@ -50,6 +50,8 @@ object Here {
     val ai = false
     val scan = false          // no camera scanning: a code is typed, or an invite link pasted
     val background = false    // the app passes messages on only while its window is open
+    val tabBar = false        // no tabs along the bottom: a rail and a sidebar at the side
+    val wide = true           // panes side by side; pages open as a panel in the middle of the window
 }
 
 /** The screens ask Android's version for a few old-phone cases. A desktop is none of those. */

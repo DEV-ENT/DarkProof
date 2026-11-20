@@ -30,7 +30,7 @@ object RealEngine {
             s.await("the engine to start") { MeshEngine.router != null }
             s.await("the invite sheet, which a new group opens with") { s.has("Invite to My group") && s.has("Invite QR code") }
             s.tap("Close")
-            check(!s.has("Invite QR code") && s.has("Looking for phones")) { "Home isn't showing after the setup: ${s.texts()}" }
+            check(!s.has("Invite QR code") && s.has("Looking for phones") && s.has("Channels")) { "the main window isn't showing after the setup: ${s.texts()}" }
         }
         await("the Wi-Fi link to listen") { (MeshEngine.wifi?.links?.port ?: 0) > 0 }
     }

@@ -22,12 +22,19 @@ class IconsRenderTest {
     @Test fun thePhonesIconsAndButtonsDraw() {
         val ids = R.drawable::class.java.declaredFields.filter { it.type == Int::class.javaPrimitiveType && it.name.startsWith("ic_") && it.name != "ic_launcher_foreground" }.sortedBy { it.name }.map { it.getInt(null) }
         assertTrue("only ${ids.size} icons were found", ids.size >= 40)
-        val png = Screen(920, 560) {
+        val png = Screen(920, 560, 2f) {
             Column(Modifier.fillMaxSize().background(Theme.bg).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) { Logo(44.dp); PrimaryButton("Start a group", icon = R.drawable.ic_add) {}; SecondaryButton("Join") {} }
                 ids.chunked(14).forEach { row -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { row.forEach { Ic(it) } } }
             }
         }.use { it.png("build/icons.png") }
         assertTrue("the picture is nearly empty", png.size > 8_000)
+    }
+
+    /** The window's icon is in the program and reads as a picture, and the installer's is where the build looks for it. */
+    @Test fun theDesktopIconIsThere() {
+        org.junit.Assert.assertEquals(androidx.compose.ui.geometry.Size(512f, 512f), appIcon().intrinsicSize)
+        val ico = java.io.File("icons/DarkProof.ico").readBytes() // tests run in the desktop folder
+        assertTrue("not an icon file with its nine sizes", ico.size > 20_000 && ico[0].toInt() == 0 && ico[2].toInt() == 1 && ico[4].toInt() == 9)
     }
 }

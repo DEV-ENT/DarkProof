@@ -26,7 +26,7 @@ import kotlin.coroutines.CoroutineContext
  * thing is drawn, so something covered or off screen can't be tapped. Frames are drawn as time passes, so sheets and
  * other animations finish. Everything runs on the calling thread.
  */
-class Screen(private val width: Int = 880, private val height: Int = 1760, content: @Composable () -> Unit) : AutoCloseable {
+class Screen(private val width: Int = 2040, private val height: Int = 1290, density: Float = 1.5f, content: @Composable () -> Unit) : AutoCloseable { // 1360 x 860, the window's own size
     private class Here : CoroutineDispatcher() {
         private val queue = ConcurrentLinkedQueue<Runnable>()
         override fun dispatch(context: CoroutineContext, block: Runnable) { queue += block }
@@ -34,7 +34,7 @@ class Screen(private val width: Int = 880, private val height: Int = 1760, conte
     }
     private val here = Here()
     private var time = 0L
-    private val scene = ImageComposeScene(width, height, Density(2f), coroutineContext = here) { content() }
+    private val scene = ImageComposeScene(width, height, Density(density), coroutineContext = here) { content() }
 
     init { settle() }
 
@@ -73,6 +73,18 @@ class Screen(private val width: Int = 880, private val height: Int = 1760, conte
 
     /** Taps what says [text] (exactly, else containing it); [nth] picks among several, from the top. */
     fun tap(text: String, nth: Int = 0) { tapAt(find(text, nth).boundsInWindow.center); settle() }
+
+    /** Turns the mouse wheel over what says [text]: [lines] down, or up when negative. */
+    fun wheel(text: String, lines: Int) {
+        scene.sendPointerEvent(PointerEventType.Scroll, find(text).boundsInWindow.center, scrollDelta = Offset(0f, lines.toFloat()), type = PointerType.Mouse); settle()
+    }
+
+    /** Presses a key of the keyboard, in whatever was last clicked into. */
+    @OptIn(androidx.compose.ui.InternalComposeUiApi::class)
+    fun press(key: androidx.compose.ui.input.key.Key, shift: Boolean = false) {
+        scene.sendKeyEvent(androidx.compose.ui.input.key.KeyEvent(key, androidx.compose.ui.input.key.KeyEventType.KeyDown, isShiftPressed = shift)); here.run()
+        scene.sendKeyEvent(androidx.compose.ui.input.key.KeyEvent(key, androidx.compose.ui.input.key.KeyEventType.KeyUp, isShiftPressed = shift)); settle()
+    }
 
     fun tapAt(at: Offset) {
         scene.sendPointerEvent(PointerEventType.Press, at, type = PointerType.Touch); here.run(); time += 16_000_000L; scene.render(time)

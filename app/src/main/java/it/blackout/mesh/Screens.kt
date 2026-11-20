@@ -106,10 +106,12 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
         }.start()
     }
     val typing = WindowInsets.isImeVisible
-    Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding().padding(bottom = if (typing) 0.dp else 84.dp)) { // room for the tab bar
-        Column(Modifier.padding(horizontal = 20.dp).padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            ScreenTitle(g.name, if (phones == 1) "1 phone in range" else "$phones phones in range")
-            PillSwitch(g.name, "Everyone", everyone) { s.everyone = it }
+    Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding().padding(bottom = if (typing || !Here.tabBar) 0.dp else 84.dp)) { // room for the tab bar
+        Column(Modifier.padding(horizontal = 20.dp).padding(top = if (Here.wide) 2.dp else 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (!Here.wide) { // a wide window names the chat above it and switches channels at its side
+                ScreenTitle(g.name, if (phones == 1) "1 phone in range" else "$phones phones in range")
+                PillSwitch(g.name, "Everyone", everyone) { s.everyone = it }
+            }
             Txt(if (everyone) "Anyone with DarkProof can read these, nearby or online." else "Only people in ${g.name} can read these. They disappear after one to two weeks.", 14, color = Theme.dim)
             if (!everyone && remember(tick, g) { MeshEngine.removed(g.code) }) Card(padding = 16.dp) {
                 Txt("You were removed from ${g.name}", 16, FontWeight.SemiBold)
@@ -141,7 +143,7 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
             if (shown.isEmpty()) item {
                 Column(Modifier.fillMaxWidth().padding(top = 40.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Txt("No messages yet", 20, FontWeight.Bold)
-                    Txt(if (everyone) "Messages here reach everyone, nearby or online." else "Say hi, or tap I'm safe on Home.", 15, color = Theme.dim)
+                    Txt(if (everyone) "Messages here reach everyone, nearby or online." else if (Here.tabBar) "Say hi, or tap I'm safe on Home." else "Say hi, or tap I'm safe.", 15, color = Theme.dim)
                 }
             }
             items(rows, key = { it.key }) { r ->
@@ -159,10 +161,7 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
             if (!everyone) RoundIcon(R.drawable.ic_photo_camera, 52.dp, desc = "Send a photo") {
                 pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             }
-            TextBox(draft, { s.drafts[channel] = it.take(1000) }, if (everyone) "Message everyone" else "Message ${g.name}", singleLine = false,
-                keyboard = KeyboardOptions(KeyboardCapitalization.Sentences), modifier = Modifier.weight(1f), shape = RoundedCornerShape(26.dp))
-            RoundIcon(R.drawable.ic_arrow_upward, 52.dp, tint = if (draft.isBlank()) Theme.dim else Color.Black,
-                bg = if (draft.isBlank()) Theme.tile else Color.White, desc = "Send") {
+            val send: () -> Unit = {
                 val t = draft.trim()
                 if (t.isNotEmpty() && meshReady(ctx)) {
                     s.drafts.remove(channel)
@@ -175,6 +174,11 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
                     }.start()
                 }
             }
+            TextBox(draft, { s.drafts[channel] = it.take(1000) }, if (everyone) "Message everyone" else "Message ${g.name}", singleLine = false,
+                keyboard = KeyboardOptions(KeyboardCapitalization.Sentences), modifier = Modifier.weight(1f), shape = RoundedCornerShape(26.dp),
+                onEnter = if (Here.wide) send else null) // at a computer's keyboard, Enter sends
+            RoundIcon(R.drawable.ic_arrow_upward, 52.dp, tint = if (draft.isBlank()) Theme.dim else Color.Black,
+                bg = if (draft.isBlank()) Theme.tile else Color.White, desc = "Send", onClick = send)
         }
     }
 }
@@ -403,7 +407,7 @@ fun PlacesTab(s: AppState, messages: List<Message>, open: (Sheet) -> Unit) {
             all.mapNotNull { sh -> sh.place.spot?.let { Pin(sh.place.kind.word + if (sh.place.note.isNotEmpty()) ": " + Cut.units(sh.place.note, 40) else "", it, sh.ts, if (sh.old) "#6B6B6B" else "#FFFFFF") } } +
                 people.mapNotNull { p -> p.spot?.let { Pin(p.name, it, p.spotTs, when (p.checkIn) { CheckIn.HELP -> "#FF453B"; CheckIn.SAFE -> "#33D64A"; null -> "#949494" }) } }
         }
-        Column(Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 8.dp, bottom = if (Here.tabBar) 100.dp else 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             ScreenTitle("Places", "Shared by anyone with DarkProof, nearby or online")
             PillSwitch("List", "Map", true) { s.placesMap = it }
             StreetMap(pins, me, Modifier.fillMaxWidth().weight(1f), open) { center = it }
@@ -412,7 +416,7 @@ fun PlacesTab(s: AppState, messages: List<Message>, open: (Sheet) -> Unit) {
         }
         return
     }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 120.dp),
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 8.dp, bottom = if (Here.tabBar) 120.dp else 24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
         ScreenTitle("Places", "Shared by anyone with DarkProof, nearby or online")
         if (Here.map) PillSwitch("List", "Map", false) { s.placesMap = it }
@@ -516,11 +520,11 @@ fun PeopleTab(s: AppState, a: MainActivity, g: SavedGroup, messages: List<Messag
     val people = remember(messages) { Person.all(messages, MeshEngine.deviceId) }
     val mine = remember(messages) { messages.lastOrNull { !it.public && it.sender == MeshEngine.deviceId && CheckIn.of(it.text) != null } }
     var askAll by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 120.dp),
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 8.dp, bottom = if (Here.tabBar) 120.dp else 24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.weight(1f)) { ScreenTitle("People", "${g.name} · ${people.size} ${if (people.size == 1) "person" else "people"} · $phones nearby") }
-            RoundIcon(R.drawable.ic_settings, desc = "Settings") { open(Sheet.Settings) }
+            if (!Here.wide) RoundIcon(R.drawable.ic_settings, desc = "Settings") { open(Sheet.Settings) } // a wide window has Settings at its side
         }
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             BigCheckIn("I'm safe", R.drawable.ic_verified_user, Theme.safe, Color.Black, Modifier.weight(1f)) {
@@ -695,7 +699,7 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
     }
     var menu by remember { mutableStateOf(false) }
     val typing = WindowInsets.isImeVisible
-    Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding().padding(bottom = if (typing) 0.dp else 84.dp)) {
+    Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding().padding(bottom = if (typing || !Here.tabBar) 0.dp else 84.dp)) {
         Row(Modifier.padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.Top) {
             Box(Modifier.weight(1f)) { ScreenTitle("Ask", "Works with no internet. It can be wrong: double-check anything important.") }
             Spacer(Modifier.width(12.dp))

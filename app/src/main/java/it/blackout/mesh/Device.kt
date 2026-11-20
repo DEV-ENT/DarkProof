@@ -61,6 +61,8 @@ object Here {
     val ai = true             // the offline AI
     val scan = true           // a camera that scans an invite's QR code
     val background = true     // DarkProof keeps passing messages on while the app is closed
+    val tabBar = true         // the tabs float over the bottom of the screen, so each tab leaves room for them
+    val wide = false          // a wide window with panes side by side: pages open in the middle of it, not as a sheet from below
 }
 
 /** Android's version number (API level). The screens ask through this, so that they also run where there is no Android. */

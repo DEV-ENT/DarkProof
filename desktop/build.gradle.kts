@@ -53,7 +53,7 @@ val generateR = tasks.register("generateR") {
         })
     }
 }
-sourceSets.named("main") { resources { srcDir(phoneRes); include("drawable/**", "drawable-nodpi/**") } }
+sourceSets.named("main") { resources { srcDir(phoneRes); include("drawable/**", "drawable-nodpi/**", "icon.png") } } // icon.png: the desktop's own, see icons/MakeIcon.java
 
 kotlin {
     compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
@@ -109,6 +109,7 @@ compose.desktop {
             includeAllModules = true // the whole Java runtime: a trimmed one leaves out parts the encryption and the database need
             windows {
                 menuGroup = "DarkProof"; shortcut = true
+                iconFile.set(project.file("icons/DarkProof.ico")) // the program's and its shortcuts' icon, drawn by icons/MakeIcon.java
                 perUserInstall = true // installs for the person, with no administrator password
                 upgradeUuid = "47564acc-4ff5-4925-be87-f8f7e3a80ba7" // never change: it is how a newer installer finds and replaces an older DarkProof
             }

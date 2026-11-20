@@ -280,6 +280,12 @@ fun MainView(s: AppState, a: MainActivity) {
         if (!((s.tab == 1 || s.tab == 4) && WindowInsets.isImeVisible)) TabBar(s.tab, unread, Modifier.align(Alignment.BottomCenter)) { s.tab = it } // hidden while typing
         s.banner?.let { AlertBanner(it, s, a, Modifier.align(Alignment.TopCenter)) }
     }
+    Overlays(s, a, g, messages, all)
+}
+
+/** The sheets and notices that open over the main view, whichever layout it has (the phones' tabs, a computer's panes). */
+@Composable
+internal fun Overlays(s: AppState, a: MainActivity, g: SavedGroup, messages: List<Message>, all: List<Message>) {
     val close = { s.sheet = null }
     when (val sh = s.sheet) {
         Sheet.Invite -> { LaunchedEffect(Unit) { Ready.mark(a, Ready.INVITE) }; InviteSheet(g, a, close) }
