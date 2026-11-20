@@ -1,0 +1,54 @@
+# Builds the desktop app (desktop/) on Windows: runs every test there, makes the installer, installs nothing, and
+# checks that the built app starts its engine (DarkProof --self-test). The installer is kept with the run for 14 days.
+name: Desktop app for Windows
+
+on:
+  push:
+    branches: [windows-desktop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Keep the files' line endings as they are
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Run every test on Windows
+        run: ./gradlew -Pdesktop :desktop:test --no-daemon --console=plain
+      - name: Build the app and its installer
+        run: ./gradlew -Pdesktop :desktop:createDistributable :desktop:packageMsi --no-daemon --console=plain
+      - name: Start the built app's engine (self-test)
+        shell: pwsh
+        run: |
+          $env:DARKPROOF_HOME = Join-Path $env:RUNNER_TEMP 'darkproof-self-test'
+          $exe = Get-ChildItem desktop/build/compose/binaries/main/app -Recurse -Filter DarkProof.exe | Select-Object -First 1
+          if (-not $exe) { throw 'DarkProof.exe was not built' }
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList '--self-test' -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'the self-test did not finish in two minutes' }
+          $report = Join-Path $env:DARKPROOF_HOME 'self-test.txt'
+          if (Test-Path $report) { Get-Content $report } else { Write-Host 'no self-test.txt was written' }
+          if ($p.ExitCode -ne 0) { throw "the self-test failed with exit code $($p.ExitCode)" }
+      - name: Keep the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: desktop/build/reports/tests/test
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Keep the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkProof-windows-installer
+          path: desktop/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14

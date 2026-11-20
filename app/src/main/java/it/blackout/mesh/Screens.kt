@@ -130,7 +130,7 @@ fun ChatTab(s: AppState, g: SavedGroup, messages: List<Message>, phones: Int, op
                     Txt(Fingerprint.emojiLines(P256.emoji(r.pub)), 22, lineHeight = 30)
                     Txt("Let them in only if you know it's them. Their phone shows these same emoji.", 14, color = Theme.dim)
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        PrimaryButton("Let in", Modifier.weight(1f)) { MeshEngine.approveJoin(g.code, r.id) { ok -> if (!ok) Toast.makeText(ctx, "Not everyone's keys have reached this phone yet. Try again when they're in reach.", Toast.LENGTH_LONG).show() } }
+                        PrimaryButton("Let in", Modifier.weight(1f)) { MeshEngine.approveJoin(g.code, r.id) { ok -> if (!ok) Toast.makeText(ctx, "Not everyone's keys have reached this ${Here.device} yet. Try again when they're in reach.", Toast.LENGTH_LONG).show() } }
                         SecondaryButton("Not now", Modifier.weight(1f)) { MeshEngine.declineJoin(g.code, r.id) }
                     }
                 }
@@ -198,7 +198,7 @@ private fun MessageRow(m: Message, firstOfRun: Boolean, delivery: Delivery?, myN
     var menu by remember { mutableStateOf(false) }
     var confirmBlock by remember { mutableStateOf(false) }
     val hold = Modifier.combinedClickable(onLongClick = { menu = true }, onClick = {}, onLongClickLabel = "Message options")
-    if (confirmBlock) Confirm("Block ${m.name}?", "You won't see their messages, places or check-ins on this phone. You can unblock them in Settings.", "Block", danger = true,
+    if (confirmBlock) Confirm("Block ${m.name}?", "You won't see their messages, places or check-ins on this ${Here.device}. You can unblock them in Settings.", "Block", danger = true,
         onYes = { confirmBlock = false; Moderation.block(ctx, m); moderated() }, onNo = { confirmBlock = false })
     // Shown under the message held (anchored to the Box around it).
     val options: @Composable () -> Unit = { DropdownMenu(menu, { menu = false }, containerColor = Theme.card) {
@@ -206,11 +206,11 @@ private fun MessageRow(m: Message, firstOfRun: Boolean, delivery: Delivery?, myN
         if (Blocks.canBlock(m, MeshEngine.deviceId)) DropdownMenuItem(text = { Txt("Block ${m.name}", 16) }, onClick = { menu = false; confirmBlock = true })
         else if (!me) DropdownMenuItem(text = { Txt("Hide this message", 16) }, onClick = {
             menu = false; Moderation.hide(ctx, m.id); moderated()
-            Toast.makeText(ctx, "Hidden on this phone", Toast.LENGTH_SHORT).show()
+            Toast.makeText(ctx, "Hidden on this ${Here.device}", Toast.LENGTH_SHORT).show()
         })
         if (!me && m.public) DropdownMenuItem(text = { Txt("Report this message", 16, color = Theme.help) }, onClick = {
             menu = false; Moderation.hide(ctx, m.id); NostrReports.report(ctx, m.id); moderated()
-            Toast.makeText(ctx, "Reported and hidden on this phone", Toast.LENGTH_SHORT).show()
+            Toast.makeText(ctx, "Reported and hidden on this ${Here.device}", Toast.LENGTH_SHORT).show()
         })
     } }
     val card = check != null || vouch != null || ask != null || place != null
@@ -396,7 +396,7 @@ fun PlacesTab(s: AppState, messages: List<Message>, open: (Sheet) -> Unit) {
         if (me == null) f.sortedWith(compareBy<Shared> { it.old }.thenByDescending { it.ts })
         else f.sortedWith(compareBy<Shared> { it.old }.thenBy { it.place.spot?.let { sp -> Geo.distance(me, sp) } ?: Double.MAX_VALUE }.thenByDescending { it.ts })
     }
-    if (s.placesMap) {
+    if (s.placesMap && Here.map) {
         var center by remember { mutableStateOf<Spot?>(null) }
         val people = remember(messages) { Person.all(messages, MeshEngine.deviceId) }
         val pins = remember(all, people) {
@@ -415,7 +415,7 @@ fun PlacesTab(s: AppState, messages: List<Message>, open: (Sheet) -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(top = 8.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
         ScreenTitle("Places", "Shared by anyone with DarkProof, nearby or online")
-        PillSwitch("List", "Map", false) { s.placesMap = it }
+        if (Here.map) PillSwitch("List", "Map", false) { s.placesMap = it }
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip("All", null, filter == null) { filter = null }
             PlaceKind.entries.forEach { k -> FilterChip(k.word, kindIcon(k), filter == k) { filter = k } }
@@ -587,12 +587,12 @@ fun FindSheet(f: Sheet.Find, close: () -> Unit) {
                 Txt(if (near) "Within about ${Geo.meters(maxOf(15.0, (me.accuracy ?: 15).toDouble()))}. Look around or call out." else "${Geo.compassWord(b)} of you", 18, color = Theme.dim)
             }
             Txt("Position from ${ago(f.ts)}", 15, color = Theme.dim)
-            if (!compass) Txt("This phone has no compass right now, so the arrow assumes the top of the phone points north.", 14, color = Theme.dim)
+            if (!compass) Txt("This ${Here.device} has no compass right now, so the arrow assumes the top of the ${Here.device} points north.", 14, color = Theme.dim)
         }
         Card(padding = 16.dp) { PlusCodeRow(f.spot) }
         SecondaryButton("Open in a map app", icon = R.drawable.ic_map) {
             val geo = String.format(Locale.ROOT, "geo:%.5f,%.5f?q=%.5f,%.5f", f.spot.lat, f.spot.lon, f.spot.lat, f.spot.lon)
-            runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(geo))) }.onFailure { Toast.makeText(ctx, "No map app on this phone", Toast.LENGTH_LONG).show() }
+            runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(geo))) }.onFailure { Toast.makeText(ctx, "No map app on this ${Here.device}", Toast.LENGTH_LONG).show() }
         }
     }
 }
