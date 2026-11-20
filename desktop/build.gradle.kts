@@ -167,6 +167,12 @@ val fetchAiEngine = tasks.register("fetchAiEngine") {
     }
 }
 tasks.matching { it.name == "prepareAppResources" }.configureEach { dependsOn(fetchAiEngine) }
+// Packing the app drops the mark that says the engine is a program (seen on the Mac build of 2026-11-20: every file in
+// the packed app came out as a plain file). It is put back in the packed app, which the disk image is then made from.
+tasks.matching { it.name == "createDistributable" }.configureEach {
+    val packed = layout.buildDirectory.dir("compose/binaries/main/app")
+    doLast { packed.get().asFile.walkTopDown().filter { it.isFile && it.name == "llama-server" }.forEach { it.setExecutable(true, false) } }
+}
 
 compose.desktop {
     application {

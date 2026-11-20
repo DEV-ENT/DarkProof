@@ -166,18 +166,21 @@ jobs:
           java-version: '21'
       - name: Build the app and its disk image
         run: ./gradlew -Pdesktop -PaiEngine :desktop:createDistributable :desktop:packageDmg --no-daemon --console=plain
-      - name: Start the built app's engine (self-test)
+      - name: Open the disk image and start the app's engines from it (self-test)
         run: |
-          export DARKPROOF_HOME="$RUNNER_TEMP/darkproof-self-test"
-          app=$(find desktop/build/compose/binaries/main/app -maxdepth 1 -name 'DarkProof.app' | head -1)
-          test -n "$app" || { echo 'DarkProof.app was not built'; exit 1; }
+          # The disk image itself, opened the way a Mac opens it: nothing on it can be changed, so what runs here is what was shipped
           uname -m; sw_vers -productVersion
-          # The AI engine as it lies in the built app: its files and whether they may be run, what signs it, and its own word
+          dmg=$(ls desktop/build/compose/binaries/main/dmg/*.dmg | head -1)
+          hdiutil attach "$dmg" -mountpoint "$RUNNER_TEMP/darkproof-image" -nobrowse -readonly
+          app="$RUNNER_TEMP/darkproof-image/DarkProof.app"
           engine="$app/Contents/app/resources/llama"
-          ls -la "$engine" || true
+          ls -la "$engine"
           codesign -dv "$engine/llama-server" 2>&1 | head -6 || true
-          "$engine/llama-server" --version 2>&1 | head -4; echo "the engine started by hand ended with ${PIPESTATUS[0]}"
+          "$engine/llama-server" --version 2>&1 | head -3
+          test "${PIPESTATUS[0]}" = 0 || { echo 'the AI engine on the disk image cannot be started as it is'; exit 1; }
+          export DARKPROOF_HOME="$RUNNER_TEMP/darkproof-self-test"
           "$app/Contents/MacOS/DarkProof" --self-test
+          hdiutil detach "$RUNNER_TEMP/darkproof-image" || true
       - name: Keep the disk image
         uses: actions/upload-artifact@v4
         with:
