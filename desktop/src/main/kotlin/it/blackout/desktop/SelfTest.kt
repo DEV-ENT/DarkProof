@@ -8,7 +8,7 @@ import java.io.File
 
 /**
  * `DarkProof --self-test`: starts the engine without a window in the data folder (set DARKPROOF_HOME to a throwaway
- * one), makes a group, writes to it and to Everyone, and checks they are kept. It shows that a built app has what the
+ * one: a folder already in use is refused), makes a group, writes to it and to Everyone, and checks they are kept. It shows that a built app has what the
  * engine needs on this computer: the encryption, the database and the network link. The result is the exit code (0 is
  * good) and a file self-test.txt in the data folder, since a built Windows app has no console to print to.
  */
@@ -19,6 +19,7 @@ object SelfTest {
         val ok = runCatching {
             WifiLink.discovery = null // a self-test's messages are not for real devices: it neither looks for them nor announces itself
             val a = Desktop.activity()
+            check(a.state.group == null) { "this data folder is in use: set DARKPROOF_HOME to an empty folder" } // never a test group in someone's real DarkProof
             say("data folder ready on ${System.getProperty("os.name")} ${System.getProperty("os.arch")}, Java ${System.getProperty("java.version")}")
             val code = Invite.newCode()
             MeshEngine.found(a, code); a.started("Self test", SavedGroup("Self test", code))

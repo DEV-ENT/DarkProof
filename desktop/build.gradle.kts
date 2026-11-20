@@ -98,6 +98,9 @@ tasks.withType<Test>().configureEach {
 compose.desktop {
     application {
         mainClass = "it.blackout.desktop.MainKt"
+        // The app calls into the system itself: Windows for a dark title bar (TitleBar.kt), and the database's own library.
+        // Java asks to be told so, and later versions will refuse without it.
+        jvmArgs += "--enable-native-access=ALL-UNNAMED"
         // The installer. It has to be built on the system it is for: .github/workflows/desktop-windows.yml builds the
         // Windows one on GitHub. It is not signed, so Windows warns before running it.
         nativeDistributions {

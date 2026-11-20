@@ -1,5 +1,7 @@
 # Builds the desktop app (desktop/) on Windows: runs every test there, makes the installer, installs nothing, and
-# checks that the built app starts its engine (DarkProof --self-test). The installer is kept with the run for 14 days.
+# checks that the built app starts its engine (DarkProof --self-test) and opens its window with a dark title bar
+# (DarkProof --window-test, which photographs the window). The installer and the pictures are kept with the run for
+# 14 days. A second job opens the window on the older Windows too, which draws title bars its own way.
 name: Desktop app for Windows
 
 on:
@@ -51,4 +53,63 @@ jobs:
           name: DarkProof-windows-installer
           path: desktop/build/compose/binaries/main/msi/*.msi
           if-no-files-found: error
+          retention-days: 14
+      - name: Open the built app's window and photograph it (window test)
+        shell: pwsh
+        run: |
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force } catch { Write-Host "the screen keeps its size: $_" }
+          $env:DARKPROOF_HOME = Join-Path $env:RUNNER_TEMP 'darkproof-window-test'
+          $exe = Get-ChildItem desktop/build/compose/binaries/main/app -Recurse -Filter DarkProof.exe | Select-Object -First 1
+          if (-not $exe) { throw 'DarkProof.exe was not built' }
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList '--window-test' -PassThru
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw 'the window test did not finish in three minutes' }
+          $report = Join-Path $env:DARKPROOF_HOME 'window-test.txt'
+          if (Test-Path $report) { Get-Content $report } else { Write-Host 'no window-test.txt was written' }
+          if ($p.ExitCode -ne 0) { throw "the window test ended with exit code $($p.ExitCode)" }
+      - name: Keep the pictures of the window
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: window-pictures-windows-latest
+          path: |
+            ${{ runner.temp }}/darkproof-window-test/window-*.png
+            ${{ runner.temp }}/darkproof-window-test/window-test.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The same window on the older Windows (the Windows 10 family), which takes a dark title bar differently.
+  older-windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Keep the files' line endings as they are
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build the app
+        run: ./gradlew -Pdesktop :desktop:createDistributable --no-daemon --console=plain
+      - name: Open the built app's window and photograph it (window test)
+        shell: pwsh
+        run: |
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force } catch { Write-Host "the screen keeps its size: $_" }
+          $env:DARKPROOF_HOME = Join-Path $env:RUNNER_TEMP 'darkproof-window-test'
+          $exe = Get-ChildItem desktop/build/compose/binaries/main/app -Recurse -Filter DarkProof.exe | Select-Object -First 1
+          if (-not $exe) { throw 'DarkProof.exe was not built' }
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList '--window-test' -PassThru
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw 'the window test did not finish in three minutes' }
+          $report = Join-Path $env:DARKPROOF_HOME 'window-test.txt'
+          if (Test-Path $report) { Get-Content $report } else { Write-Host 'no window-test.txt was written' }
+          if ($p.ExitCode -ne 0) { throw "the window test ended with exit code $($p.ExitCode)" }
+      - name: Keep the pictures of the window
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: window-pictures-windows-2022
+          path: |
+            ${{ runner.temp }}/darkproof-window-test/window-*.png
+            ${{ runner.temp }}/darkproof-window-test/window-test.txt
+          if-no-files-found: ignore
           retention-days: 14

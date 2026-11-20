@@ -9,13 +9,17 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.DpSize
@@ -27,17 +31,41 @@ import androidx.compose.ui.window.rememberWindowState
 import it.blackout.mesh.MainActivity
 import it.blackout.mesh.MeshEngine
 import it.blackout.mesh.Theme
+import it.blackout.mesh.WifiLink
+import kotlinx.coroutines.delay
 import org.jetbrains.skia.Image
+import kotlin.system.exitProcess
 
 fun main(args: Array<String>) {
-    if ("--self-test" in args) kotlin.system.exitProcess(SelfTest.run()) // no window: see SelfTest
-    window()
+    if ("--self-test" in args) exitProcess(SelfTest.run()) // no window: see SelfTest
+    val test = "--window-test" in args // the real window, photographed: see WindowTest
+    if (test) WifiLink.discovery = null // a test's messages are not for real devices: it neither looks for them nor announces itself
+    window(test)
 }
 
-private fun window() = application {
+private fun window(test: Boolean) = application {
     val a = remember { Desktop.activity() }
-    Window(onCloseRequest = { MeshEngine.shutdown(); exitApplication() }, title = "DarkProof", icon = remember { appIcon() }, state = rememberWindowState(size = DpSize(1360.dp, 860.dp))) {
-        LaunchedEffect(Unit) { window.minimumSize = java.awt.Dimension(900, 620) }
+    // On Windows the window opens once its title bar has been made dark, so it never shows up with a light one.
+    var open by remember { mutableStateOf(!TitleBar.onWindows) }
+    LaunchedEffect(Unit) { delay(2500); open = true } // whatever happens to the title bar, the window opens
+    Window(onCloseRequest = { MeshEngine.shutdown(); exitApplication() }, visible = open, title = "DarkProof", icon = remember { appIcon() }, state = rememberWindowState(size = DpSize(1360.dp, 860.dp))) {
+        LaunchedEffect(Unit) {
+            window.minimumSize = java.awt.Dimension(900, 620)
+            var bar = TitleBar.Answer(error = "not Windows"); var asked = "not asked"
+            if (TitleBar.onWindows) {
+                val colour = Theme.bg.toArgb() and 0xFFFFFF; val edge = Theme.line.toArgb() and 0xFFFFFF
+                if (!open) { // the window exists for Windows from here on, and stays hidden until it is asked for a dark bar
+                    bar = runCatching { if (!window.isDisplayable) window.addNotify(); TitleBar.darken(window.windowHandle, colour, edge) }.getOrElse { TitleBar.Answer(error = it.toString()) }
+                    asked = "asked before the window opened"; open = true
+                }
+                if (!bar.isDark) { // not taken then: once more with the window open, drawing its frame again
+                    delay(400); val first = bar
+                    bar = runCatching { TitleBar.darken(window.windowHandle, colour, edge, redraw = true) }.getOrElse { TitleBar.Answer(error = it.toString()) }
+                    asked = "asked after the window opened; before it: $first"
+                }
+            }
+            if (test) exitProcess(WindowTest.run(window, a, bar, asked))
+        }
         App(a)
     }
 }
