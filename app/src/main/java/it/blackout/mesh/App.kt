@@ -806,6 +806,7 @@ private fun HelpPage(s: AppState, a: MainActivity, close: () -> Unit) {
             GhostButton("Email us") { Contact.open(a, Contact.MAIL) }
             GhostButton("Privacy policy") { Contact.open(a, Contact.PRIVACY) }
         }
+        GhostButton("Terms of use") { Contact.open(a, Contact.TERMS) } // on its own line: three in a row do not fit a narrow phone
     }
 }
 
