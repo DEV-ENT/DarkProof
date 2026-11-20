@@ -2,6 +2,7 @@ package it.blackout.desktop
 
 import it.blackout.mesh.MainActivity
 import it.blackout.mesh.MeshEngine
+import it.blackout.mesh.WifiLink
 import org.junit.Assert.fail
 import java.io.File
 import java.nio.file.Files
@@ -16,6 +17,7 @@ object RealEngine {
     lateinit var activity: MainActivity; private set
 
     private val start: Unit by lazy {
+        WifiLink.discovery = null // the tests' engine must not find, or be found by, real DarkProof devices on this network
         val a = Desktop.activity(dir); activity = a // nothing saved yet: the screens ask for a name and a group
         Screen { App(a) }.use { s ->
             check(s.has("Create a group") && s.has("Join a group")) { "a first start doesn't show the setup: ${s.texts()}" }

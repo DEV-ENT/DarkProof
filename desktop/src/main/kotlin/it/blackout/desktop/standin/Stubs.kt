@@ -1,6 +1,9 @@
 package it.blackout.mesh
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import it.blackout.desktop.Mdns
 import org.json.JSONObject
 
 // The desktop's versions of phone-only objects that the phone's engine names (same names and calls), so that it
@@ -31,16 +34,63 @@ object Tor {
     fun check(client: okhttp3.OkHttpClient, label: String = ""): Boolean = false
 }
 
-/** Phones on the same network. The phones also find each other by themselves (Bonjour); the desktop can't yet, so an address has to be typed. */
+/**
+ * DarkProof devices on the same network, found with DNS-SD and linked with [WifiLinks]: the desktop's version of the
+ * phones' WifiLink.kt, with the desktop's own finder ([Mdns]) where a phone asks its system. The rules are the phones'
+ * (spec/FORMAT.md, "Wi-Fi networks"): only the device with the smaller node id connects, it tries again every 10 s
+ * while there is no link, and at most 256 found devices are remembered. An address can still be typed.
+ */
 class WifiLink(c: Context, private val nodeId: String, router: () -> MeshRouter?, changed: () -> Unit) {
-    companion object { const val SERVICE = "_darkproof._tcp" }
+    companion object {
+        const val SERVICE = Mdns.SERVICE
+        /**
+         * The service type devices are looked for and announced under, or null to do neither. Tests and the self-test
+         * set null, or a type of their own: what they write must never reach real DarkProof devices on the network.
+         */
+        @Volatile internal var discovery: String? = SERVICE
+    }
     // DARKPROOF_DEBUG=1 also takes links from this computer itself, as the phones' debug builds do (emulator tests).
     private val debug = System.getenv("DARKPROOF_DEBUG") == "1"
     val links = WifiLinks(nodeId, router, changed) { WifiLinks.onLan(it) || (debug && it.isLoopbackAddress) }
+    private val h = Handler(Looper.getMainLooper())
+    private val found = HashMap<String, Pair<String, Int>>() // node id -> host, port (main thread)
+    private var finder: Mdns? = null
     var running = false; private set
 
-    fun start() { if (running) return; running = true; links.listen() }
-    fun stop() { if (!running) return; running = false; links.stop() }
+    fun start() {
+        if (running) return
+        running = true
+        val port = links.listen()
+        if (port == 0) return
+        val type = discovery ?: return
+        finder = Mdns(nodeId, port, found = { node, host, p -> h.post { onFound(node, host, p) } }, gone = { node -> h.post { found.remove(node) } }, type = type).also { it.start() }
+        h.postDelayed(::retry, 10_000)
+    }
+
+    fun stop() {
+        if (!running) return
+        running = false
+        h.removeCallbacksAndMessages(null)
+        finder?.stop(); finder = null
+        found.clear()
+        links.stop()
+    }
+
+    /** Only the smaller node id connects (spec), and not to itself. */
+    private fun wanted(node: String) = node != nodeId && nodeId < node
+
+    private fun onFound(node: String, host: String, port: Int) {
+        if (!running || !wanted(node) || (found.size >= LinkLimits.FOUND && node !in found)) return
+        found[node] = host to port
+        if (!links.linkedAt(node, host)) links.dial(host, port)
+    }
+
+    /** Every 10 s, dials the devices it found that have no link. Only a link to the address it would dial counts: one from elsewhere may only claim that device's node id. */
+    private fun retry() {
+        if (!running) return
+        found.filter { (node, at) -> wanted(node) && !links.linkedAt(node, at.first) }.values.shuffled().forEach { (host, port) -> links.dial(host, port) }
+        h.postDelayed(::retry, 10_000)
+    }
 }
 
 /** LoRa radios reach a phone over Bluetooth. Not on the desktop yet: none is ever made here, the engine and the screens only need the names. */

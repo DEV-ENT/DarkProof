@@ -3,6 +3,7 @@ package it.blackout.desktop
 import it.blackout.mesh.Invite
 import it.blackout.mesh.MeshEngine
 import it.blackout.mesh.SavedGroup
+import it.blackout.mesh.WifiLink
 import java.io.File
 
 /**
@@ -16,6 +17,7 @@ object SelfTest {
         val out = StringBuilder()
         fun say(s: String) { out.appendLine(s); println(s) }
         val ok = runCatching {
+            WifiLink.discovery = null // a self-test's messages are not for real devices: it neither looks for them nor announces itself
             val a = Desktop.activity()
             say("data folder ready on ${System.getProperty("os.name")} ${System.getProperty("os.arch")}, Java ${System.getProperty("java.version")}")
             val code = Invite.newCode()
