@@ -44,8 +44,11 @@ class Screen(private val width: Int = 2040, private val height: Int = 1290, dens
     /** Waits for something that other threads bring about (the engine, a link), drawing frames meanwhile. */
     fun await(what: String, ms: Long = 15_000, ok: () -> Boolean) {
         val end = System.currentTimeMillis() + ms
-        while (true) { settle(48); if (ok()) return; if (System.currentTimeMillis() > end) fail("timed out waiting for: $what\non screen: ${texts()}"); Thread.sleep(40) }
+        while (true) { settle(48); if (ok()) return; if (System.currentTimeMillis() > end) fail("timed out waiting for: $what\non screen: ${texts().map { t -> secrets.fold(t) { shown, secret -> shown.replace(secret, "(hidden)") } }}"); Thread.sleep(40) }
     }
+
+    /** Texts that a failed wait must not print with the rest of the screen, such as a group's code. */
+    val secrets = ArrayList<String>()
 
     private fun nodes(): List<SemanticsNode> = scene.semanticsOwners.flatMap { it.getAllSemanticsNodes(mergingEnabled = false) }
     private fun words(n: SemanticsNode): List<String> =
