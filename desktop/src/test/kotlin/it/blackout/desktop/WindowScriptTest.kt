@@ -99,7 +99,8 @@ class WindowScriptTest {
                 assertTrue(s.has("Type the code your friend tells you, or paste the invite link they send.")); assertFalse(s.has("Scan"))
                 s.typeInto(0, code); s.typeInto(1, "Neighbours"); s.tap("Join")
                 s.await("the new group in use") { Groups.current(c)?.code == code && MeshEngine.currentCode == code }
-                assertEquals("Neighbours", Groups.current(c)!!.name); assertTrue(MeshEngine.joining(code))
+                assertEquals("Neighbours", Groups.current(c)!!.name)
+                s.await("the engine to be asking to join") { MeshEngine.joining(code) } // it says so a moment after the group is in use
                 // The engine takes the join on its own thread and the window follows it: wait for the window, as a person would
                 s.secrets += code
                 s.await("the new group's chat, asking to join, with the code gone from the screen") { s.has("Neighbours") && s.has("Asking to join Neighbours") && !s.has(code) }

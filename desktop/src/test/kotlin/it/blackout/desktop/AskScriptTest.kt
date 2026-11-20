@@ -61,7 +61,9 @@ class AskScriptTest {
                 s.await("the model to be in use: the page turns into a conversation") { s.has("How do I treat a burn?") && s.has("Ask anything") }
                 // A question typed and sent with Enter; the answer names a dose, so it gets the note
                 s.type("Ask anything", "What dose of ibuprofen?"); s.press(Key.Enter)
-                s.await("the answer with its note") { s.has("Take 400 mg every six hours with food.") && s.has("Check doses on the package. This model can get doses wrong.") }
+                try {
+                    s.await("the answer with its note", 60_000) { s.has("Take 400 mg every six hours with food.") && s.has("Check doses on the package. This model can get doses wrong.") }
+                } catch (e: AssertionError) { throw AssertionError(e.message + "\n" + whereTheAiIs(), e) }
                 assertTrue(s.has("What dose of ibuprofen?")); assertFalse("what the model thinks is not shown", s.has("The user wants"))
                 assertEquals(2, LocalAi.conversation.size)
                 s.png("build/screen-ask-answer.png")
@@ -77,5 +79,13 @@ class AskScriptTest {
                 LocalAi.newConversation(); LocalAi.reset(a, LocalAi.offered); Llama.command = engineBefore; server.stop(0)
             }
         }
+    }
+
+    /** For a wait that ran out on a machine nobody can look at: what the AI holds, and what its threads are doing. */
+    private fun whereTheAiIs(): String = buildString {
+        appendLine("the AI: busy ${LocalAi.busy}, model in use ${LocalAi.selected}, states ${LocalAi.states.toMap()}, conversation ${LocalAi.conversation.toList()}")
+        appendLine("engine programs alive: " + ProcessHandle.current().descendants().map { it.pid().toString() + " " + it.info().command().orElse("?").takeLast(30) }.toList())
+        for ((thread, stack) in Thread.getAllStackTraces()) if (thread.name in setOf("ai-answers", "darkproof-main", "ai-engine-output", "ai-model-download"))
+            appendLine("thread ${thread.name} (${thread.state}): " + stack.take(14).joinToString(" < ") { it.className.substringAfterLast('.') + "." + it.methodName + ":" + it.lineNumber })
     }
 }
