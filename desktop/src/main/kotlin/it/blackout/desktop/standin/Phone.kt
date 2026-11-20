@@ -47,7 +47,8 @@ object Here {
     val position = false      // no GPS
     val map = false
     val tile = false
-    val ai = false
+    val ai = true             // llama.cpp beside the app (Llama.kt), with the dark room's kind of models
+    val allModels = true      // every AI model is listed and says what it needs: the person decides which to download
     val scan = false          // no camera scanning: a code is typed, or an invite link pasted
     val background = false    // the app passes messages on only while its window is open
     val tabBar = false        // no tabs along the bottom: a rail and a sidebar at the side

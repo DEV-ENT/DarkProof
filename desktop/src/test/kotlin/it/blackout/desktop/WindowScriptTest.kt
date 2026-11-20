@@ -81,7 +81,7 @@ class WindowScriptTest {
 
                 // The other pages, from the side
                 s.tap("Places"); assertTrue(s.has("Share a place") && s.has("Nothing shared yet")); assertFalse(s.says("Map")); s.png("build/screen-places.png")
-                s.tap("Ask"); assertTrue(s.has("The AI isn't on the desktop yet")); s.png("build/screen-ask.png")
+                s.tap("Ask"); assertTrue(s.has("No AI model on this computer") && s.says("Qwen 3.5 4B uncensored")) // the page itself: AskScriptTest
 
                 // Settings: only what a computer can do, and a new name
                 s.tap("Settings"); assertTrue(s.has("Your name") && s.has("Groups") && s.has("Help and privacy"))

@@ -2,6 +2,8 @@
 # checks that the built app starts its engine (DarkProof --self-test) and opens its window with a dark title bar
 # (DarkProof --window-test, which photographs the window). The installer and the pictures are kept with the run for
 # 14 days. A second job opens the window on the older Windows too, which draws title bars its own way.
+# -PaiEngine has the build fetch the AI engine (llama.cpp's server, one pinned build, checked by SHA-256: see
+# desktop/build.gradle.kts) into the app; the self-test then checks that it runs on Windows. No model is fetched.
 name: Desktop app for Windows
 
 on:
@@ -27,7 +29,7 @@ jobs:
       - name: Run every test on Windows
         run: ./gradlew -Pdesktop :desktop:test --no-daemon --console=plain
       - name: Build the app and its installer
-        run: ./gradlew -Pdesktop :desktop:createDistributable :desktop:packageMsi --no-daemon --console=plain
+        run: ./gradlew -Pdesktop -PaiEngine :desktop:createDistributable :desktop:packageMsi --no-daemon --console=plain
       - name: Start the built app's engine (self-test)
         shell: pwsh
         run: |
@@ -90,7 +92,7 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Build the app
-        run: ./gradlew -Pdesktop :desktop:createDistributable --no-daemon --console=plain
+        run: ./gradlew -Pdesktop -PaiEngine :desktop:createDistributable --no-daemon --console=plain
       - name: Open the built app's window and photograph it (window test)
         shell: pwsh
         run: |

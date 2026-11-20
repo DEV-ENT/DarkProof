@@ -717,8 +717,8 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Card {
-                    Txt("No AI model on this phone", 18, FontWeight.Bold)
-                    Txt("Download one while you still have internet. It stays on the phone and works offline afterwards.", 15, color = Theme.dim)
+                    Txt("No AI model on this ${Here.device}", 18, FontWeight.Bold)
+                    Txt("Download one while you still have internet. It stays on the ${Here.device} and works offline afterwards.", 15, color = Theme.dim)
                 }
                 ModelList()
             }
@@ -737,7 +737,7 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
                     val t = turns[i]; val me = t.role == "user"
                     Box(Modifier.fillMaxWidth(), contentAlignment = if (me) Alignment.CenterEnd else Alignment.CenterStart) {
                         Text(if (t.text == "…") AnnotatedString("Thinking…") else if (me) AnnotatedString(t.text) else markdown(t.text),
-                            Modifier.widthIn(max = 320.dp).clip(RoundedCornerShape(22.dp)).background(if (me) Color.White else Theme.tile)
+                            Modifier.widthIn(max = if (Here.wide) 560.dp else 320.dp).clip(RoundedCornerShape(22.dp)).background(if (me) Color.White else Theme.tile)
                                 .padding(horizontal = 16.dp, vertical = 11.dp),
                             color = when { me -> Color.Black; t.isError -> Theme.help; t.text == "…" -> Theme.dim; else -> Theme.text },
                             fontSize = 16.sp, lineHeight = 23.sp)
@@ -746,7 +746,7 @@ fun AskTab(g: SavedGroup, messages: List<Message>) {
             }
             Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 TextBox(draft, { draft = it.take(1000) }, "Ask anything", singleLine = false, keyboard = KeyboardOptions(KeyboardCapitalization.Sentences),
-                    modifier = Modifier.weight(1f), shape = RoundedCornerShape(26.dp))
+                    modifier = Modifier.weight(1f), shape = RoundedCornerShape(26.dp), onEnter = if (Here.wide) ({ send(draft) }) else null) // at a computer's keyboard, Enter asks
                 if (LocalAi.busy) RoundIcon(R.drawable.ic_close, 52.dp, desc = "Stop") { LocalAi.stop() }
                 else RoundIcon(R.drawable.ic_arrow_upward, 52.dp, tint = if (draft.isBlank()) Theme.dim else Color.Black,
                     bg = if (draft.isBlank()) Theme.tile else Color.White, desc = "Ask") { send(draft) }
@@ -778,7 +778,8 @@ private fun ModelList() {
         LocalAi.spaceProblem(m)?.let { Toast.makeText(ctx, it, Toast.LENGTH_LONG).show(); return }
         when (val net = LocalAi.network(ctx)) { "free" -> LocalAi.download(m); else -> ask = m to net }
     }
-    Txt("Models run entirely on this phone. Bigger ones answer better but slower. This phone has ${LocalAi.memoryGB} GB of memory: only models that fit are shown.",
+    Txt("Models run entirely on this ${Here.device}. Bigger ones answer better but slower. This ${Here.device} has ${LocalAi.memoryGB} GB of memory" +
+        (if (Here.allModels) ". Each model says what it needs. They are uncensored versions that other people made: they answer anything, and they can be wrong." else ": only models that fit are shown."),
         14, color = Theme.dim)
     if (LocalAi.catalog.isEmpty()) Txt("No model fits a phone with less than 4 GB of memory.", 15, FontWeight.SemiBold, Theme.help)
     LocalAi.catalog.forEach { m ->

@@ -1,3 +1,8 @@
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.util.zip.ZipInputStream
+
 // DarkProof for desktop computers (Windows first). Run it with: ./gradlew -Pdesktop :desktop:run
 //
 // The parts of the Android app that use no Android code are compiled here as they are, straight from
@@ -95,6 +100,60 @@ tasks.withType<Test>().configureEach {
     testLogging { events("failed"); exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
 }
 
+// The AI engine: llama.cpp's own server program (MIT), one pinned build from its authors' releases, checked by SHA-256
+// before it is unpacked. It is code from outside, so it is fetched only when asked for with -PaiEngine (the build on
+// GitHub asks). Without it the app builds and runs, and its Ask page says this copy has no AI engine.
+val aiEngineBuild = "b12590"
+val aiEngines = mapOf( // the computer it is for, to the file's name and SHA-256
+    "windows-x64" to ("llama-$aiEngineBuild-bin-win-cpu-x64.zip" to "e895687489ceed01770fd5101ac377ad77ed41b5b2b7dafc8e1e1bfca613ba62"),
+    "macos-arm64" to ("llama-$aiEngineBuild-bin-macos-arm64.tar.gz" to "c0961e9c1ee87fb17357825a8f4a0a294ce7334093e1295917f71f17977d5ad6"),
+)
+val engineRoot = layout.projectDirectory.dir("engine") // engine/<computer>/llama goes into the app as resources/llama
+val fetchAiEngine = tasks.register("fetchAiEngine") {
+    val wanted = providers.gradleProperty("aiEngine").isPresent
+    val pick = aiEngines[composeTarget]
+    val into = engineRoot.dir("$composeTarget/llama").asFile
+    val work = layout.buildDirectory.dir("ai-engine").get().asFile
+    onlyIf { wanted && pick != null }
+    doLast {
+        val (name, sha) = pick!!
+        fun sha256(f: File): String {
+            val md = MessageDigest.getInstance("SHA-256")
+            f.inputStream().use { i -> val b = ByteArray(1 shl 16); while (true) { val n = i.read(b); if (n < 0) break; md.update(b, 0, n) } }
+            return md.digest().joinToString("") { "%02x".format(it) }
+        }
+        val archive = File(work, name)
+        if (!archive.isFile || sha256(archive) != sha) {
+            work.mkdirs()
+            uri("https://github.com/ggml-org/llama.cpp/releases/download/$aiEngineBuild/$name").toURL().openStream().use { i -> archive.outputStream().use { i.copyTo(it) } }
+        }
+        check(sha256(archive) == sha) { "$name is not the file that was pinned (SHA-256 ${sha256(archive)})" }
+        val unpacked = File(work, "unpacked"); unpacked.deleteRecursively(); unpacked.mkdirs()
+        if (name.endsWith(".zip")) { // read here: what "tar" is on a Windows computer depends on what else is installed
+            ZipInputStream(archive.inputStream()).use { zip ->
+                while (true) {
+                    val e = zip.nextEntry ?: break
+                    val out = File(unpacked, e.name).canonicalFile
+                    check(out.path.startsWith(unpacked.canonicalPath + File.separator)) { "$name holds a file that would land outside its folder: ${e.name}" }
+                    if (e.isDirectory) out.mkdirs() else { out.parentFile.mkdirs(); out.outputStream().use { zip.copyTo(it) } }
+                }
+            }
+        } else {
+            val tar = ProcessBuilder("tar", "-xzf", archive.path, "-C", unpacked.path).inheritIO().start()
+            check(tar.waitFor() == 0) { "could not unpack $name" }
+        }
+        val server = unpacked.walkTopDown().firstOrNull { it.name == "llama-server" || it.name == "llama-server.exe" } ?: error("no llama-server in $name")
+        into.deleteRecursively(); into.mkdirs()
+        // The server, the libraries beside it and the licences; not the other programs of the archive.
+        val wantedFile = Regex("""(llama-server(\.exe)?|.*\.(dll|dylib|so)(\.\d+)*|LICENSE.*)""")
+        (server.parentFile.listFiles().orEmpty().toList() + unpacked.walkTopDown().filter { it.name.startsWith("LICENSE") }).distinct()
+            .filter { it.name.matches(wantedFile) && Files.isRegularFile(it.toPath()) } // a link to a library is copied as the library
+            .forEach { f -> val out = File(into, f.name); Files.copy(f.toPath(), out.toPath(), StandardCopyOption.REPLACE_EXISTING); if (f.canExecute() || f.name.startsWith("llama-server")) out.setExecutable(true) }
+        check(File(into, server.name).isFile) { "the AI engine was not unpacked" }
+    }
+}
+tasks.matching { it.name == "prepareAppResources" }.configureEach { dependsOn(fetchAiEngine) }
+
 compose.desktop {
     application {
         mainClass = "it.blackout.desktop.MainKt"
@@ -104,6 +163,7 @@ compose.desktop {
         // The installer. It has to be built on the system it is for: .github/workflows/desktop-windows.yml builds the
         // Windows one on GitHub. It is not signed, so Windows warns before running it.
         nativeDistributions {
+            appResourcesRootDir.set(engineRoot) // the AI engine and its notice (above)
             targetFormats(org.jetbrains.compose.desktop.application.dsl.TargetFormat.Msi)
             packageName = "DarkProof"
             packageVersion = "0.4.1" // the Android app's versionName (app/build.gradle.kts); Windows wants three numbers

@@ -28,6 +28,9 @@ object SelfTest {
             MeshEngine.send("group message"); MeshEngine.send("everyone message", public = true)
             await("both messages to be kept") { MeshEngine.snapshotAll().count { it.sender == MeshEngine.deviceId } == 2 }; say("a group message and an Everyone message sealed, signed and kept")
             await("the network link to listen") { (MeshEngine.wifi?.links?.port ?: 0) > 0 }; say("listening for phones on port ${MeshEngine.wifi?.links?.port}")
+            // The AI engine is a program of its own: that it is in this copy and runs on this computer, without a model
+            if (Llama.program() == null) say("no AI engine in this copy")
+            else say("AI engine runs: " + (Llama.version() ?: error("the AI engine in this copy does not run on this computer")))
             MeshEngine.shutdown()
         }.onFailure { say("FAILED: $it"); it.stackTrace.take(12).forEach { l -> say("    at $l") } }.isSuccess
         say(if (ok) "SELF-TEST OK" else "SELF-TEST FAILED")

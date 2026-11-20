@@ -2,6 +2,7 @@ package it.blackout.desktop
 
 import it.blackout.mesh.AppState
 import it.blackout.mesh.Groups
+import it.blackout.mesh.LocalAi
 import it.blackout.mesh.MainActivity
 import it.blackout.mesh.MeshEngine
 import it.blackout.mesh.Notifier
@@ -23,6 +24,7 @@ object Desktop {
         a.state = AppState(a)
         MeshEngine.listener = { Groups.current(a)?.let { if (it != a.state.group) a.state.group = it }; a.state.tick++ } // a removal changes the group's code
         Notifier.onScreen = true; Notifier.inApp = { a.state.banner = it }
+        LocalAi.setUp(a)
         a.startStore()
         return a
     }
