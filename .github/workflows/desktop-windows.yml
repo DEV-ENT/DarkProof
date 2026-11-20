@@ -172,6 +172,11 @@ jobs:
           app=$(find desktop/build/compose/binaries/main/app -maxdepth 1 -name 'DarkProof.app' | head -1)
           test -n "$app" || { echo 'DarkProof.app was not built'; exit 1; }
           uname -m; sw_vers -productVersion
+          # The AI engine as it lies in the built app: its files and whether they may be run, what signs it, and its own word
+          engine="$app/Contents/app/resources/llama"
+          ls -la "$engine" || true
+          codesign -dv "$engine/llama-server" 2>&1 | head -6 || true
+          "$engine/llama-server" --version 2>&1 | head -4; echo "the engine started by hand ended with ${PIPESTATUS[0]}"
           "$app/Contents/MacOS/DarkProof" --self-test
       - name: Keep the disk image
         uses: actions/upload-artifact@v4

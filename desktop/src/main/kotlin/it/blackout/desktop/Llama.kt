@@ -40,8 +40,21 @@ internal class Llama private constructor(private val process: Process, internal 
             // the program with a message box of its own before it says a word, so on such a computer it is not offered.
             if (graphics && TitleBar.onWindows && !File(program.parentFile, "vulkan-1.dll").isFile &&
                 !File(System.getenv("SystemRoot") ?: "C:\\Windows", "System32\\vulkan-1.dll").isFile) return null
+            // Packing an app can lose the mark that says a file is a program (a Mac and Linux keep one; Windows has none).
+            if (!TitleBar.onWindows && !program.canExecute()) program.setExecutable(true)
             return program
         }
+
+        /** Why the engine doesn't run, in the engine's and the system's own words: for a self-test on a computer nobody can look at. */
+        fun whyNot(graphics: Boolean = false): String = runCatching {
+            val base = command(graphics) ?: return "this copy has no such engine"
+            val program = File(base.first())
+            val about = "${program.name} is ${if (program.isFile) "there (${program.length()} bytes)" else "missing"} and ${if (program.canExecute()) "may be run" else "may not be run (it has no execute permission)"}"
+            val p = ProcessBuilder(base + "--version").redirectErrorStream(true).also { b -> program.parentFile?.takeIf { it.isDirectory }?.let(b::directory) }.start()
+            val said = p.inputStream.bufferedReader().readText()
+            val ended = p.waitFor(30, TimeUnit.SECONDS); if (!ended) p.destroyForcibly()
+            "$about; it ${if (ended) "ended with ${p.exitValue()}" else "did not end in 30 seconds"} and said: " + said.lines().filter { it.isNotBlank() }.take(5).joinToString(" / ").take(500).ifEmpty { "nothing" }
+        }.getOrElse { "it could not be started: $it" }
 
         /** The command that starts the engine (the one for the graphics card, if asked), without the model and the address. Tests put a stand-in program here. */
         @Volatile var command: (graphics: Boolean) -> List<String>? = { graphics -> program(graphics)?.let { listOf(it.path) } }

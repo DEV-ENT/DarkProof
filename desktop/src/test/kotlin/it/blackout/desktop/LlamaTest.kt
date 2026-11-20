@@ -76,6 +76,24 @@ class LlamaTest {
 
     @Test fun theEngineSaysItsVersion() { assertEquals("version: 1 (stand-in)", Llama.version()) }
 
+    /** Packing the app can lose a program's execute permission (seen on the Mac build): the app gives it back, and says why when an engine doesn't run. */
+    @Test fun anEngineThatLostItsExecutePermissionGetsItBack() {
+        org.junit.Assume.assumeTrue("Windows has no such permission", !TitleBar.onWindows)
+        val resources = File(dir, "resources"); val program = File(resources, "llama/llama-server")
+        program.parentFile.mkdirs(); program.writeText("#!/bin/sh\necho 'version: 7 (a script)'\n"); program.setExecutable(false)
+        val before = System.getProperty("compose.application.resources.dir"); val commandBefore = Llama.command
+        System.setProperty("compose.application.resources.dir", resources.path)
+        try {
+            Llama.command = { graphics -> Llama.program(graphics)?.let { listOf(it.path) } } // the app's own way of finding its engine
+            assertFalse(program.canExecute())
+            assertEquals("version: 7 (a script)", Llama.version()); assertTrue(program.canExecute())
+            assertEquals(null, Llama.version(graphics = true)); assertEquals("this copy has no such engine", Llama.whyNot(graphics = true))
+            program.writeText("#!/bin/sh\necho 'dyld: Library not loaded: libllama.1.dylib' >&2\nexit 6\n")
+            assertEquals(null, Llama.version())
+            assertTrue(Llama.whyNot(), Llama.whyNot().let { "may be run" in it && "ended with 6" in it && "Library not loaded" in it })
+        } finally { Llama.command = commandBefore; if (before == null) System.clearProperty("compose.application.resources.dir") else System.setProperty("compose.application.resources.dir", before) }
+    }
+
     @Test fun thinkingOutLoudIsCutFromWhatIsShown() {
         assertEquals("Boil it.", Llama.shown("<think>water... unsafe?</think>\n\nBoil it."))
         assertEquals("", Llama.shown("<think>still thinking"))

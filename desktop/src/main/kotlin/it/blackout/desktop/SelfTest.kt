@@ -30,12 +30,12 @@ object SelfTest {
             await("the network link to listen") { (MeshEngine.wifi?.links?.port ?: 0) > 0 }; say("listening for phones on port ${MeshEngine.wifi?.links?.port}")
             // The AI engine is a program of its own: that it is in this copy and runs on this computer, without a model
             if (Llama.program() == null) say("no AI engine in this copy")
-            else say("AI engine runs: " + (Llama.version() ?: error("the AI engine in this copy does not run on this computer")))
+            else say("AI engine runs: " + (Llama.version() ?: error("the AI engine in this copy does not run on this computer: " + Llama.whyNot())))
             // The second engine, for the graphics card, needs a card and a driver: that it doesn't start here is no fault, the app falls back
             val resources = System.getProperty("compose.application.resources.dir")
             if (resources != null && java.io.File(resources, "llama-gpu").isDirectory) say("AI engine for the graphics card: " + when {
                 Llama.program(graphics = true) == null -> "in this copy, and not offered on this computer (it has no Vulkan, which comes with a graphics card's driver)"
-                else -> Llama.version(graphics = true)?.let { "runs: $it" } ?: "does not start on this computer"
+                else -> Llama.version(graphics = true)?.let { "runs: $it" } ?: ("does not start on this computer: " + Llama.whyNot(graphics = true))
             })
             MeshEngine.shutdown()
         }.onFailure { say("FAILED: $it"); it.stackTrace.take(12).forEach { l -> say("    at $l") } }.isSuccess
