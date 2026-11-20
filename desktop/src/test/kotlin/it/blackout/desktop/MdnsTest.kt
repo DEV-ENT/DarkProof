@@ -114,6 +114,7 @@ class MdnsTest {
         try {
             it.blackout.mesh.WifiLink.discovery = TEST
             small.start(); big.start()
+            org.junit.Assert.assertNotEquals("the two listen on the same port", small.links.port, big.links.port)
             val end = System.currentTimeMillis() + 25_000
             while (System.currentTimeMillis() < end && (small.links.linkCount() != 1 || big.links.linkCount() != 1)) Thread.sleep(100)
             assertEquals("the two didn't link", 1, small.links.linkCount()); assertEquals(1, big.links.linkCount())

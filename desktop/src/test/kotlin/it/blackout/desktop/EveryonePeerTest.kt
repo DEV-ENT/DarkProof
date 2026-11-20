@@ -2,6 +2,7 @@ package it.blackout.desktop
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -37,6 +38,16 @@ class EveryonePeerTest {
             val port = a.start(0)
             b.connect("127.0.0.1:$port")
             await("the stored post at Ada") { a.lines().any { it.text == "written with no link" && it.verified } }
+        } finally { a.stop(); b.stop() }
+    }
+
+    /** A second device on the same computer gets a port of its own, on every system (on Windows two listeners could otherwise end up sharing one). */
+    @Test fun twoDevicesOnOneComputerNeverShareAPort() {
+        val a = EveryonePeer("Ada", loopback = true); val b = EveryonePeer("Bo", loopback = true)
+        try {
+            val first = a.start(0); assertTrue(first > 0)
+            val second = b.start(first); assertTrue(second > 0) // asks for the port that is taken
+            assertNotEquals("both listen on port $first", first, second)
         } finally { a.stop(); b.stop() }
     }
 

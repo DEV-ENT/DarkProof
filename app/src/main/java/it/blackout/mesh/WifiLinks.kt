@@ -111,7 +111,11 @@ class WifiLinks(private val nodeId: String, private val router: () -> MeshRouter
         }
         return ss.localPort
     }
-    private fun bind(port: Int) = ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress(port)) }
+    /**
+     * With reuseAddress a port can be taken again right after a restart. Not on Windows: there the same option lets two
+     * programs listen on one port at once, and which of them gets a connection is anyone's guess.
+     */
+    private fun bind(port: Int) = ServerSocket().apply { reuseAddress = !System.getProperty("os.name").orEmpty().startsWith("Windows"); bind(InetSocketAddress(port)) }
 
     /**
      * A connection that dialed in waits for its HELLO. At most 16 wait, 4 of them from one address: over that, one
