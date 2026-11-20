@@ -22,6 +22,22 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - name: Can this machine reach its own network address?
+        shell: pwsh
+        run: |
+          # Two test devices on this one machine link over its network address, as a phone would. This shows whether the
+          # machine lets a program do that, before and after its firewall is told to let test connections in.
+          function Probe($label) {
+            $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1).IPAddress
+            $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 45454); $l.Start()
+            $c = [System.Net.Sockets.TcpClient]::new(); $ok = $false
+            try { $ok = $c.ConnectAsync($ip, 45454).Wait(3000) } catch { }
+            Write-Host "$label a connection from this machine to its own address ${ip}: $ok"
+            $c.Close(); $l.Stop()
+          }
+          Probe 'before:'
+          New-NetFirewallRule -DisplayName 'DarkProof tests' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1024-65535 | Out-Null
+          Probe 'after: '
       - name: Run every test on Windows
         run: ./gradlew -Pdesktop :desktop:test --no-daemon --console=plain
       - name: Build the app and its installer

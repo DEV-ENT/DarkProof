@@ -100,6 +100,23 @@ class MdnsTest {
         } finally { a.stop(); b.stop() }
     }
 
+    /** For a failure on a machine nobody can look at: this computer's networks, what a finder hears on them, and whether a plain connection to what it hears works. */
+    private fun why(small: it.blackout.mesh.WifiLink, big: it.blackout.mesh.WifiLink): String = buildString {
+        fun connect(host: String, port: Int) = runCatching { java.net.Socket().use { it.connect(InetSocketAddress(host, port), 3_000) }; "ok" }.getOrElse { "${it.javaClass.simpleName}: ${it.message}" }
+        append("\n  status: ${small.links.statusLine()} / ${big.links.statusLine()}; ports ${small.links.port} and ${big.links.port}")
+        append("\n  networks: " + java.net.NetworkInterface.getNetworkInterfaces().toList().filter { runCatching { it.isUp }.getOrDefault(false) }.joinToString("; ") { n ->
+            "${n.name} (${listOfNotNull("multicast".takeIf { n.supportsMulticast() }, "loopback".takeIf { n.isLoopback }, "point-to-point".takeIf { n.isPointToPoint }).joinToString(",")}) " +
+                n.interfaceAddresses.filter { it.address is java.net.Inet4Address }.joinToString(",") { "${it.address.hostAddress}/${it.networkPrefixLength}" }
+        })
+        val heard = Collections.synchronizedList(ArrayList<Triple<String, String, Int>>())
+        val ear = Mdns("5555cccc0003", 1, { n, h, p -> heard += Triple(n, h, p) }, type = TEST)
+        ear.start(); Thread.sleep(4_000); ear.stop()
+        val each = heard.distinct()
+        append("\n  a third finder heard: $each")
+        for ((n, h, p) in each) append("\n  a plain connection to $n at $h:$p: ${connect(h, p)}; counts as the local network: ${it.blackout.mesh.WifiLinks.onLan(java.net.InetAddress.getByName(h))}")
+        append("\n  a plain connection to 127.0.0.1:${big.links.port}: ${connect("127.0.0.1", big.links.port)}")
+    }
+
     /** Two desktops on one network: they find each other, and the one with the smaller node id connects (spec, "Who connects"). */
     @Test fun twoDesktopsLinkByThemselves() {
         assumeTrue("this computer doesn't let a program hear its own multicast", multicastWorks())
@@ -117,7 +134,7 @@ class MdnsTest {
             org.junit.Assert.assertNotEquals("the two listen on the same port", small.links.port, big.links.port)
             val end = System.currentTimeMillis() + 25_000
             while (System.currentTimeMillis() < end && (small.links.linkCount() != 1 || big.links.linkCount() != 1)) Thread.sleep(100)
-            assertEquals("the two didn't link", 1, small.links.linkCount()); assertEquals(1, big.links.linkCount())
+            if (small.links.linkCount() != 1 || big.links.linkCount() != 1) org.junit.Assert.fail("the two didn't link: ${small.links.linkCount()} and ${big.links.linkCount()} links" + why(small, big))
             assertEquals(setOf("9999bbbb0002"), small.links.nodes()); assertEquals(setOf("1111aaaa0001"), big.links.nodes())
         } finally { small.stop(); big.stop(); it.blackout.mesh.WifiLink.discovery = before }
     }

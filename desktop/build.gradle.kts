@@ -90,6 +90,11 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
 }
 
+// A failed test says why in the build's own output: on a build machine there is nothing else to look at.
+tasks.withType<Test>().configureEach {
+    testLogging { events("failed"); exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
+}
+
 compose.desktop {
     application {
         mainClass = "it.blackout.desktop.MainKt"
